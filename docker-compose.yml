@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+    depends_on:
+      - backend
+    networks:
+      - codewise-network
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MCP_SERVER_URL=http://mcp_server:8001
+    depends_on:
+      - mcp_server
+    volumes:
+      - ./workspace:/workspace
+    networks:
+      - codewise-network
+
+  mcp_server:
+    build: ./mcp_server
+    environment:
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - ./workspace:/workspace
+    networks:
+      - codewise-network
+
+networks:
+  codewise-network:
+    driver: bridge 
