@@ -16,6 +16,11 @@ interface ChatStore {
   clearMessages: () => void
 }
 
+interface ThemeStore {
+  isDarkMode: boolean
+  toggleTheme: () => void
+}
+
 export const useChatStore = create<ChatStore>((set) => ({
   messages: [],
   
@@ -36,4 +41,9 @@ export const useChatStore = create<ChatStore>((set) => ({
     }),
   
   clearMessages: () => set({ messages: [] }),
+}))
+
+export const useThemeStore = create<ThemeStore>((set) => ({
+  isDarkMode: true, // Default to dark mode
+  toggleTheme: () => set((state) => ({ isDarkMode: !state.isDarkMode })),
 })) 
