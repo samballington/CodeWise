@@ -43,8 +43,12 @@ graph TD
 
 1. **Prerequisites**: Docker, Docker Compose, OpenAI API key
 2. **Setup**: Copy `env.example` to `.env` and add your OpenAI API key
-3. **Run**: Execute `./start.sh` (Linux/Mac) or `.\start.ps1` (Windows)
-4. **Access**: Open http://localhost:3000 and start chatting with your AI assistant
+3. **GitHub OAuth** (Optional): 
+   - Register OAuth app at https://github.com/settings/developers
+   - Add `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` to `.env`
+   - Set callback URL to `http://localhost:8000/oauth/callback`
+4. **Run**: Execute `./start.sh` (Linux/Mac) or `.\start.ps1` (Windows)
+5. **Access**: Open http://localhost:3000 and start chatting with your AI assistant
 
 ## Security
 
