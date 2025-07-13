@@ -1,0 +1,30 @@
+# CodeWise Roadmap TODOs
+
+## Phase 0 – Stabilise Prototype
+- [ ] Add unit and integration tests; set up GitHub Actions CI.
+- [ ] Close `httpx.AsyncClient` and purge `active_connections` leaks.
+- [ ] Implement WebSocket authentication (token/JWT) and rate limiting.
+- [ ] Harden MCP security: symlink-escape check and output size cap.
+- [ ] Add auto-reconnect logic in the front-end WebSocket hook.
+
+## Phase 1 – Storage Abstraction
+- [ ] Introduce `StorageAdapter` interface (`read`, `write`, `list`, `run`).
+- [ ] Refactor MCP endpoints to delegate to the injected adapter.
+- [ ] Implement `LocalFSAdapter` and `GitAdapter`.
+
+## Phase 2 – Desktop Wrapper (Tauri/Electron)
+- [ ] Bundle the React UI inside a desktop shell.
+- [ ] First-run wizard: Docker check, folder picker or Git clone, launch docker-compose.
+- [ ] Provide menu: Switch workspace, Open in VS Code, Stop CodeWise.
+
+## Phase 3 – GitHub Workflow Polish
+- [ ] OAuth flow; store PAT only in the back-end container.
+- [ ] Add LangChain tools: `git_commit`, `git_push`, `github_create_pr`.
+- [ ] Update agent prompt to open a PR automatically.
+- [ ] Display the PR link in chat.
+
+## Phase 4 – User-Centric Niceties
+- [ ] Persist theme and chat history per workspace.
+- [ ] File-watcher to alert UI/agent when external edits occur.
+- [ ] Settings page: OpenAI key, model choice, resource limits.
+- [ ] Auto-update the desktop application. 

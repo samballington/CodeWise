@@ -4,11 +4,14 @@ import React, { useEffect, useState } from 'react'
 import ChatInterface from '../components/ChatInterface'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
+import GitHubAuth from '../components/GitHubAuth'
 
 export default function Home() {
   const { connected, sendMessage } = useWebSocket()
   const { messages } = useChatStore()
   const { isDarkMode, toggleTheme } = useThemeStore()
+  const [showGitHub, setShowGitHub] = useState(false)
+  const [githubSession, setGithubSession] = useState<string | null>(null)
 
   // Apply theme to document
   useEffect(() => {
@@ -58,6 +61,20 @@ export default function Home() {
                 </svg>
               )}
             </button>
+
+            {/* GitHub toggle */}
+            <button
+              onClick={() => setShowGitHub(!showGitHub)}
+              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
+                showGitHub
+                  ? 'bg-primary text-white'
+                  : isDarkMode
+                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              GitHub
+            </button>
             
             <div className="flex items-center gap-2">
               <div
@@ -65,9 +82,11 @@ export default function Home() {
                   connected ? 'status-connected' : 'status-disconnected'
                 }`}
               />
-              <span className={`text-sm transition-colors duration-300 ${
-                isDarkMode ? 'text-text-secondary' : 'text-gray-600'
-              }`}>
+              <span
+                className={`text-sm transition-colors duration-300 ${
+                  isDarkMode ? 'text-text-secondary' : 'text-gray-600'
+                }`}
+              >
                 {connected ? 'Connected' : 'Disconnected'}
               </span>
             </div>
@@ -76,8 +95,14 @@ export default function Home() {
       </header>
       
       <div className="flex-1 flex">
-        <ChatInterface />
+        {showGitHub ? (
+          <div className="flex-1 p-6">
+            <GitHubAuth onAuthSuccess={(session) => setGithubSession(session)} />
+          </div>
+        ) : (
+          <ChatInterface />
+        )}
       </div>
     </main>
   )
-} 
+}

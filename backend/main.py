@@ -7,13 +7,15 @@ import os
 from dotenv import load_dotenv
 
 from agent import CodeWiseAgent
+from starlette.middleware.sessions import SessionMiddleware
+from github_auth import router as github_oauth_router
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(title="CodeWise Backend")
 
-# Configure CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -21,6 +23,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Session cookies for Auth
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "change_me"))
+
+# Include GitHub OAuth router
+app.include_router(github_oauth_router)
 
 # Store active connections
 active_connections: Dict[str, WebSocket] = {}
