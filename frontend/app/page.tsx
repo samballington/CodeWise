@@ -2,16 +2,20 @@
 
 import React, { useEffect, useState } from 'react'
 import ChatInterface from '../components/ChatInterface'
+import ChatOverlay from '../components/ChatOverlay'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
 import GitHubAuth from '../components/GitHubAuth'
+import { ProjectLayout } from '../components/ProjectLayout'
 
 export default function Home() {
   const { connected, sendMessage } = useWebSocket()
   const { messages } = useChatStore()
   const { isDarkMode, toggleTheme } = useThemeStore()
   const [showGitHub, setShowGitHub] = useState(false)
+  const [showProjects, setShowProjects] = useState(false)
   const [githubSession, setGithubSession] = useState<string | null>(null)
+  const [showChatOverlay, setShowChatOverlay] = useState(false)
 
   // Apply theme to document
   useEffect(() => {
@@ -76,6 +80,34 @@ export default function Home() {
               GitHub
             </button>
             
+            {/* Chat toggle */}
+            <button
+              onClick={() => setShowChatOverlay(!showChatOverlay)}
+              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
+                showChatOverlay
+                  ? 'bg-primary text-white'
+                  : isDarkMode
+                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              Chat
+            </button>
+
+            {/* Projects toggle */}
+            <button
+              onClick={() => setShowProjects(!showProjects)}
+              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
+                showProjects
+                  ? 'bg-primary text-white'
+                  : isDarkMode
+                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              Projects
+            </button>
+            
             <div className="flex items-center gap-2">
               <div
                 className={`status-icon ${
@@ -95,7 +127,19 @@ export default function Home() {
       </header>
       
       <div className="flex-1 flex">
-        {showGitHub ? (
+        {showProjects ? (
+          <div className="flex-1 flex">
+            <ProjectLayout />
+            {showGitHub && (
+              <div className="w-96 border-l border-gray-200 bg-white p-4 overflow-y-auto">
+                <GitHubAuth onAuthSuccess={(session) => {
+                  setGithubSession(session)
+                  setShowGitHub(false) // Close GitHub panel after successful auth
+                }} />
+              </div>
+            )}
+          </div>
+        ) : showGitHub ? (
           <div className="flex-1 p-6">
             <GitHubAuth onAuthSuccess={(session) => setGithubSession(session)} />
           </div>
@@ -103,6 +147,8 @@ export default function Home() {
           <ChatInterface />
         )}
       </div>
+      {/* Chat overlay */}
+      {showChatOverlay && <ChatOverlay onClose={() => setShowChatOverlay(false)} />}
     </main>
   )
 }

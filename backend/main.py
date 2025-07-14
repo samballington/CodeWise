@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from agent import CodeWiseAgent
 from starlette.middleware.sessions import SessionMiddleware
 from github_auth import router as github_oauth_router
+from routers.projects import router as projects_router
 
 # Load environment variables
 load_dotenv()
@@ -29,6 +30,9 @@ app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "change
 
 # Include GitHub OAuth router
 app.include_router(github_oauth_router)
+
+# Include Projects router
+app.include_router(projects_router)
 
 # Store active connections
 active_connections: Dict[str, WebSocket] = {}

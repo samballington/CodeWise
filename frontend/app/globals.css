@@ -255,3 +255,25 @@ pre:hover .copy-button {
     opacity: 1;
   }
 } 
+
+/* Force Monaco Editor to fill full width */
+.monaco-editor,
+.monaco-editor .overflow-guard,
+.monaco-editor .monaco-scrollable-element {
+  width: 100% !important;
+  min-width: 100% !important;
+}
+
+/* Force code viewer container to expand */
+.code-viewer-container {
+  width: 100% !important;
+  min-width: 100% !important;
+  flex: 1 !important;
+}
+
+/* Force full width on flex containers */
+.project-layout-main {
+  width: 100% !important;
+  min-width: 0 !important;
+  flex: 1 !important;
+} 
