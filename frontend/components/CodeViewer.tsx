@@ -92,7 +92,7 @@ export const CodeViewer: React.FC = () => {
   }
 
   return (
-    <div className="w-full h-full flex flex-col bg-white code-viewer-container">
+    <div className="w-full h-full flex flex-col bg-white flex-1 code-viewer-container">
       {/* File Tabs */}
       <div className="w-full flex border-b border-gray-200 bg-gray-50 overflow-x-auto flex-shrink-0">
         {openFiles.map((file) => (

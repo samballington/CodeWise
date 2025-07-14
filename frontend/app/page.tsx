@@ -126,9 +126,9 @@ export default function Home() {
         </div>
       </header>
       
-      <div className="flex-1 flex">
+      <div className="flex-1 flex min-h-0">
         {showProjects ? (
-          <div className="flex-1 flex">
+          <div className="flex-1 flex min-h-0">
             <ProjectLayout />
             {showGitHub && (
               <div className="w-96 border-l border-gray-200 bg-white p-4 overflow-y-auto">

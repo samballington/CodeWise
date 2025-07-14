@@ -93,6 +93,26 @@ export const useWebSocket = () => {
           isComplete: true,
         })
         break
+
+      case 'stream_token':
+        {
+          const state = useChatStore.getState()
+          const { messages } = state
+          if (messages.length === 0 || messages[messages.length - 1].role !== 'assistant' || messages[messages.length - 1].isComplete) {
+            // start new assistant message
+            addMessage({
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: data.token,
+              timestamp: new Date(),
+            })
+          } else {
+            // append token to last assistant message
+            const lastMsg = messages[messages.length - 1]
+            updateLastMessage({ content: lastMsg.content + data.token })
+          }
+        }
+        break
     }
   }
 

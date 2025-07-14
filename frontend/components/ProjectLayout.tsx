@@ -8,7 +8,7 @@ export const ProjectLayout: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   return (
-    <div className="flex h-screen bg-gray-100">
+    <div className="flex flex-1 min-h-0 bg-gray-100">
       {/* Sidebar */}
       <div className={`
         ${sidebarOpen ? 'w-64' : 'w-0'} 

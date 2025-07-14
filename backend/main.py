@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 
 from agent import CodeWiseAgent
+from chat_memory import ChatMemory
 from starlette.middleware.sessions import SessionMiddleware
 from github_auth import router as github_oauth_router
 from routers.projects import router as projects_router
@@ -47,11 +48,12 @@ async def websocket_endpoint(websocket: WebSocket):
     connection_id = id(websocket)
     active_connections[connection_id] = websocket
     
-    # Initialize the agent
+    # Initialize the agent and chat memory
     agent = CodeWiseAgent(
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         mcp_server_url=os.getenv("MCP_SERVER_URL", "http://mcp_server:8001")
     )
+    chat_memory = ChatMemory()
     
     try:
         while True:
@@ -69,9 +71,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     "message": "Processing your request..."
                 })
                 
+                # Add user message to memory
+                chat_memory.add_message("user", user_query)
+
                 # Execute agent with streaming updates
-                async for update in agent.process_request(user_query):
+                async for update in agent.process_request(user_query, chat_history=chat_memory.as_langchain_messages()):
                     await websocket.send_json(update)
+
+                    # If we reach final result, add assistant reply to memory
+                    if update.get("type") == "final_result":
+                        chat_memory.add_message("assistant", update.get("output", ""))
                 
                 # Send completion message
                 await websocket.send_json({

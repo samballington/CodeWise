@@ -52,3 +52,6 @@ workspace/*
 
 # Internal documentation
 memory.md 
+TODO.txt
+feature.md
+scratchpad.md
