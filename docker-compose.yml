@@ -37,6 +37,16 @@ services:
     networks:
       - codewise-network
 
+  indexer:
+    build: ./indexer
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - ./workspace:/workspace
+    networks:
+      - codewise-network
+
 networks:
   codewise-network:
     driver: bridge 

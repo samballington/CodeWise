@@ -3,13 +3,16 @@ import json
 from typing import List, Tuple
 import numpy as np
 import faiss
-from openai import OpenAI
+# type: ignore
+import openai
 from pathlib import Path
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-INDEX_FILE = "vector_index.faiss"
-META_FILE = "vector_meta.json"
+WORKSPACE_DIR = "/workspace"
+CACHE_DIR = Path(WORKSPACE_DIR) / ".vector_cache"
+INDEX_FILE = CACHE_DIR / "index.faiss"
+META_FILE = CACHE_DIR / "meta.json"
 CHUNK_SIZE = 400  # characters per chunk
 EMBED_MODEL = "text-embedding-3-small"
 
@@ -19,15 +22,16 @@ class VectorStore:
 
     def __init__(self, workspace_dir: str = "/workspace"):
         self.workspace_dir = workspace_dir
-        self.index_path = Path(workspace_dir) / INDEX_FILE
-        self.meta_path = Path(workspace_dir) / META_FILE
+        self.index_path = INDEX_FILE
+        self.meta_path = META_FILE
         self.index = None  # type: ignore
         self.meta: List[Tuple[str, str]] = []  # (file_path, snippet)
 
         if self.index_path.exists() and self.meta_path.exists():
             self._load()
         else:
-            self._build()
+            # If index not present, fallback to empty index (indexer builds asynchronously)
+            self.index = faiss.IndexFlatL2(768)
 
     # --------------------------- internal helpers ---------------------------
     def _chunk_text(self, text: str) -> List[str]:
@@ -59,7 +63,7 @@ class VectorStore:
         embeddings: List[List[float]] = []
         for i in range(0, len(texts), 100):
             batch = texts[i : i + 100]
-            resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+            resp = openai.embeddings.create(model=EMBED_MODEL, input=batch)
             embeddings.extend([d.embedding for d in resp.data])
         return embeddings
 

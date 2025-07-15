@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import os
 import mimetypes
+import openai
 from datetime import datetime
+from vector_store import get_vector_store
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -166,6 +170,131 @@ class ProjectService:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
+    
+    @staticmethod
+    async def get_project_summary(project_name: str, query: str = "") -> str:
+        """Generate AI summary of a project"""
+        try:
+            # Search for relevant code if query provided
+            if query:
+                chunks = get_vector_store().query(f"{project_name} {query}")
+            else:
+                chunks = get_vector_store().query(f"project overview {project_name}")
+            
+            # Build context
+            context_parts = []
+            if chunks:
+                for file_path, snippet in chunks[:5]:  # Top 5 relevant chunks
+                    context_parts.append(f"File: {file_path}\n```\n{snippet}\n```")
+            
+            context = "\n\n".join(context_parts) if context_parts else "No relevant code found."
+            
+            # Generate summary
+            prompt_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code analysis assistant. Given code snippets from a project, "
+                        "provide a comprehensive summary of the project's purpose, architecture, "
+                        "key features, and technologies used. Keep response under 300 tokens."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Project: {project_name}\nQuery: {query or 'general overview'}\n\nCode Context:\n{context}\n\nProvide a project summary:"
+                }
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-0125",
+                messages=prompt_messages,
+                max_tokens=300,
+                temperature=0.1,
+            )
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return f"Project summary (fallback): {project_name} - Unable to generate detailed summary. {str(e)}"
+    
+    @staticmethod
+    async def get_directory_summary(project_name: str, dir_path: str, query: str = "") -> str:
+        """Generate AI summary of a directory"""
+        try:
+            # Get directory path
+            if project_name == "workspace":
+                project_path = Path(WORKSPACE_DIR)
+            else:
+                project_path = Path(WORKSPACE_DIR) / project_name
+                if not project_path.exists():
+                    raise HTTPException(status_code=404, detail="Project not found")
+            
+            full_dir_path = project_path / dir_path
+            if not full_dir_path.exists() or not full_dir_path.is_dir():
+                raise HTTPException(status_code=404, detail="Directory not found")
+            
+            # Get directory structure
+            files = []
+            dirs = []
+            
+            for item in full_dir_path.iterdir():
+                if item.is_file() and not item.name.startswith('.'):
+                    files.append(item.name)
+                elif item.is_dir() and not item.name.startswith('.'):
+                    dirs.append(item.name)
+            
+            # Search for relevant code in this directory
+            search_query = f"{project_name} {dir_path} {query}" if query else f"{project_name} {dir_path}"
+            chunks = get_vector_store().query(search_query)
+            
+            # Filter chunks to only include files from this directory
+            relevant_chunks = []
+            for file_path, snippet in chunks:
+                if file_path.startswith(dir_path) or dir_path in file_path:
+                    relevant_chunks.append((file_path, snippet))
+            
+            # Build context
+            context_parts = []
+            if relevant_chunks:
+                for file_path, snippet in relevant_chunks[:3]:  # Top 3 relevant chunks
+                    context_parts.append(f"File: {file_path}\n```\n{snippet}\n```")
+            
+            context = "\n\n".join(context_parts) if context_parts else "No relevant code found."
+            
+            # Create directory info
+            structure_info = []
+            if dirs:
+                structure_info.append(f"Directories: {', '.join(dirs[:10])}")
+            if files:
+                structure_info.append(f"Files: {', '.join(files[:15])}")
+            
+            structure = "; ".join(structure_info)
+            
+            # Generate summary
+            prompt_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code analysis assistant. Given a directory structure and code snippets, "
+                        "provide a summary of what this directory contains, its purpose, and key components. "
+                        "Keep response under 200 tokens."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Directory: {dir_path}\nProject: {project_name}\nQuery: {query or 'general overview'}\nStructure: {structure}\n\nCode Context:\n{context}\n\nProvide a directory summary:"
+                }
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-0125",
+                messages=prompt_messages,
+                max_tokens=200,
+                temperature=0.1,
+            )
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return f"Directory summary (fallback): {dir_path} in {project_name} - Unable to generate detailed summary. {str(e)}"
 
 @router.get("/")
 async def list_projects():
@@ -196,4 +325,29 @@ async def get_file_content(project_name: str, path: str = Query(..., description
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting file content: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Error getting file content: {str(e)}")
+
+@router.get("/{project_name}/summary")
+async def get_project_summary(
+    project_name: str,
+    query: str = Query("", description="Optional query to focus the summary")
+):
+    """Get an AI-generated summary of the project"""
+    try:
+        summary = await ProjectService.get_project_summary(project_name, query)
+        return JSONResponse(content={"summary": summary, "project": project_name})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/{project_name}/dir/{path:path}")
+async def get_directory_summary(
+    project_name: str,
+    path: str,
+    query: str = Query("", description="Optional query to focus the summary")
+):
+    """Get an AI-generated summary of a directory"""
+    try:
+        summary = await ProjectService.get_directory_summary(project_name, path, query)
+        return JSONResponse(content={"summary": summary, "project": project_name, "path": path})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

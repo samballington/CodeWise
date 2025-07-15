@@ -1,5 +1,6 @@
 import asyncio
 import os
+import openai
 from typing import AsyncGenerator, Dict, Any, List
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_openai import ChatOpenAI
@@ -130,6 +131,147 @@ class CodeWiseAgent:
         self.tools = self._create_tools()
         self.agent = self._create_agent()
     
+    def _search_code_with_summary(self, query: str) -> str:
+        """Search code and provide both raw snippets and summarized analysis with directory fallback."""
+        chunks = get_vector_store().query(query)
+        
+        # Check if we have good results or need directory fallback
+        if not chunks or len(chunks) < 2:
+            # Try directory-based fallback
+            directory_summary = self._get_directory_fallback_summary(query)
+            if directory_summary:
+                return f"DIRECTORY SUMMARY (limited vector results):\n{directory_summary}"
+        
+        if not chunks:
+            return "No relevant code found."
+        
+        # Raw snippets
+        raw_snippets = "\n\n".join(f"{path}:\n{snippet}" for path, snippet in chunks)
+        
+        # Create simple summary
+        try:
+            context_parts = []
+            for file_path, snippet in chunks:
+                context_parts.append(f"File: {file_path}\n```\n{snippet}\n```")
+            
+            context = "\n\n".join(context_parts)
+            
+            prompt_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code analysis assistant. Given code snippets and a user query, "
+                        "provide a concise technical summary that directly addresses the query. "
+                        "Focus on key functionality, patterns, and relevant implementation details. "
+                        "Keep response under 150 tokens."
+                    )
+                },
+                {
+                    "role": "user", 
+                    "content": f"User Query: {query}\n\nCode Context:\n{context}\n\nProvide a concise summary:"
+                }
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-0125",
+                messages=prompt_messages,
+                max_tokens=150,
+                temperature=0.1,
+            )
+            summary = response.choices[0].message.content.strip()
+            
+            return f"SUMMARY: {summary}\n\nRAW SNIPPETS:\n{raw_snippets}"
+            
+        except Exception as e:
+            # Fallback to just raw snippets
+            return f"SUMMARY: Found {len(chunks)} relevant snippets across files: {', '.join(set(path for path, _ in chunks))}\n\nRAW SNIPPETS:\n{raw_snippets}"
+    
+    def _get_directory_fallback_summary(self, query: str) -> str:
+        """Get directory-based summary when vector search is insufficient."""
+        try:
+            import os
+            from pathlib import Path
+            
+            workspace_dir = "/workspace"
+            workspace_path = Path(workspace_dir)
+            
+            if not workspace_path.exists():
+                return ""
+            
+            # Look for directories that might match the query
+            relevant_dirs = []
+            query_lower = query.lower()
+            
+            for item in workspace_path.iterdir():
+                if item.is_dir() and not item.name.startswith('.'):
+                    # Check if directory name is relevant to query
+                    if (query_lower in item.name.lower() or 
+                        item.name.lower() in query_lower or
+                        any(word in item.name.lower() for word in query_lower.split())):
+                        relevant_dirs.append(item)
+            
+            if not relevant_dirs:
+                # Fallback to common directories
+                common_dirs = ['src', 'app', 'lib', 'components', 'utils', 'api', 'services']
+                for dir_name in common_dirs:
+                    dir_path = workspace_path / dir_name
+                    if dir_path.exists() and dir_path.is_dir():
+                        relevant_dirs.append(dir_path)
+                        break
+            
+            if not relevant_dirs:
+                return ""
+            
+            # Generate summary for the most relevant directory
+            target_dir = relevant_dirs[0]
+            relative_path = str(target_dir.relative_to(workspace_path))
+            
+            # Get directory structure
+            files = []
+            dirs = []
+            
+            for item in target_dir.iterdir():
+                if item.is_file() and not item.name.startswith('.'):
+                    files.append(item.name)
+                elif item.is_dir() and not item.name.startswith('.'):
+                    dirs.append(item.name)
+            
+            # Create structure info
+            structure_info = []
+            if dirs:
+                structure_info.append(f"Directories: {', '.join(dirs[:5])}")
+            if files:
+                structure_info.append(f"Files: {', '.join(files[:10])}")
+            
+            structure = "; ".join(structure_info)
+            
+            prompt_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code analysis assistant. Given a directory structure and user query, "
+                        "provide a helpful summary of what this directory likely contains and how it "
+                        "relates to the user's query. Keep response under 200 tokens."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"User Query: {query}\n\nDirectory: {relative_path}\nStructure: {structure}\n\nProvide a directory summary:"
+                }
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo-0125",
+                messages=prompt_messages,
+                max_tokens=200,
+                temperature=0.1,
+            )
+            
+            return f"Directory '{relative_path}' summary: {response.choices[0].message.content.strip()}"
+            
+        except Exception as e:
+            return f"Directory fallback failed: {str(e)}"
+
     def _create_tools(self) -> List[Tool]:
         """Create LangChain tools from MCP wrapper methods"""
         return [
@@ -141,15 +283,11 @@ class CodeWiseAgent:
             ),
             Tool(
                 name="search_code",
-                description="Retrieve up to 3 relevant code snippets from the project for a natural language query.",
-                func=lambda x: "\n\n".join(
-                    f"{path}:\n{snippet}" for path, snippet in get_vector_store().query(x)
-                ),
+                description="Retrieve up to 3 relevant code snippets from the project for a natural language query. Returns both raw snippets and a summarized analysis.",
+                func=lambda x: self._search_code_with_summary(x),
                 coroutine=lambda x: asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: "\n\n".join(
-                        f"{p}:\n{s}" for p, s in get_vector_store().query(x)
-                    ),
+                    lambda: self._search_code_with_summary(x),
                 ),
             ),
             Tool(

@@ -1,16 +1,18 @@
 import React, { useState } from 'react';
 import { useProjectStore } from '../lib/projectStore';
 import { FileIcon } from './FileIcon';
-import { ChevronRight, ChevronDown } from 'lucide-react';
+import { ChevronRight, ChevronDown, FileText } from 'lucide-react';
 import { FileNode } from '../types/project';
+import { SummaryPanel } from './SummaryPanel';
 
 interface FileTreeNodeProps {
   node: FileNode;
   level: number;
   onFileClick: (filePath: string) => void;
+  onSummaryClick: (path: string, isDirectory: boolean) => void;
 }
 
-const FileTreeNode: React.FC<FileTreeNodeProps> = ({ node, level, onFileClick }) => {
+const FileTreeNode: React.FC<FileTreeNodeProps> = ({ node, level, onFileClick, onSummaryClick }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const hasChildren = node.children && node.children.length > 0;
 
@@ -27,12 +29,17 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({ node, level, onFileClick })
     setIsExpanded(!isExpanded);
   };
 
+  const handleSummaryClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onSummaryClick(node.path, node.type === 'directory');
+  };
+
   return (
     <div>
       <div
         className={`
           flex items-center py-1 px-2 hover:bg-gray-100 cursor-pointer
-          text-sm select-none
+          text-sm select-none group
         `}
         style={{ paddingLeft: `${level * 12 + 8}px` }}
         onClick={handleClick}
@@ -67,8 +74,17 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({ node, level, onFileClick })
           {node.name}
         </span>
         
+        {/* Summary button */}
+        <button
+          onClick={handleSummaryClick}
+          className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-200 rounded transition-opacity ml-auto"
+          title="View summary"
+        >
+          <FileText className="w-3 h-3 text-gray-500" />
+        </button>
+        
         {node.type === 'file' && node.size && (
-          <span className="ml-auto text-xs text-gray-500">
+          <span className="text-xs text-gray-500 ml-2">
             {formatFileSize(node.size)}
           </span>
         )}
@@ -82,6 +98,7 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({ node, level, onFileClick })
               node={child}
               level={level + 1}
               onFileClick={onFileClick}
+              onSummaryClick={onSummaryClick}
             />
           ))}
         </div>
@@ -106,10 +123,26 @@ export const FileTree: React.FC = () => {
     loading,
     error 
   } = useProjectStore();
+  
+  const [summaryPanel, setSummaryPanel] = useState<{
+    projectName: string;
+    directoryPath?: string;
+    filePath?: string;
+  } | null>(null);
 
   const handleFileClick = async (filePath: string) => {
     if (currentProject) {
       await fetchFileContent(currentProject, filePath);
+    }
+  };
+
+  const handleSummaryClick = (path: string, isDirectory: boolean) => {
+    if (currentProject) {
+      setSummaryPanel({
+        projectName: currentProject,
+        directoryPath: isDirectory ? path : undefined,
+        filePath: !isDirectory ? path : undefined,
+      });
     }
   };
 
@@ -162,8 +195,18 @@ export const FileTree: React.FC = () => {
           node={fileTree}
           level={0}
           onFileClick={handleFileClick}
+          onSummaryClick={handleSummaryClick}
         />
       </div>
+      
+      {summaryPanel && (
+        <SummaryPanel
+          projectName={summaryPanel.projectName}
+          directoryPath={summaryPanel.directoryPath}
+          filePath={summaryPanel.filePath}
+          onClose={() => setSummaryPanel(null)}
+        />
+      )}
     </div>
   );
 }; 
