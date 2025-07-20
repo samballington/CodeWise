@@ -51,29 +51,33 @@ _Sequence overview:_ the browser streams user input to **backend → backend** c
 | File Coverage | **98.3 %** | > 98 % |
 | Index Freshness | **< 60 s** | < 1 min from file change |
 
+### 6. Lightweight Complexity Scoring  
+* **TinyLM-style heuristic** – measures token-uniqueness instead of calling a large transformer.  
+* Cuts cold-start time by **400 MB** of model downloads while keeping chunk-size decisions within test thresholds.  
+
 <details>
 <summary>Mermaid overview</summary>
 
 ```mermaid
-flowchart LR
-    subgraph Frontend
-        FE[Next.js 14<br/>Port 3000]
+graph TD
+    subgraph "Frontend"
+        FE["Frontend\nNext.js 14 (3000)"]
     end
-    subgraph Backend
-        BE[FastAPI<br/>Port 8000]
-        IDX[Indexer]
-        MCP[MCP Server]
+    subgraph "Backend"
+        BE["Backend\nFastAPI (8000)"]
+        IDX["Indexer"]
+        MCP["MCP Server (8001)"]
     end
-    subgraph Storage
-        WS[/workspace]
-        VC[.vector_cache]
+    subgraph "Storage"
+        WS["/workspace"]
+        VC[(".vector_cache")]
     end
 
-    FE -- WebSocket / HTTP --> BE
-    BE -- Index requests --> IDX
-    BE -- File ops --> MCP
-    IDX -- Embeddings --> VC
-    MCP -- RW --> WS
+    FE -->|"WebSocket / HTTP"| BE
+    BE -->|"Hybrid query"| IDX
+    BE -->|"Secure file ops"| MCP
+    IDX -->|"Vectors"| VC
+    MCP --> WS
 ```
 </details>
 
