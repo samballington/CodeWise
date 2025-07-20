@@ -194,7 +194,7 @@ class KimiProvider(BaseProvider):
     
     def __init__(self, api_key: str = None, model_name: str = "moonshot-v1-8k"):
         # Use provided API key or default from TODO.txt
-        api_key = api_key or "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"
+        api_key = api_key or ""
         
         super().__init__(api_key, model_name)
         self.base_url = "https://api.moonshot.cn/v1"
