@@ -1,6 +1,6 @@
 # CodeWise
 
-![UI Example](docs/ui_example.png)
+![UI Example](ui_example.png)
 
 CodeWise is an AI-powered development assistant that combines deep code understanding with a hybrid search engine to deliver precise, context-aware answers for large, multi-language codebases.
 
@@ -12,7 +12,7 @@ CodeWise is an AI-powered development assistant that combines deep code understa
 
 ---
 
-## What CodeWise Does Today
+## What CodeWise Does 
 
 ### 1. Intelligent Code Understanding
 * **AST-Aware Chunking**  
