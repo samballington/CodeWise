@@ -9,5 +9,6 @@ COPY . .
 
 ENV WORKSPACE_DIR=/workspace
 ENV OPENAI_API_KEY=""
+ENV PYTHONPATH=/app:/app/indexer
 
 CMD ["python", "main.py"] 

@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback } from 'react'
-import { useChatStore } from '@/lib/store'
+import { useChatStore, useContextStore, ContextActivity } from '@/lib/store'
 
 export const useWebSocket = () => {
   const [socket, setSocket] = useState<WebSocket | null>(null)
   const [connected, setConnected] = useState(false)
   const { addMessage, updateLastMessage } = useChatStore()
+  const { setGatheringContext, addContextActivity, clearContextActivities } = useContextStore()
 
   useEffect(() => {
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws'
@@ -51,6 +52,47 @@ export const useWebSocket = () => {
         })
         break
 
+      case 'context_gathering_start':
+        console.log('🔍 Context gathering started:', data.message)
+        setGatheringContext(true)
+        addContextActivity({
+          id: Date.now().toString(),
+          type: 'start',
+          message: data.message || 'Starting context analysis...',
+          timestamp: new Date(),
+        })
+        break
+
+      case 'context_search':
+        console.log('🔎 Context search:', data.source, '-', data.query)
+        addContextActivity({
+          id: Date.now().toString(),
+          type: 'search',
+          message: `Grabbing context from: ${data.source}`,
+          source: data.source,
+          query: data.query,
+          timestamp: new Date(),
+        })
+        break
+
+      case 'context_gathering_complete':
+        console.log('✅ Context gathering complete:', data)
+        setGatheringContext(false)
+        addContextActivity({
+          id: Date.now().toString(),
+          type: 'complete',
+          message: data.no_context 
+            ? 'No relevant context found' 
+            : `Found ${data.chunks_found || 0} relevant chunks from ${data.files_analyzed || 0} files`,
+          sources: data.sources,
+          chunksFound: data.chunks_found,
+          filesAnalyzed: data.files_analyzed,
+          timestamp: new Date(),
+        })
+        break
+
+
+
       case 'agent_action':
         updateLastMessage({
           content: `🔧 ${data.action}: ${data.log}`,
@@ -92,6 +134,10 @@ export const useWebSocket = () => {
         updateLastMessage({
           isComplete: true,
         })
+        // Clear context activities after completion
+        setTimeout(() => {
+          clearContextActivities()
+        }, 2000) // Keep visible for 2 seconds after completion
         break
 
       case 'stream_token':
@@ -117,11 +163,23 @@ export const useWebSocket = () => {
   }
 
   const sendMessage = useCallback(
-    (content: string) => {
+    (messageOrContent: string | { content: string; mentionedProjects: string[] }) => {
       if (socket && socket.readyState === WebSocket.OPEN) {
+        let content: string
+        let mentionedProjects: string[] = []
+        
+        // Handle both string and object formats
+        if (typeof messageOrContent === 'string') {
+          content = messageOrContent
+        } else {
+          content = messageOrContent.content
+          mentionedProjects = messageOrContent.mentionedProjects
+        }
+        
         const message = {
           type: 'user_message',
           content,
+          mentionedProjects: mentionedProjects.length > 0 ? mentionedProjects : undefined
         }
         socket.send(JSON.stringify(message))
         
@@ -132,9 +190,12 @@ export const useWebSocket = () => {
           content,
           timestamp: new Date(),
         })
+        
+        // Clear previous context activities when starting new message
+        clearContextActivities()
       }
     },
-    [socket, addMessage]
+    [socket, addMessage, clearContextActivities]
   )
 
   return {

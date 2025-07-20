@@ -7,6 +7,8 @@ import mimetypes
 import openai
 from datetime import datetime
 from vector_store import get_vector_store
+import shutil
+from pydantic import BaseModel
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -14,6 +16,10 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 # Get workspace directory from environment
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
+
+class CloneRequest(BaseModel):
+    repo_url: str
+    target_name: Optional[str] = None
 
 class ProjectService:
     @staticmethod
@@ -295,6 +301,102 @@ class ProjectService:
             
         except Exception as e:
             return f"Directory summary (fallback): {dir_path} in {project_name} - Unable to generate detailed summary. {str(e)}"
+    
+    @staticmethod
+    def delete_project(project_name: str) -> Dict[str, Any]:
+        """Delete a project and clean up its vector embeddings"""
+        if project_name == "workspace":
+            raise HTTPException(status_code=400, detail="Cannot delete workspace root")
+        
+        workspace_path = Path(WORKSPACE_DIR)
+        project_path = workspace_path / project_name
+        
+        if not project_path.exists():
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        if not project_path.is_dir():
+            raise HTTPException(status_code=400, detail="Can only delete directories")
+        
+        try:
+            # Clean up vector embeddings first
+            vector_store = get_vector_store()
+            vector_cleanup_success = vector_store.remove_project_embeddings(project_name)
+            
+            # Delete the project directory
+            shutil.rmtree(project_path)
+            
+            return {
+                "success": True,
+                "message": f"Project '{project_name}' deleted successfully",
+                "vector_cleanup": vector_cleanup_success
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
+    
+    @staticmethod
+    def clone_any_github_repo(repo_url: str, target_name: str = None) -> Dict[str, Any]:
+        """Clone any public GitHub repository"""
+        import subprocess
+        
+        # Parse repository URL or user/repo format
+        if repo_url.startswith("http"):
+            # Full URL provided
+            clone_url = repo_url
+            if target_name is None:
+                # Extract repo name from URL
+                target_name = repo_url.rstrip('/').split('/')[-1]
+                if target_name.endswith('.git'):
+                    target_name = target_name[:-4]
+        else:
+            # Assume user/repo format
+            if '/' not in repo_url:
+                raise HTTPException(status_code=400, detail="Invalid repository format. Use 'user/repo' or full URL")
+            
+            clone_url = f"https://github.com/{repo_url}.git"
+            if target_name is None:
+                target_name = repo_url.split('/')[-1]
+        
+        workspace_path = Path(WORKSPACE_DIR)
+        target_path = workspace_path / target_name
+        
+        # Check if project already exists
+        if target_path.exists():
+            raise HTTPException(status_code=400, detail=f"Project '{target_name}' already exists")
+        
+        try:
+            # Clone the repository
+            result = subprocess.run([
+                "git", "clone", clone_url, str(target_path)
+            ], capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            
+            if result.returncode != 0:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Failed to clone repository: {result.stderr}"
+                )
+            
+            # Get project info
+            project_size = ProjectService._get_directory_size(target_path)
+            
+            return {
+                "success": True,
+                "message": f"Repository cloned successfully as '{target_name}'",
+                "project_name": target_name,
+                "project_path": str(target_path.relative_to(workspace_path)),
+                "size": project_size,
+                "clone_url": clone_url
+            }
+            
+        except subprocess.TimeoutExpired:
+            # Clean up partial clone on timeout
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            raise HTTPException(status_code=408, detail="Clone operation timed out")
+        except Exception as e:
+            # Clean up partial clone on error
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
 
 @router.get("/")
 async def list_projects():
@@ -351,3 +453,23 @@ async def get_directory_summary(
         return JSONResponse(content={"summary": summary, "project": project_name, "path": path})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/{project_name}")
+async def delete_project(project_name: str):
+    """Delete a project and its vector embeddings"""
+    try:
+        result = ProjectService.delete_project(project_name)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/clone")
+async def clone_github_repo(request: CloneRequest):
+    """Clone any public GitHub repository"""
+    try:
+        result = ProjectService.clone_any_github_repo(request.repo_url, request.target_name)
+        return JSONResponse(content=result)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")

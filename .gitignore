@@ -56,3 +56,8 @@ TODO.txt
 feature.md
 scratchpad.md
 GITHUB_OAUTH.md
+
+# Specs and DOC specs
+*.spec.md
+docs/**
+specs/**

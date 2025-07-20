@@ -7,6 +7,7 @@ import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
 import GitHubAuth from '../components/GitHubAuth'
 import { ProjectLayout } from '../components/ProjectLayout'
+import APIProviderToggle from '../components/APIProviderToggle'
 
 export default function Home() {
   const { connected, sendMessage } = useWebSocket()
@@ -65,6 +66,9 @@ export default function Home() {
                 </svg>
               )}
             </button>
+
+            {/* API Provider Toggle */}
+            <APIProviderToggle />
 
             {/* GitHub toggle */}
             <button
