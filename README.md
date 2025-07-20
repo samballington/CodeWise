@@ -1,6 +1,6 @@
 # CodeWise
 
-![UI Example](ui_example.png)
+![UI Example](uiexample.png)
 
 CodeWise is an AI-powered development assistant that combines deep code understanding with a hybrid search engine to deliver precise, context-aware answers for large, multi-language codebases.
 
