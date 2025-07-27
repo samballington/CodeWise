@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { useProjectStore } from '../lib/projectStore';
-import { ChevronDown, Folder, Clock, HardDrive, Home } from 'lucide-react';
+import { ChevronDown, Folder, Clock, HardDrive, Home, Trash } from 'lucide-react';
 
 export const ProjectSelector: React.FC = () => {
   const { 
@@ -94,6 +94,18 @@ export const ProjectSelector: React.FC = () => {
                   </div>
                   {currentProject === project.name && (
                     <ChevronDown className="w-4 h-4 text-blue-500" />
+                  )}
+                  { !project.is_workspace_root && (
+                    <Trash
+                      className="w-4 h-4 text-red-500 hover:text-red-600"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm(`Delete project '${project.name}'? This will remove its files and embeddings.`)) {
+                          // @ts-ignore – deleteProject will be added to store
+                          useProjectStore.getState().deleteProject(project.name)
+                        }
+                      }}
+                    />
                   )}
                 </div>
                 

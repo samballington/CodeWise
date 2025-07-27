@@ -9,18 +9,23 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy source into /app/backend so imports use backend.*
+COPY . /app/backend
 
-# Create and configure entrypoint script
-RUN echo '#!/bin/bash\nset -e\n\n# Start the FastAPI server\nexec uvicorn main:app --host 0.0.0.0 --port 8000' > /entrypoint.sh && \
-    chmod +x /entrypoint.sh
+# Fix line endings and ensure entrypoint executable
+RUN sed -i 's/\r$//' /app/backend/entrypoint.sh && chmod +x /app/backend/entrypoint.sh
 
-# Use entrypoint to start server
-ENTRYPOINT ["/entrypoint.sh"]
+# Environment variables
+ENV WORKSPACE_DIR=/workspace
+ENV OPENAI_API_KEY=""
+ENV PYTHONPATH=/app:/app/backend
 
-# Expose port
+# Set entrypoint
+ENTRYPOINT ["/app/backend/entrypoint.sh"]
+CMD []
+
 EXPOSE 8000 

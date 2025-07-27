@@ -5,8 +5,8 @@ Test integration of file discovery and AST chunking
 
 import sys
 from pathlib import Path
-from file_discovery import FileDiscoveryEngine
-from ast_chunker import ASTChunker
+from indexer.file_discovery import FileDiscoveryEngine
+from indexer.ast_chunker import ASTChunker
 
 def test_integration():
     """Test the integration of file discovery and AST chunking"""

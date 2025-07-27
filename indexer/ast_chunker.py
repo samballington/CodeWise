@@ -780,23 +780,23 @@ class JavaScriptASTChunker(BaseChunker):
         """Heuristic block terminator: balanced braces OR first empty line after they close."""
         brace_count = 0
         found_opening = False
-
+        
         for i in range(start_line_idx, len(self.source_lines)):
             line = self.source_lines[i]
-
+            
             for char in line:
                 if char == '{':
                     brace_count += 1
                     found_opening = True
                 elif char == '}':
                     brace_count -= 1
-
-            if found_opening and brace_count == 0:
-                # End either at the closing brace line OR the following blank line
-                if i + 1 < len(self.source_lines) and self.source_lines[i + 1].strip() == "":
-                    return i + 2
-                return i + 1
-
+                    
+                    if found_opening and brace_count == 0:
+                        # End either at the closing brace line OR the following blank line
+                        if i + 1 < len(self.source_lines) and self.source_lines[i + 1].strip() == "":
+                            return i + 2
+                        return i + 1
+        
         return -1  # fallback if unbalanced
    
     def _regex_fallback(self, content: str, file_path: Path) -> List[CodeChunk]:
@@ -949,7 +949,7 @@ class MarkdownChunker(BaseChunker):
                 current_section.append(line)
         
         found_headings = any(l.startswith('#') for l in lines)
-
+        
         # Add final section
         if current_section:
             section_text = '\n'.join(current_section)

@@ -3,7 +3,7 @@
 Test script specifically for JavaScript AST chunker
 """
 
-from ast_chunker import ASTChunker
+from indexer.ast_chunker import ASTChunker
 from pathlib import Path
 
 def test_javascript_ast():

@@ -3,7 +3,7 @@
 Detailed test script for the AST chunker to verify specific functionality
 """
 
-from ast_chunker import ASTChunker
+from indexer.ast_chunker import ASTChunker
 from pathlib import Path
 
 def test_python_detailed():

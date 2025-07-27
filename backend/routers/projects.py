@@ -378,6 +378,14 @@ class ProjectService:
             # Get project info
             project_size = ProjectService._get_directory_size(target_path)
             
+            # Notify indexer to rebuild for this project
+            try:
+                import httpx, os
+                indexer_url = os.getenv("INDEXER_URL", "http://indexer:8002")
+                httpx.post(f"{indexer_url}/rebuild", json={"project": target_name}, timeout=5)
+            except Exception as e:
+                print(f"[backend] Warning: could not notify indexer to rebuild: {e}")
+
             return {
                 "success": True,
                 "message": f"Repository cloned successfully as '{target_name}'",

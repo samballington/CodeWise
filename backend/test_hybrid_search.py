@@ -7,7 +7,7 @@ vector search fusion, query processing, and result ranking.
 
 import pytest
 from unittest.mock import Mock, patch, MagicMock
-from hybrid_search import (
+from backend.hybrid_search import (
     HybridSearchEngine,
     QueryProcessor, 
     ResultFusion,

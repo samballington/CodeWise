@@ -5,7 +5,7 @@ Test script for the enhanced file discovery system
 
 import sys
 from pathlib import Path
-from file_discovery import FileDiscoveryEngine
+from indexer.file_discovery import FileDiscoveryEngine
 
 def test_file_discovery():
     """Test the file discovery engine"""

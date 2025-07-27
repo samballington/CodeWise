@@ -5,11 +5,15 @@ import numpy as np
 # type: ignore
 import openai
 openai.log = "warning"
+from sentence_transformers import SentenceTransformer
 import faiss
 from watchfiles import watch
-from file_discovery import FileDiscoveryEngine, FileInfo
-from ast_chunker import ASTChunker, CodeChunk
-from complexity import choose_chunk_size
+from indexer.file_discovery import FileDiscoveryEngine, FileInfo
+from indexer.ast_chunker import ASTChunker, CodeChunk
+from indexer.complexity import choose_chunk_size
+
+# Load local embedder once
+_local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 WORKSPACE = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
 CACHE_DIR = WORKSPACE / ".vector_cache"
@@ -20,6 +24,14 @@ STATS_FILE = CACHE_DIR / "discovery_stats.json"
 CHUNK_SIZE = 400
 EMBED_MODEL = "text-embedding-3-small"
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Optional: disable automatic re-indexing in production to avoid expensive rebuilds
+WATCH_ENABLED = os.getenv("INDEXER_WATCH", "0") == "1"
+
+# Simple build mutex to prevent overlapping rebuilds (e.g., when many file events fire)
+_build_lock = False
+# Flag to remember if a rebuild was requested while a build is already running
+_pending_rebuild = False
 
 def chunk_text(text: str) -> List[str]:
     return [text[i:i+CHUNK_SIZE] for i in range(0,len(text),CHUNK_SIZE)]
@@ -52,67 +64,23 @@ def discover_files() -> List[FileInfo]:
     return discovered_files
 
 def embed_batch(texts: List[str]):
-    embs = []
-    batch_size = 5  # Reduced from 100 to 5 chunks per batch to avoid token limit
-    
-    print(f"[indexer] Processing {len(texts)} chunks in batches of {batch_size}")
-    
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        
-        try:
-            # Validate and clean batch input
-            clean_batch = []
-            for text in batch:
-                if isinstance(text, str) and text.strip():
-                    clean_batch.append(text.strip())
-                else:
-                    clean_batch.append("empty")  # Replace invalid content with placeholder
-            
-            if not clean_batch:
-                print(f"[indexer] Batch {i}-{i+batch_size} contains no valid text, skipping", flush=True)
-                for _ in range(len(batch)):
-                    embs.append([0.0] * 1536)
-                continue
-            
-            print(f"[indexer] Sending batch of {len(clean_batch)} items to OpenAI", flush=True)
-            print(f"[indexer] Sample batch item: {clean_batch[0][:100] if clean_batch else 'empty'}", flush=True)
-            resp = openai.embeddings.create(model=EMBED_MODEL, input=clean_batch)
-            embs.extend([d.embedding for d in resp.data])
-            
-            # Progress logging every 50 chunks
-            if i % 50 == 0:
-                progress = (i / len(texts)) * 100
-                print(f"[indexer] Processed {i}/{len(texts)} chunks ({progress:.1f}%)", flush=True)
-                
-        except openai.BadRequestError as e:
-            if "maximum context length" in str(e):
-                print(f"[indexer] Batch {i}-{i+batch_size} exceeded token limit, skipping", flush=True)
-                # Add empty embeddings to maintain alignment
-                for _ in range(len(batch)):
-                    embs.append([0.0] * 1536)  # text-embedding-3-small dimension
-            else:
-                print(f"[indexer] API error for batch {i}-{i+batch_size}: {e}", flush=True)
-                # Add empty embeddings to maintain alignment
-                for _ in range(len(batch)):
-                    embs.append([0.0] * 1536)
-                continue
-                
-        except Exception as e:
-            print(f"[indexer] Unexpected error for batch {i}-{i+batch_size}: {e}", flush=True)
-            # Add empty embeddings to maintain alignment
-            for _ in range(len(batch)):
-                embs.append([0.0] * 1536)
-            continue
-    
-    if not embs:
-        print("[indexer] No embeddings generated, creating empty index", flush=True)
-        return np.array([]).reshape(0, 1536).astype("float32")
-    
-    print(f"[indexer] Successfully generated {len(embs)} embeddings", flush=True)
-    return np.array(embs).astype("float32")
+    """Generate embeddings locally using MiniLM; returns float32 numpy array."""
+    import numpy as np
+    try:
+        vectors = _local_embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return np.array(vectors, dtype="float32")
+    except Exception as e:
+        print(f"[indexer] Local embedding error: {e}", flush=True)
+        return np.zeros((len(texts), 384), dtype="float32")
 
-def build_index():
+def build_index(project: str | None = None):
+    global _build_lock, _pending_rebuild
+    if _build_lock:
+        # A build is already running – queue another one so that new files are guaranteed to be indexed
+        print("[indexer] build already in progress – queueing another rebuild trigger", flush=True)
+        _pending_rebuild = True
+        return
+    _build_lock = True
     print("[indexer] building vector index with AST chunking…", flush=True)
     texts: List[str] = []
     enhanced_meta: List[dict] = []  # Enhanced metadata with chunk information
@@ -120,8 +88,23 @@ def build_index():
     # Initialize AST chunker
     ast_chunker = ASTChunker()
     
-    # Use enhanced file discovery
-    discovered_files = discover_files()
+    # If a project scope is provided, adjust the root dir
+    root_dir: Path = WORKSPACE if project is None else WORKSPACE / project
+    if project and not root_dir.exists():
+        print(f"[indexer] Requested project '{project}' not found – falling back to whole workspace", flush=True)
+        root_dir = WORKSPACE
+    
+    # Discover files within the requested scope
+    if root_dir == WORKSPACE:
+        discovered_files = discover_files()
+    else:
+        # Temporarily override WORKSPACE for discovery
+        original_workspace = WORKSPACE
+        try:
+            globals()["WORKSPACE"] = root_dir
+            discovered_files = discover_files()
+        finally:
+            globals()["WORKSPACE"] = original_workspace
     
     total_chunks = 0
     processed_files = 0
@@ -148,6 +131,38 @@ def build_index():
             failed_files += 1
             continue
         
+        # Optionally add a file-level summary chunk for large files
+        if len(content) > 2500:
+            summary_len = 1200
+            summary_text = content[:summary_len]
+
+            try:
+                full_rel_path = str(file_info.path.relative_to(WORKSPACE))
+            except Exception:
+                full_rel_path = file_info.relative_path
+            project_name = full_rel_path.split("/", 1)[0].split("\\", 1)[0]
+
+            texts.append(summary_text)
+            summary_meta = {
+                "file_path": str(file_info.path),
+                "relative_path": full_rel_path,
+                "project": project_name,
+                "chunk_text": summary_text,
+                "start_line": 1,
+                "end_line": 0,
+                "file_type": file_info.file_type,
+                "chunk_type": "file_summary",
+                "function_name": None,
+                "class_name": None,
+                "imports": [],
+                "parent_context": None,
+                "dependencies": [],
+                "docstring": None,
+                "decorators": []
+            }
+            enhanced_meta.append(summary_meta)
+            total_chunks += 1
+        
         # Use AST chunker to create intelligent chunks
         try:
             code_chunks = ast_chunker.chunk_content(content, file_info.path)
@@ -155,10 +170,20 @@ def build_index():
             for chunk in code_chunks:
                 texts.append(chunk.text)
                 
-                # Create enhanced metadata
+                # Compute workspace-relative path to preserve project folder
+                try:
+                    full_rel_path = str(Path(chunk.file_path).relative_to(WORKSPACE))
+                except Exception:
+                    full_rel_path = file_info.relative_path  # Fallback
+
+                # Derive project name (first path component)
+                project_name = full_rel_path.split("/", 1)[0].split("\\", 1)[0]
+
+                # Create enhanced metadata (now includes project)
                 chunk_meta = {
                     "file_path": chunk.file_path,
-                    "relative_path": file_info.relative_path,
+                    "relative_path": full_rel_path,
+                    "project": project_name,
                     "chunk_text": chunk.text,
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
@@ -186,9 +211,17 @@ def build_index():
 
             for chunk in dynamic_chunks(content):
                 texts.append(chunk)
+
+                try:
+                    full_rel_path = str(file_info.path.relative_to(WORKSPACE))
+                except Exception:
+                    full_rel_path = file_info.relative_path
+                project_name = full_rel_path.split("/", 1)[0].split("\\", 1)[0]
+
                 chunk_meta = {
                     "file_path": str(file_info.path),
-                    "relative_path": file_info.relative_path,
+                    "relative_path": full_rel_path,
+                    "project": project_name,
                     "chunk_text": chunk,
                     "start_line": 0,
                     "end_line": 0,
@@ -237,7 +270,27 @@ def build_index():
     print(f"[indexer] File types: {dict(file_types)}")
     print(f"[indexer] Summary: {processed_files} processed, {failed_files} failed, {total_chunks} chunks created", flush=True)
 
+    # Record which top-level projects are indexed
+    projects = [p.name for p in Path(WORKSPACE).iterdir() if p.is_dir() and not p.name.startswith('.')]
+    idx_file = CACHE_DIR / "indexed_projects.json"
+    try:
+        idx_file.write_text(json.dumps(projects))
+    except Exception as e:
+        print(f"[indexer] Warning: could not write indexed_projects.json: {e}")
+    _build_lock = False
+    # If another rebuild request came in while we were working, run it now
+    if _pending_rebuild:
+        _pending_rebuild = False
+        print("[indexer] running queued rebuild", flush=True)
+        build_index()
+
 def file_event_listener():
+    if not WATCH_ENABLED:
+        print("[indexer] file watching disabled (set INDEXER_WATCH=1 to enable) – idling…", flush=True)
+        # Keep the process alive so the container stays up
+        import time
+        while True:
+            time.sleep(3600)
     for _ in watch(str(WORKSPACE)):
         print("[indexer] detected file change – rebuilding index", flush=True)
         build_index()
@@ -248,7 +301,7 @@ def ensure_index():
 
 if __name__ == "__main__":
     ensure_index()
-    # start watching in foreground
+    # start watch loop only if enabled
     try:
         file_event_listener()
     except KeyboardInterrupt:
