@@ -89,6 +89,26 @@ async def websocket_endpoint(websocket: WebSocket):
                 user_query = message.get("content", "")
                 mentioned_projects = message.get("mentionedProjects", [])
                 
+                # Quick fix: Extract @mentions from query if not provided by frontend
+                if not mentioned_projects and user_query:
+                    import re
+                    mentions = re.findall(r'@([a-zA-Z0-9_-]+)', user_query)
+                    mentioned_projects = mentions
+                
+                # Persistent project context: maintain project context across conversation
+                if not hasattr(websocket, 'active_project_context'):
+                    websocket.active_project_context = None
+                
+                # If new @mention found, update active context
+                if mentioned_projects:
+                    websocket.active_project_context = mentioned_projects[0]  # Use first mentioned project
+                    logger.info(f"🎯 PROJECT CONTEXT SET: {websocket.active_project_context}")
+                
+                # If no @mention but we have active context, use it
+                elif websocket.active_project_context:
+                    mentioned_projects = [websocket.active_project_context]
+                    logger.info(f"🔄 USING ACTIVE PROJECT CONTEXT: {websocket.active_project_context}")
+                
                 # Log the complete input query
                 logger.info("="*80)
                 logger.info("🔍 FULL USER QUERY INPUT:")
