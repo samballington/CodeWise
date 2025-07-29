@@ -4,15 +4,17 @@ from typing import List, Tuple
 import numpy as np
 import faiss
 # type: ignore
-import openai
 from pathlib import Path
 import logging
+from sentence_transformers import SentenceTransformer
 
 # Set up logging for vector store operations
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Local MiniLM encoder (loads once)
+_vs_embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 WORKSPACE_DIR = "/workspace"
 CACHE_DIR = Path(WORKSPACE_DIR) / ".vector_cache"
@@ -31,6 +33,7 @@ class VectorStore:
         self.meta_path = META_FILE
         self.index = None  # type: ignore
         self.meta: List = []  # Can be tuples or dicts depending on format
+        self._index_mtime = None  # Track last modified time of the loaded index
 
         if self.index_path.exists() and self.meta_path.exists():
             logger.info("Loading existing vector index from cache")
@@ -66,12 +69,17 @@ class VectorStore:
         return paths
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # split into batches of 100
+        # encode locally in batches of 256
         embeddings: List[List[float]] = []
-        for i in range(0, len(texts), 100):
-            batch = texts[i : i + 100]
-            resp = openai.embeddings.create(model=EMBED_MODEL, input=batch)
-            embeddings.extend([d.embedding for d in resp.data])
+        batch_size = 256
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            try:
+                vecs = _vs_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+                embeddings.extend(vecs.tolist())
+            except Exception as e:
+                logger.error(f"Local embedding error: {e}")
+                embeddings.extend([[0.0] * 384] * len(batch))
         return embeddings
 
     def _build(self):
@@ -130,6 +138,11 @@ class VectorStore:
 
     def _load(self):
         self.index = faiss.read_index(str(self.index_path))
+        # Record the mtime we just loaded
+        try:
+            self._index_mtime = self.index_path.stat().st_mtime
+        except Exception:
+            self._index_mtime = None
         with open(self.meta_path, "r", encoding="utf-8") as f:
             raw_meta = json.load(f)
             
@@ -154,6 +167,21 @@ class VectorStore:
                 logger.info(f"Converted legacy metadata to enhanced format with {len(self.meta)} chunks")
         
         logger.info(f"Loaded vector index with {len(self.meta)} chunks from {self.index.ntotal} embeddings")
+
+    def _refresh_if_updated(self):
+        """Reload the FAISS index & metadata if the on-disk file has changed."""
+        try:
+            current_mtime = self.index_path.stat().st_mtime
+        except FileNotFoundError:
+            logger.warning("Index file not found; using empty index")
+            self.index = faiss.IndexFlatL2(768)
+            self.meta = []
+            self._index_mtime = None
+            return
+
+        if self._index_mtime is None or current_mtime != self._index_mtime:
+            logger.info("Detected updated vector index on disk – reloading")
+            self._load()
 
     def _calculate_relevance_score(self, distance: float, file_path: str, query: str) -> float:
         """Calculate relevance score combining distance with contextual factors"""
@@ -208,6 +236,9 @@ class VectorStore:
     # --------------------------- public API ---------------------------
     def query(self, query: str, k: int = 3, min_relevance: float = 0.3) -> List[Tuple[str, str]]:
         """Query the vector store with enhanced relevance scoring and adaptive filtering"""
+        # Ensure we are using the latest index built by the indexer
+        self._refresh_if_updated()
+
         logger.info(f"Vector search query: '{query}' (k={k}, min_relevance={min_relevance})")
         
         if self.index is None or not self.meta:

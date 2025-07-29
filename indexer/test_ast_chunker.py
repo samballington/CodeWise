@@ -7,7 +7,7 @@ JavaScript/TypeScript chunking, and various file type handling.
 
 import pytest
 from pathlib import Path
-from ast_chunker import (
+from indexer.ast_chunker import (
     ASTChunker, 
     PythonASTChunker, 
     JavaScriptChunker,

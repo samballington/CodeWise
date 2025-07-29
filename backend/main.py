@@ -5,6 +5,8 @@ import json
 import asyncio
 from typing import Dict, Any
 import os
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -77,10 +79,43 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             message = json.loads(data)
             
+            # Handle keep-alive ping
+            if message.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
             # Process the message
             if message.get("type") == "user_message":
                 user_query = message.get("content", "")
                 mentioned_projects = message.get("mentionedProjects", [])
+                
+                # Quick fix: Extract @mentions from query if not provided by frontend
+                if not mentioned_projects and user_query:
+                    import re
+                    mentions = re.findall(r'@([a-zA-Z0-9_-]+)', user_query)
+                    mentioned_projects = mentions
+                
+                # Persistent project context: maintain project context across conversation
+                if not hasattr(websocket, 'active_project_context'):
+                    websocket.active_project_context = None
+                
+                # If new @mention found, update active context
+                if mentioned_projects:
+                    websocket.active_project_context = mentioned_projects[0]  # Use first mentioned project
+                    logger.info(f"🎯 PROJECT CONTEXT SET: {websocket.active_project_context}")
+                
+                # If no @mention but we have active context, use it
+                elif websocket.active_project_context:
+                    mentioned_projects = [websocket.active_project_context]
+                    logger.info(f"🔄 USING ACTIVE PROJECT CONTEXT: {websocket.active_project_context}")
+                
+                # Log the complete input query
+                logger.info("="*80)
+                logger.info("🔍 FULL USER QUERY INPUT:")
+                logger.info(f"Query: {user_query}")
+                logger.info(f"Mentioned Projects: {mentioned_projects}")
+                logger.info(f"Timestamp: {datetime.now().isoformat()}")
+                logger.info("="*80)
                 
                 # Log project context if provided
                 if mentioned_projects:
@@ -124,7 +159,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # If we reach final result, add assistant reply to memory
                     if update.get("type") == "final_result":
-                        chat_memory.add_message("assistant", update.get("output", ""))
+                        final_output = update.get("output", "")
+                        
+                        # Log the complete response output
+                        logger.info("="*80)
+                        logger.info("📝 FULL AGENT RESPONSE OUTPUT:")
+                        logger.info(f"Response: {final_output}")
+                        logger.info(f"Response Length: {len(final_output)} chars")
+                        logger.info(f"Timestamp: {datetime.now().isoformat()}")
+                        logger.info("="*80)
+                        
+                        chat_memory.add_message("assistant", final_output)
                 
                 # Send completion message
                 await websocket.send_json({

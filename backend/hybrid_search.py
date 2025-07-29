@@ -11,9 +11,10 @@ from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
 from collections import defaultdict
 import numpy as np
+from pathlib import Path
 
-from bm25_index import BM25Index, BM25Result
-from vector_store import get_vector_store
+from backend.bm25_index import BM25Index, BM25Result
+from backend.vector_store import get_vector_store
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -104,7 +105,7 @@ class QueryProcessor:
 class ResultFusion:
     """Combine and rank results from multiple search methods"""
     
-    def __init__(self, vector_weight: float = 0.6, bm25_weight: float = 0.4):
+    def __init__(self, vector_weight: float = 0.5, bm25_weight: float = 0.5):
         """
         Initialize result fusion with weights
         
@@ -266,12 +267,25 @@ class HybridSearchEngine:
             bm25_index: BM25 index instance (creates new if None)
         """
         self.vector_store = vector_store or get_vector_store()
-        self.bm25_index = bm25_index or BM25Index()
+        
+        # Load cached BM25 index if available
+        if bm25_index is None:
+            bm25_index = BM25Index()
+            bm25_cache_file = Path("/workspace/.vector_cache/bm25_index.json")
+            if bm25_cache_file.exists():
+                if bm25_index.load_index(bm25_cache_file):
+                    logger.info(f"Loaded cached BM25 index from {bm25_cache_file}")
+                else:
+                    logger.warning(f"Failed to load BM25 index from {bm25_cache_file}")
+            else:
+                logger.warning("No cached BM25 index found - BM25 search will be empty")
+        
+        self.bm25_index = bm25_index
         self.query_processor = QueryProcessor()
         self.result_fusion = ResultFusion()
         
-        # Search parameters
-        self.min_relevance_threshold = 0.25
+        # Search parameters (tuned)
+        self.min_relevance_threshold = 0.25  # default threshold
         self.max_results = 20
         
     def build_bm25_index(self, documents: List[Dict]) -> bool:
@@ -307,7 +321,7 @@ class HybridSearchEngine:
         if min_relevance is None:
             min_relevance = self.min_relevance_threshold
         
-        logger.info(f"Hybrid search for: '{query}' (k={k}, min_relevance={min_relevance})")
+        logger.info(f"🔍 HYBRID SEARCH: '{query}' (k={k}, min_relevance={min_relevance})")
         
         # Analyze query to determine search strategy
         query_analysis = self.query_processor.analyze_query(query)
@@ -339,6 +353,21 @@ class HybridSearchEngine:
             result for result in unified_results 
             if result.relevance_score >= min_relevance
         ][:k]
+
+        # Adaptive retry: if too few results, relax threshold once
+        if len(filtered_results) < 8 and min_relevance > 0.05:
+            logger.info(f"Only {len(filtered_results)} results ≥{min_relevance:.2f}; retrying with lower threshold")
+            relaxed_threshold = min_relevance * 0.7
+            filtered_results = [
+                result for result in unified_results
+                if result.relevance_score >= relaxed_threshold
+            ][:k]
+            logger.info(f"Adaptive retry returned {len(filtered_results)} results with threshold {relaxed_threshold:.2f}")
+        
+        # Log search results summary
+        logger.info(f"🔍 SEARCH RESULTS: {len(filtered_results)} results above threshold")
+        for i, result in enumerate(filtered_results[:3]):  # Log top 3 results
+            logger.info(f"  {i+1}. {result.file_path} (score: {result.relevance_score:.3f})")
         
         logger.info(f"Hybrid search returned {len(filtered_results)} results above threshold")
         

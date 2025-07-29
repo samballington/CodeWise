@@ -1,8 +1,12 @@
 #!/bin/bash
 set -e
 
-# Run backend tests; exit if they fail
-pytest -q
+if [ "$RUN_MODE" = "test" ]; then
+  # Run only pytest then exit
+  shift || true
+  pytest -q "$@"
+  exit $?
+fi
 
-# Start the FastAPI server
+# Default behaviour: start FastAPI server
 exec uvicorn main:app --host 0.0.0.0 --port 8000 

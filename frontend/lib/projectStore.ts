@@ -16,6 +16,7 @@ interface ProjectStore extends ProjectState {
   // API calls
   fetchProjects: () => Promise<void>;
   fetchFileTree: (projectName: string) => Promise<void>;
+  deleteProject: (projectName: string) => Promise<void>;
   fetchFileContent: (projectName: string, filePath: string) => Promise<void>;
 }
 
@@ -101,6 +102,26 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
       set({ fileTree: tree, loading: false });
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Failed to fetch file tree', loading: false });
+    }
+  },
+
+  deleteProject: async (projectName: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectName)}`, {
+        method: 'DELETE',
+      })
+      if (!response.ok) {
+        throw new Error(`Failed to delete project: ${response.statusText}`)
+      }
+      // Refresh project list after deletion
+      await get().fetchProjects()
+      // Reset current project if it was deleted
+      const { currentProject } = get()
+      if (currentProject === projectName) {
+        set({ currentProject: null, fileTree: null })
+      }
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Failed to delete project' })
     }
   },
 

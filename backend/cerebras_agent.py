@@ -1,0 +1,1592 @@
+#!/usr/bin/env python3
+"""
+Native Cerebras Agent Implementation
+Follows Cerebras SDK tool calling patterns exactly as documented
+"""
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+from typing import Dict, Any, List, AsyncGenerator
+from cerebras.cloud.sdk import Cerebras
+from pathlib import Path
+import re
+from directory_filters import (
+    get_find_filter_args, get_grep_filter_args, should_include_file,
+    filter_file_list, resolve_workspace_path, get_project_from_path
+)
+from project_context import (
+    get_context_manager, set_project_context, get_current_context,
+    filter_files_by_context
+)
+from enhanced_project_structure import EnhancedProjectStructure
+from backend.smart_search import smart_search
+from backend.path_resolver import PathResolver
+
+logger = logging.getLogger(__name__)
+
+
+class CerebrasNativeAgent:
+    """Native Cerebras agent with proper tool calling support"""
+    
+    def __init__(self, api_key: str, mcp_server_url: str):
+        self.client = Cerebras(api_key=api_key)
+        self.mcp_server_url = mcp_server_url
+        self.tools_schema = self._create_tools_schema()
+        self.available_functions = self._create_function_mapping()
+        self.current_mentioned_projects = None  # Store current project context
+        
+        # Initialize enhanced project structure analyzer
+        self.enhanced_structure = EnhancedProjectStructure(self._call_mcp_tool_wrapper)
+        
+        # Initialize path resolver for Task 3 fix
+        self.path_resolver = PathResolver()
+        
+        # Tool context for result chaining
+        self.tool_context = {
+            'last_search_results': None,
+            'discovered_files': [],
+            'query_intent': None,
+            'main_files': [],
+            'entities_found': []
+        }
+    
+    async def _call_mcp_tool_wrapper(self, tool_name: str, params):
+        """Wrapper method for MCP tool calls to match the expected signature"""
+        if tool_name == "run_command":
+            if isinstance(params, str):
+                command = params
+            else:
+                command = params.get("command", params)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
+        elif tool_name == "read_file":
+            try:
+                with open(params, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception as e:
+                return f"Error reading file: {e}"
+        else:
+            return f"Tool {tool_name} not supported in wrapper"
+        
+    def _filter_results_by_projects(self, results: List, mentioned_projects: List[str] = None) -> List:
+        """Filter search results by mentioned projects using centralized context management"""
+        if not mentioned_projects:
+            return results
+        
+        # Use centralized filtering logic
+        filtered_results = []
+        for result in results:
+            # Get file path from result (handle both search results and file paths)
+            file_path = result.file_path if hasattr(result, 'file_path') else str(result)
+            
+            # Use centralized context manager for consistent filtering
+            if get_context_manager().is_file_in_current_context(file_path):
+                filtered_results.append(result)
+        
+        return filtered_results
+    
+    def _detect_negative_result(self, result_text: str, function_name: str) -> bool:
+        """Detect if a tool result indicates no findings (Phase 1 fix)"""
+        negative_patterns = {
+            "smart_search": ["no results found", "not found", "no matches"],
+            "examine_files": ["file not found", "does not exist", "error reading"],
+            "analyze_relationships": ["not found", "error analyzing", "no references found"]
+        }
+        
+        patterns = negative_patterns.get(function_name, ["not found", "no results"])
+        return any(pattern in result_text.lower() for pattern in patterns)
+    
+    def _get_fallback_guidance(self, function_name: str) -> str:
+        """Get fallback strategy guidance for negative results (Phase 1 fix)"""
+        fallback_strategies = {
+            "smart_search": "Try different search terms or more general queries - smart_search adapts automatically",
+            "examine_files": "Verify file paths are correct or try smart_search to find the files first",
+            "analyze_relationships": "Ensure target exists or try smart_search to find the correct symbol/file names"
+        }
+        
+        return fallback_strategies.get(function_name, "Try alternative approaches or different search terms")
+    
+    async def _get_smart_fallback_files(self, query_intent: str = None, query: str = "") -> List[str]:
+        """Get intelligent fallback files when search fails"""
+        import subprocess
+        from pathlib import Path
+        
+        workspace = Path('/workspace')
+        fallback_files = []
+        
+        try:
+            # Intent-based fallbacks
+            if query_intent == "ARCHITECTURE" or any(word in query.lower() for word in ['architecture', 'system', 'overview', 'structure']):
+                # Look for architectural files
+                arch_patterns = ['README*', 'package.json', 'pom.xml', 'setup.py', 'requirements.txt', 'Dockerfile', 'docker-compose*']
+                for pattern in arch_patterns:
+                    matches = list(workspace.rglob(pattern))
+                    fallback_files.extend([str(f) for f in matches[:2]])  # Limit per pattern
+                
+                # Look for main entry points
+                entry_patterns = ['main.py', 'app.py', 'index.js', 'server.js', 'Application.java', 'manage.py']
+                for pattern in entry_patterns:
+                    matches = list(workspace.rglob(pattern))
+                    fallback_files.extend([str(f) for f in matches[:1]])
+            
+            elif query_intent == "ENTITY" or any(word in query.lower() for word in ['entity', 'model', 'database', 'schema']):
+                # Look for entity-like files
+                try:
+                    cmd = ["find", "/workspace", "-name", "*model*", "-o", "-name", "*entity*", "-o", "-name", "*Entity*", "-type", "f"]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
+                        fallback_files.extend(files[:5])
+                except Exception:
+                    pass
+            
+            else:
+                # General fallbacks - look for common important files
+                general_patterns = ['README*', 'main.*', 'app.*', 'index.*', 'package.json']
+                for pattern in general_patterns:
+                    matches = list(workspace.rglob(pattern))
+                    fallback_files.extend([str(f) for f in matches[:2]])
+            
+            # Remove duplicates and apply project filtering
+            unique_files = []
+            for f in fallback_files:
+                if f not in unique_files:
+                    if self.current_mentioned_projects:
+                        for project in self.current_mentioned_projects:
+                            if f"/{project}/" in f or f.endswith(f"/{project}"):
+                                unique_files.append(f)
+                                break
+                    else:
+                        unique_files.append(f)
+            
+            # Limit to reasonable number
+            return unique_files[:8]
+            
+        except Exception as e:
+            logger.debug(f"Error in smart fallback discovery: {e}")
+            return []
+    
+    def _extract_files_from_search_results(self, search_result: str) -> List[str]:
+        """Extract file paths from smart_search results"""
+        import re
+        
+        files = []
+        
+        # Look for FILE: patterns
+        file_matches = re.findall(r'FILE:\s*([^\n]+)', search_result)
+        files.extend(file_matches)
+        
+        # Look for file paths in results
+        path_matches = re.findall(r'([a-zA-Z0-9_./\\-]+\.[a-zA-Z]{2,4})', search_result)
+        files.extend(path_matches)
+        
+        # Clean and deduplicate
+        cleaned_files = []
+        for f in files:
+            f = f.strip()
+            if f and f not in cleaned_files and not f.startswith('Error'):
+                cleaned_files.append(f)
+        
+        return cleaned_files[:10]  # Limit to 10 files
+    
+    def _extract_query_intent_from_search(self, search_result: str) -> str:
+        """Extract query intent from smart_search results"""
+        import re
+        
+        intent_match = re.search(r'Query Intent:\s*(\w+)', search_result)
+        if intent_match:
+            return intent_match.group(1)
+        return "GENERAL"
+    
+    def _extract_main_target_from_examine_results(self, examine_result: str) -> str:
+        """Extract main target for relationship analysis from examine_files results"""
+        import re
+        
+        # Look for the first successfully examined file
+        file_match = re.search(r'FILE:\s*([^\n]+)', examine_result)
+        if file_match:
+            return file_match.group(1).strip()
+        
+        # Look for class or function names that could be analyzed
+        class_matches = re.findall(r'class\s+(\w+)', examine_result)
+        if class_matches:
+            return class_matches[0]
+        
+        function_matches = re.findall(r'def\s+(\w+)', examine_result)
+        if function_matches:
+            return function_matches[0]
+        
+        return "main"  # Default fallback
+    
+    def _detect_incomplete_response(self, response_text: str) -> bool:
+        """Detect if response indicates intention to do more work (Phase 2 fix)"""
+        continuation_signals = [
+            "let me try", "i will", "let me search", "i'll examine", 
+            "let me check", "i'll look", "let me find", "i will search",
+            "let me explore", "i'll investigate", "let me analyze"
+        ]
+        return any(signal in response_text.lower() for signal in continuation_signals)
+    
+    def _calculate_investigation_completeness(self, tool_calls_made: List[str], messages: List[Dict]) -> float:
+        """Calculate investigation quality score to prevent premature termination (Updated for 3-tool system)"""
+        score = 0.0
+        
+        # Extract function names from tool call signatures
+        tool_types = set()
+        for call in tool_calls_made:
+            if ':' in call:
+                func_name = call.split(':')[0]
+                tool_types.add(func_name)
+        
+        # Points for tool diversity (encourages using different approaches)
+        score += len(tool_types) * 2.0  # Increased weight for tool diversity
+        
+        # Check recent results for negative outcomes
+        recent_results = []
+        for msg in messages[-10:]:  # Check last 10 messages
+            if msg.get('role') == 'tool':
+                recent_results.append(msg.get('content', ''))
+        
+        # Deduct for negative results without alternatives
+        negative_results = sum(1 for result in recent_results if "not found" in result.lower() or "no matches" in result.lower())
+        if negative_results > 0 and len(tool_types) < 2:
+            score -= 1  # Reduced penalty
+        
+        # Bonus for comprehensive investigation patterns (updated for 3-tool system)
+        if "smart_search" in tool_types and "examine_files" in tool_types:
+            score += 2
+        
+        # Bonus for complete workflow
+        if "smart_search" in tool_types and "examine_files" in tool_types and "analyze_relationships" in tool_types:
+            score += 3
+        
+        return score
+    
+    def _create_tools_schema(self) -> List[Dict[str, Any]]:
+        """Create simplified 3-tool architecture schema with smart tools"""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "smart_search",
+                    "strict": True,
+                    "description": "Intelligent unified search combining vector search, keyword search, and entity discovery. Automatically detects query intent (entity, file, general) and routes to optimal search strategies. Use this as your primary search tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query - can be about entities, files, code functionality, or general questions"
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return (default: 10)"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function", 
+                "function": {
+                    "name": "examine_files",
+                    "strict": True,
+                    "description": "Flexible file inspection with multiple detail levels. Automatically uses files from previous smart_search if no paths provided. Can show file summaries, full content, or structural analysis.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of file paths to examine. Optional - will use smart fallbacks from previous search if not provided."
+                            },
+                            "detail_level": {
+                                "type": "string",
+                                "enum": ["summary", "full", "structure"],
+                                "description": "Level of detail: 'summary' (key sections), 'full' (complete content), 'structure' (outline only)"
+                            }
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_relationships",
+                    "strict": True,
+                    "description": "Analyze code relationships and dependencies using AST-based analysis. Automatically uses targets from previous examine_files if no target provided. Find imports, references, related files, and predict impact of changes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target": {
+                                "type": "string",
+                                "description": "Target file, class, or function to analyze relationships for. Optional - will use smart fallbacks from previous tools if not provided."
+                            },
+                            "analysis_type": {
+                                "type": "string",
+                                "enum": ["imports", "usage", "impact", "all"],
+                                "description": "Type of analysis: 'imports' (what it uses), 'usage' (what uses it), 'impact' (change prediction), 'all' (comprehensive)"
+                            }
+                        },
+                        "required": []
+                    }
+                }
+            }
+        ]
+    
+    def _create_function_mapping(self) -> Dict[str, callable]:
+        """Map function names to simplified 3-tool implementations"""
+        return {
+            "smart_search": self._smart_search,
+            "examine_files": self._examine_files,
+            "analyze_relationships": self._analyze_relationships
+        }
+    
+    async def _smart_search(self, query: str, max_results: int = 10) -> str:
+        """Intelligent unified search combining vector, BM25, and entity discovery"""
+        try:
+            logger.info(f"🧠 SMART SEARCH: '{query}' (max_results={max_results})")
+            
+            # Use the smart search engine
+            search_result = await smart_search(query, k=max_results)
+            
+            results = search_result['results']
+            query_analysis = search_result['query_analysis']
+            strategies_used = search_result['search_strategies_used']
+            
+            # Store context for tool chaining
+            self.tool_context['last_search_results'] = search_result
+            self.tool_context['query_intent'] = query_analysis['intent'].value
+            
+            # Apply project filtering if mentioned projects are specified
+            if self.current_mentioned_projects:
+                filtered_results = []
+                for result in results:
+                    # Normalize file path to full workspace path for filtering
+                    file_path = result.file_path
+                    if not file_path.startswith('/workspace/'):
+                        file_path = f"/workspace/{file_path.lstrip('/')}"
+                    
+                    if get_context_manager().is_file_in_current_context(file_path):
+                        filtered_results.append(result)
+                results = filtered_results
+            
+            # Extract discovered files for tool chaining
+            discovered_files = [result.file_path for result in results]
+            self.tool_context['discovered_files'] = discovered_files
+            
+            if not results:
+                filter_msg = f" (filtered for projects: {self.current_mentioned_projects})" if self.current_mentioned_projects else ""
+                
+                # Store intent even when no results found for fallback
+                intent_for_fallback = query_analysis['intent'].value
+                self.tool_context['query_intent'] = intent_for_fallback
+                
+                return f"No results found for query '{query}'{filter_msg}.\n\nQuery Analysis:\n- Intent: {intent_for_fallback}\n- Confidence: {query_analysis['confidence']:.2f}\n- Strategies tried: {', '.join(strategies_used)}\n\n💡 TIP: Other tools can use smart fallbacks based on the detected intent."
+            
+            # Format results with enhanced structure and relevance scoring
+            formatted_results = []
+            formatted_results.append(f"🧠 SMART SEARCH RESULTS ({len(results)} found)")
+            formatted_results.append(f"📊 Query Analysis:")
+            formatted_results.append(f"   • Intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
+            formatted_results.append(f"   • Strategies: {', '.join(strategies_used)}")
+            formatted_results.append(f"   • Execution Time: {search_result.get('execution_time', 0):.2f}s")
+            formatted_results.append("=" * 70)
+            
+            # Store main files for potential relationship analysis
+            main_files = []
+            for i, result in enumerate(results, 1):
+                # Calculate relevance tier
+                if result.confidence >= 0.8:
+                    relevance_tier = "🟢 HIGH"
+                elif result.confidence >= 0.6:
+                    relevance_tier = "🟡 MEDIUM" 
+                else:
+                    relevance_tier = "🔴 LOW"
+                
+                strategies_str = ', '.join(result.search_strategy)
+                formatted_results.append(f"\n📄 RESULT #{i}: {result.file_path}")
+                formatted_results.append(f"   🎯 Relevance: {relevance_tier} ({result.confidence:.3f})")
+                formatted_results.append(f"   🔍 Strategy: {strategies_str}")
+                if result.matched_terms:
+                    formatted_results.append(f"   🏷️  Matched Terms: {', '.join(result.matched_terms)}")
+                formatted_results.append(f"   📝 Code Snippet:")
+                # Indent snippet for better readability
+                snippet_lines = result.snippet.split('\n')
+                for line in snippet_lines[:10]:  # Limit to 10 lines
+                    formatted_results.append(f"      {line}")
+                if len(snippet_lines) > 10:
+                    formatted_results.append(f"      ... ({len(snippet_lines) - 10} more lines)")
+                formatted_results.append("   " + "─" * 60)
+                
+                # Collect high-confidence files as potential main files
+                if result.confidence > 0.7:
+                    main_files.append(result.file_path)
+            
+            self.tool_context['main_files'] = main_files[:3]  # Keep top 3
+            
+            # Add project filter info if applicable
+            if self.current_mentioned_projects:
+                formatted_results.append(f"\n[Filtered for projects: {', '.join(self.current_mentioned_projects)}]")
+            
+            # Add tool chaining hint
+            formatted_results.append(f"\n💡 DISCOVERED: {len(discovered_files)} files ready for examination")
+            
+            return "\n".join(formatted_results)
+            
+        except Exception as e:
+            logger.error(f"Smart search error: {e}")
+            return f"Error during smart search: {str(e)}"
+    
+    def _apply_syntax_highlighting(self, content: str, file_extension: str) -> str:
+        """Apply basic syntax highlighting using markdown code blocks"""
+        
+        # Map file extensions to language identifiers for markdown code blocks
+        language_map = {
+            '.py': 'python',
+            '.js': 'javascript', 
+            '.ts': 'typescript',
+            '.jsx': 'jsx',
+            '.tsx': 'tsx',
+            '.java': 'java',
+            '.cpp': 'cpp',
+            '.c': 'c',
+            '.cs': 'csharp',
+            '.php': 'php',
+            '.rb': 'ruby',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.kt': 'kotlin',
+            '.swift': 'swift',
+            '.html': 'html',
+            '.css': 'css',
+            '.scss': 'scss',
+            '.sass': 'sass',
+            '.json': 'json',
+            '.xml': 'xml',
+            '.yaml': 'yaml',
+            '.yml': 'yaml',
+            '.toml': 'toml',
+            '.ini': 'ini',
+            '.cfg': 'ini',
+            '.conf': 'ini',
+            '.sh': 'bash',
+            '.bash': 'bash',
+            '.zsh': 'zsh',
+            '.fish': 'fish',
+            '.ps1': 'powershell',
+            '.sql': 'sql',
+            '.md': 'markdown',
+            '.dockerfile': 'dockerfile',
+            '.gitignore': 'gitignore',
+            '.env': 'bash'
+        }
+        
+        # Get language for syntax highlighting
+        language = language_map.get(file_extension.lower(), 'text')
+        
+        # Apply markdown code block formatting for syntax highlighting
+        highlighted_content = f"```{language}\n{content}\n```"
+        
+        return highlighted_content
+
+    async def _examine_files(self, file_paths: List[str] = None, detail_level: str = "summary") -> str:
+        """Flexible file inspection with multiple detail levels"""
+        try:
+            # Smart fallback: Use discovered files from previous search or intelligent discovery
+            if not file_paths or len(file_paths) == 0:
+                logger.info("📄 EXAMINE FILES: No files provided, using smart fallbacks")
+                
+                # Try to use files discovered from previous smart_search
+                if self.tool_context['discovered_files']:
+                    file_paths = self.tool_context['discovered_files'][:5]  # Limit to 5
+                    logger.info(f"📄 Using {len(file_paths)} files from previous search results")
+                else:
+                    # Use intelligent fallback discovery
+                    query_intent = self.tool_context.get('query_intent', 'GENERAL')
+                    fallback_files = await self._get_smart_fallback_files(query_intent)
+                    if fallback_files:
+                        file_paths = fallback_files
+                        logger.info(f"📄 Using {len(file_paths)} fallback files for intent: {query_intent}")
+                    else:
+                        return "❌ No files to examine. Try running smart_search first to discover files, or provide specific file paths."
+            
+            logger.info(f"📄 EXAMINE FILES: {len(file_paths)} files, detail={detail_level}")
+            
+            workspace_path = Path('/workspace')
+            results = []
+            results.append(f"📄 FILE EXAMINATION ({detail_level} level)")
+            
+            # Add context info if using discovered files
+            if self.tool_context['discovered_files'] and file_paths == self.tool_context['discovered_files'][:5]:
+                results.append("🔗 Using files discovered from previous smart_search")
+            elif self.tool_context.get('query_intent') and file_paths != self.tool_context['discovered_files']:
+                results.append(f"🎯 Using smart fallback files for intent: {self.tool_context['query_intent']}")
+            
+            results.append("=" * 60)
+            
+            successful_files = []
+            failed_files = []
+            
+            for file_path in file_paths[:10]:  # Limit to 10 files
+                try:
+                    # Resolve path
+                    if not file_path.startswith('/workspace'):
+                        full_path = workspace_path / file_path.lstrip('./')
+                    else:
+                        full_path = Path(file_path)
+                    
+                    if not full_path.exists():
+                        results.append(f"\n❌ FILE NOT FOUND: {file_path}")
+                        continue
+                    
+                    results.append(f"\n📁 FILE: {file_path}")
+                    
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    
+                    lines = content.split('\n')
+                    file_size = len(content)
+                    line_count = len(lines)
+                    
+                    results.append(f"   Size: {file_size:,} chars | Lines: {line_count:,}")
+                    
+                    if detail_level == "structure":
+                        # Show file structure (functions, classes, imports)
+                        structure_info = self._analyze_file_structure(content, full_path.suffix)
+                        results.append(f"   📋 Structure:\n{structure_info}")
+                        
+                        # Also show a small code sample with syntax highlighting for structure level
+                        if line_count > 0:
+                            sample_lines = min(15, line_count)
+                            code_sample = '\n'.join(lines[:sample_lines])
+                            if sample_lines < line_count:
+                                code_sample += f"\n... ({line_count - sample_lines} more lines)"
+                            highlighted_sample = self._apply_syntax_highlighting(code_sample, full_path.suffix)
+                            results.append(f"   📝 CODE SAMPLE:\n{highlighted_sample}")
+                    
+                    elif detail_level == "summary":
+                        # Show first 20 and last 10 lines with syntax highlighting
+                        if line_count <= 30:
+                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
+                        else:
+                            head = '\n'.join(lines[:20])
+                            tail = '\n'.join(lines[-10:])
+                            highlighted_head = self._apply_syntax_highlighting(head, full_path.suffix)
+                            highlighted_tail = self._apply_syntax_highlighting(tail, full_path.suffix)
+                            results.append(f"   📝 HEAD (20 lines):\n{highlighted_head}")
+                            results.append(f"\n   ... ({line_count - 30} lines omitted) ...")
+                            results.append(f"\n   📝 TAIL (10 lines):\n{highlighted_tail}")
+                    
+                    elif detail_level == "full":
+                        # Show complete content with syntax highlighting (truncated if very large)
+                        if file_size > 10000:  # 10KB limit
+                            truncated_content = content[:10000] + "\n... (content truncated)"
+                            highlighted_content = self._apply_syntax_highlighting(truncated_content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT (truncated):\n{highlighted_content}")
+                        else:
+                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
+                    
+                    results.append("   " + "-" * 50)
+                    successful_files.append(file_path)
+                    
+                except Exception as e:
+                    results.append(f"\n❌ ERROR reading {file_path}: {str(e)}")
+                    failed_files.append(file_path)
+            
+            # Store context for tool chaining
+            self.tool_context['examined_files'] = successful_files
+            if successful_files:
+                # Store the first successfully examined file as potential target for relationship analysis
+                self.tool_context['main_target'] = successful_files[0]
+            
+            # Add summary
+            if successful_files or failed_files:
+                results.append(f"\n📊 SUMMARY:")
+                results.append(f"   ✅ Successfully examined: {len(successful_files)} files")
+                if failed_files:
+                    results.append(f"   ❌ Failed to read: {len(failed_files)} files")
+                if successful_files:
+                    results.append(f"   💡 Main target for relationships: {successful_files[0]}")
+            
+            return "\n".join(results)
+            
+        except Exception as e:
+            logger.error(f"Examine files error: {e}")
+            return f"Error during file examination: {str(e)}"
+    
+    def _analyze_file_structure(self, content: str, file_extension: str) -> str:
+        """Analyze file structure to show key components with improved formatting"""
+        try:
+            lines = content.split('\n')
+            structure = []
+            
+            if file_extension in ['.py']:
+                # Python structure analysis with categories
+                imports = []
+                classes = []
+                functions = []
+                decorators = []
+                
+                for i, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if stripped.startswith('import ') or stripped.startswith('from '):
+                        imports.append(f"       📦 L{i:3}: {stripped}")
+                    elif stripped.startswith('class '):
+                        classes.append(f"       🏗️  L{i:3}: {stripped}")
+                    elif stripped.startswith('def '):
+                        indent = len(line) - len(line.lstrip())
+                        if indent <= 4:  # Top-level function
+                            functions.append(f"       ⚙️  L{i:3}: {stripped}")
+                    elif stripped.startswith('@'):
+                        decorators.append(f"       🎯 L{i:3}: {stripped}")
+                
+                # Organize structure output
+                if imports: structure.extend(["     📦 IMPORTS:"] + imports[:5])
+                if classes: structure.extend(["     🏗️  CLASSES:"] + classes[:5])
+                if functions: structure.extend(["     ⚙️  FUNCTIONS:"] + functions[:8])
+                if decorators: structure.extend(["     🎯 DECORATORS:"] + decorators[:3])
+            
+            elif file_extension in ['.js', '.ts', '.jsx', '.tsx']:
+                # JavaScript/TypeScript structure analysis with categories
+                imports = []
+                exports = []
+                functions = []
+                classes = []
+                
+                for i, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if len(stripped) < 100:  # Avoid very long lines
+                        if stripped.startswith('import '):
+                            imports.append(f"       📦 L{i:3}: {stripped}")
+                        elif stripped.startswith('export '):
+                            exports.append(f"       📤 L{i:3}: {stripped}")
+                        elif 'function ' in stripped:
+                            functions.append(f"       ⚙️  L{i:3}: {stripped}")
+                        elif stripped.startswith('class '):
+                            classes.append(f"       🏗️  L{i:3}: {stripped}")
+                        elif any(stripped.startswith(keyword) for keyword in ['const ', 'let ', 'var ', 'interface ', 'type ']):
+                            exports.append(f"       📝 L{i:3}: {stripped}")
+                
+                # Organize structure output
+                if imports: structure.extend(["     📦 IMPORTS:"] + imports[:5])
+                if classes: structure.extend(["     🏗️  CLASSES:"] + classes[:3])
+                if functions: structure.extend(["     ⚙️  FUNCTIONS:"] + functions[:5])
+                if exports: structure.extend(["     📤 EXPORTS/DECLARATIONS:"] + exports[:5])
+            
+            elif file_extension in ['.java', '.kt']:
+                # Java/Kotlin structure analysis
+                for i, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if stripped.startswith('package '):
+                        structure.append(f"     📦 L{i:3}: {stripped}")
+                    elif stripped.startswith('import '):
+                        structure.append(f"     📥 L{i:3}: {stripped}")
+                    elif any(stripped.startswith(keyword) for keyword in ['public class ', 'class ']):
+                        structure.append(f"     🏗️  L{i:3}: {stripped}")
+                    elif stripped.startswith('interface '):
+                        structure.append(f"     🔌 L{i:3}: {stripped}")
+                    elif stripped.startswith('@'):
+                        structure.append(f"     🎯 L{i:3}: {stripped}")
+            
+            elif file_extension in ['.json']:
+                # JSON structure analysis
+                try:
+                    import json
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        structure.append("     📋 JSON STRUCTURE:")
+                        for key in list(data.keys())[:10]:
+                            value_type = type(data[key]).__name__
+                            structure.append(f"       🔑 {key}: {value_type}")
+                except:
+                    structure.append("     📋 JSON (structure analysis failed)")
+            
+            else:
+                # Generic structure - show first few non-empty lines with better formatting
+                structure.append("     📄 FILE OVERVIEW:")
+                non_empty_lines = [line for line in lines[:20] if line.strip()]
+                for i, line in enumerate(non_empty_lines[:8], 1):
+                    if len(line.strip()) < 100:
+                        structure.append(f"       L{i:3}: {line.strip()}")
+            
+            if not structure:
+                return "     (No significant structure detected)"
+            
+            return '\n'.join(structure[:20])  # Limit to 20 items
+            
+        except Exception as e:
+            return f"     Error analyzing structure: {e}"
+    
+    async def _analyze_relationships(self, target: str = None, analysis_type: str = "all") -> str:
+        """Analyze code relationships and dependencies using AST-based analysis"""
+        try:
+            # Smart fallback: Use target from previous examine_files or discover intelligently
+            if not target or target.strip() == "":
+                logger.info("🔗 ANALYZE RELATIONSHIPS: No target provided, using smart fallbacks")
+                
+                # Try to use main target from previous examine_files
+                if self.tool_context.get('main_target'):
+                    target = self.tool_context['main_target']
+                    logger.info(f"🔗 Using main target from examine_files: {target}")
+                elif self.tool_context.get('main_files'):
+                    target = self.tool_context['main_files'][0]
+                    logger.info(f"🔗 Using main file from search results: {target}")
+                else:
+                    # Use intelligent fallback discovery
+                    query_intent = self.tool_context.get('query_intent', 'GENERAL')
+                    fallback_files = await self._get_smart_fallback_files(query_intent)
+                    if fallback_files:
+                        target = fallback_files[0]
+                        logger.info(f"🔗 Using fallback target for intent {query_intent}: {target}")
+                    else:
+                        return "❌ No target to analyze. Try running smart_search and examine_files first to discover suitable targets."
+            
+            logger.info(f"🔗 ANALYZE RELATIONSHIPS: target='{target}', type={analysis_type}")
+            
+            workspace_path = Path('/workspace')
+            results = []
+            results.append(f"🔗 RELATIONSHIP ANALYSIS")
+            results.append(f"Target: {target}")
+            results.append(f"Analysis Type: {analysis_type}")
+            
+            # Add context info if using discovered target
+            if self.tool_context.get('main_target') and target == self.tool_context['main_target']:
+                results.append("🔗 Using target from previous examine_files")
+            elif self.tool_context.get('main_files') and target in self.tool_context['main_files']:
+                results.append("🎯 Using high-confidence file from search results")
+            elif self.tool_context.get('query_intent'):
+                results.append(f"🎯 Using smart fallback for intent: {self.tool_context['query_intent']}")
+                
+            results.append("=" * 60)
+            
+            # Determine if target is a file or a symbol (class/function)
+            if target.endswith(('.py', '.js', '.ts', '.java', '.kt')) or '/' in target:
+                # It's a file path
+                analysis_results = await self._analyze_file_relationships(target, analysis_type)
+            else:
+                # It's likely a symbol (class, function, etc.)
+                analysis_results = await self._analyze_symbol_relationships(target, analysis_type)
+            
+            results.append(analysis_results)
+            
+            return "\n".join(results)
+            
+        except Exception as e:
+            logger.error(f"Relationship analysis error: {e}")
+            return f"Error during relationship analysis: {str(e)}"
+    
+    async def _analyze_file_relationships(self, file_path: str, analysis_type: str) -> str:
+        """Analyze relationships for a specific file"""
+        try:
+            # Use PathResolver to handle various input formats
+            project_context = self.current_mentioned_projects[0] if self.current_mentioned_projects else None
+            resolved_path, exists = self.path_resolver.resolve_file_path(
+                file_path, 
+                project_context=project_context
+            )
+            
+            if not exists:
+                # Try to suggest alternatives from search results
+                suggestions = self._get_path_suggestions(file_path)
+                error_msg = f"❌ File not found: {file_path}"
+                if suggestions:
+                    error_msg += f"\n💡 Did you mean one of these?\n"
+                    for suggestion in suggestions[:3]:
+                        error_msg += f"   • {suggestion}\n"
+                return error_msg
+            
+            full_path = Path(resolved_path)
+            logger.info(f"🔧 Resolved path: {file_path} → {resolved_path}")
+            
+            results = []
+            
+            # Read file content
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            file_extension = full_path.suffix
+            
+            # Analyze imports (what this file uses)
+            if analysis_type in ["imports", "all"]:
+                imports = self._extract_imports(content, file_extension)
+                if imports:
+                    results.append("\n📥 IMPORTS (what this file uses):")
+                    for imp in imports[:10]:
+                        results.append(f"   • {imp}")
+                else:
+                    results.append("\n📥 IMPORTS: None found")
+            
+            # Analyze usage (what uses this file)
+            if analysis_type in ["usage", "all"]:
+                usage = await self._find_file_usage(file_path)
+                if usage:
+                    results.append(f"\n📤 USAGE (files that import/reference this):")
+                    for use in usage[:10]:
+                        results.append(f"   • {use}")
+                else:
+                    results.append("\n📤 USAGE: No references found")
+            
+            # NEW: Find related files through multiple strategies
+            if analysis_type in ["related", "all"]:
+                related_files = await self._find_related_files(file_path, analysis_type)
+                if related_files:
+                    results.append(f"\n🔗 RELATED FILES ({len(related_files)} found):")
+                    for rel in related_files[:5]:  # Show top 5
+                        results.append(f"   📄 {rel['file']} (confidence: {rel['confidence']:.3f})")
+                        results.append(f"      Relationship: {rel['relationship']} - {rel['reason']}")
+                else:
+                    results.append(f"\n🔗 RELATED FILES: None found")
+            
+            # NEW: Enhanced impact analysis with dependency tracking
+            if analysis_type in ["impact", "all"]:
+                impact_data = await self._analyze_dependency_impact(file_path)
+                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
+                results.append(f"   Risk Level: {impact_data['risk_level']}")
+                results.append(f"   References Found: {impact_data['dependency_count']}")
+                results.append(f"   Files Affected: {len(impact_data.get('affected_files', []))}")
+                
+                if impact_data.get('recommendations'):
+                    results.append(f"   📋 Recommendations:")
+                    for rec in impact_data['recommendations']:
+                        results.append(f"      {rec}")
+                
+                # Also show legacy impact analysis
+                legacy_impact = await self._analyze_change_impact(file_path, content)
+                results.append(f"\n📊 DETAILED IMPACT:")
+                results.append(legacy_impact)
+            
+            # NEW: Graph foundation preparation
+            if analysis_type in ["graph", "all"]:
+                related_files = await self._find_related_files(file_path, analysis_type)
+                graph_data = await self._prepare_graph_foundation(file_path, related_files)
+                if 'error' not in graph_data:
+                    results.append(f"\n🕸️ GRAPH STRUCTURE PREPARED:")
+                    results.append(f"   Nodes: {graph_data['metadata']['node_count']}")
+                    results.append(f"   Edges: {graph_data['metadata']['edge_count']}")
+                    results.append(f"   Ready for Graph RAG enhancement")
+            
+            return '\n'.join(results)
+            
+        except Exception as e:
+            return f"Error analyzing file relationships: {e}"
+    
+    def _get_path_suggestions(self, file_path: str) -> List[str]:
+        """Get path suggestions when file is not found"""
+        suggestions = []
+        
+        # Extract filename from path
+        filename = Path(file_path).name if '/' in file_path else file_path
+        
+        # Use search results if available
+        if self.tool_context.get('last_search_results'):
+            for result in self.tool_context['last_search_results'][:5]:
+                if hasattr(result, 'file_path'):
+                    result_filename = Path(result.file_path).name
+                    if filename.lower() in result_filename.lower() or result_filename.lower() in filename.lower():
+                        suggestions.append(result.file_path)
+        
+        return suggestions
+    
+    def _validate_and_fix_parameters(self, function_name: str, arguments: dict) -> dict:
+        """Fix common parameter validation issues"""
+        fixed_args = arguments.copy()
+        
+        # Fix examine_files file_paths parameter (should be list)
+        if function_name == "examine_files":
+            if "file_paths" in fixed_args:
+                file_paths = fixed_args["file_paths"]
+                # Convert string to list if needed
+                if isinstance(file_paths, str):
+                    fixed_args["file_paths"] = [file_paths] if file_paths else []
+                # Ensure it's a list
+                elif not isinstance(file_paths, list):
+                    fixed_args["file_paths"] = []
+        
+        # Fix smart_search max_results parameter (should be int)
+        if function_name == "smart_search":
+            if "max_results" in fixed_args:
+                try:
+                    fixed_args["max_results"] = int(fixed_args["max_results"])
+                except (ValueError, TypeError):
+                    fixed_args["max_results"] = 10  # Default
+        
+        # Fix analyze_relationships parameters
+        if function_name == "analyze_relationships":
+            # Ensure target is string
+            if "target" in fixed_args and not isinstance(fixed_args["target"], str):
+                fixed_args["target"] = str(fixed_args["target"])
+            
+            # Ensure analysis_type is valid
+            if "analysis_type" in fixed_args:
+                valid_types = ["all", "imports", "usage", "related", "impact", "graph"]
+                if fixed_args["analysis_type"] not in valid_types:
+                    fixed_args["analysis_type"] = "all"
+        
+        return fixed_args
+    
+    async def _find_related_files(self, target: str, analysis_type: str) -> List[Dict[str, Any]]:
+        """Find related files through imports, usage patterns, and naming (Task 3 requirement)"""
+        try:
+            related_files = []
+            
+            # Strategy 1: Find files with similar naming patterns
+            if '/' in target:  # It's a file path
+                file_name = Path(target).stem
+                # Search for files with similar names
+                naming_search = await smart_search(f"{file_name}", k=10)
+                for result in naming_search['results']:
+                    if result.file_path != target:
+                        related_files.append({
+                            'file': result.file_path,
+                            'relationship': 'naming_pattern',
+                            'confidence': result.confidence,
+                            'reason': f"Similar name to {file_name}"
+                        })
+            
+            # Strategy 2: Find files through import patterns
+            import_search = await smart_search(f"import {target}", k=8)
+            for result in import_search['results']:
+                related_files.append({
+                    'file': result.file_path,
+                    'relationship': 'import_usage',
+                    'confidence': result.confidence,
+                    'reason': f"Imports or references {target}"
+                })
+            
+            # Strategy 3: Find files in same directory (structural relationship)
+            if '/' in target:
+                dir_path = str(Path(target).parent)
+                dir_search = await smart_search(f"{dir_path}", k=6)
+                for result in dir_search['results']:
+                    if result.file_path != target:
+                        related_files.append({
+                            'file': result.file_path,
+                            'relationship': 'directory_structure',
+                            'confidence': result.confidence * 0.8,  # Lower confidence for directory matches
+                            'reason': f"Same directory as {target}"
+                        })
+            
+            # Remove duplicates and sort by confidence
+            seen_files = set()
+            unique_related = []
+            for rel in related_files:
+                if rel['file'] not in seen_files:
+                    seen_files.add(rel['file'])
+                    unique_related.append(rel)
+            
+            # Sort by confidence and limit results
+            unique_related.sort(key=lambda x: x['confidence'], reverse=True)
+            return unique_related[:8]  # Return top 8 related files
+            
+        except Exception as e:
+            logger.error(f"Error finding related files: {e}")
+            return []
+
+    async def _analyze_dependency_impact(self, target: str) -> Dict[str, Any]:
+        """Basic impact analysis using dependency tracking (Task 3 requirement)"""
+        try:
+            impact_analysis = {
+                'risk_level': 'LOW',
+                'affected_files': [],
+                'dependency_count': 0,
+                'impact_score': 0.0,
+                'recommendations': []
+            }
+            
+            # Find files that depend on this target
+            usage_search = await smart_search(f"{target}", k=15)
+            dependencies = []
+            
+            for result in usage_search['results']:
+                if result.file_path != target:
+                    dependencies.append({
+                        'file': result.file_path,
+                        'confidence': result.confidence,
+                        'snippet': result.snippet[:100]  # First 100 chars
+                    })
+            
+            impact_analysis['affected_files'] = dependencies[:10]
+            impact_analysis['dependency_count'] = len(dependencies)
+            
+            # Calculate impact score based on number and confidence of dependencies
+            if dependencies:
+                avg_confidence = sum(d['confidence'] for d in dependencies) / len(dependencies)
+                impact_analysis['impact_score'] = min(len(dependencies) * avg_confidence / 10, 1.0)
+                
+                # Determine risk level
+                if len(dependencies) >= 8 or impact_analysis['impact_score'] > 0.7:
+                    impact_analysis['risk_level'] = 'HIGH'
+                    impact_analysis['recommendations'].append("⚠️  High impact change - extensive testing recommended")
+                    impact_analysis['recommendations'].append("🔍 Review all affected files before making changes")
+                elif len(dependencies) >= 4 or impact_analysis['impact_score'] > 0.4:
+                    impact_analysis['risk_level'] = 'MEDIUM'
+                    impact_analysis['recommendations'].append("⚡ Moderate impact - test affected components")
+                else:
+                    impact_analysis['risk_level'] = 'LOW'
+                    impact_analysis['recommendations'].append("✅ Low impact change - minimal testing needed")
+            
+            return impact_analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing dependency impact: {e}")
+            return {'risk_level': 'UNKNOWN', 'error': str(e)}
+
+    async def _prepare_graph_foundation(self, target: str, related_files: List[Dict]) -> Dict[str, Any]:
+        """Prepare foundation for future Graph RAG enhancement (Task 3 requirement)"""
+        try:
+            # Create a basic graph structure that can be enhanced later
+            graph_data = {
+                'nodes': [],
+                'edges': [],
+                'metadata': {
+                    'target': target,
+                    'analysis_timestamp': str(asyncio.get_event_loop().time()),
+                    'node_count': 0,
+                    'edge_count': 0
+                }
+            }
+            
+            # Add target as central node
+            graph_data['nodes'].append({
+                'id': target,
+                'type': 'target',
+                'label': target,
+                'properties': {'is_primary': True}
+            })
+            
+            # Add related files as nodes and create edges
+            for rel_file in related_files:
+                # Add related file as node
+                graph_data['nodes'].append({
+                    'id': rel_file['file'],
+                    'type': 'related_file',
+                    'label': Path(rel_file['file']).name,
+                    'properties': {
+                        'full_path': rel_file['file'],
+                        'relationship_type': rel_file['relationship'],
+                        'confidence': rel_file['confidence']
+                    }
+                })
+                
+                # Add edge between target and related file
+                graph_data['edges'].append({
+                    'source': target,
+                    'target': rel_file['file'],
+                    'type': rel_file['relationship'],
+                    'weight': rel_file['confidence'],
+                    'properties': {'reason': rel_file['reason']}
+                })
+            
+            graph_data['metadata']['node_count'] = len(graph_data['nodes'])
+            graph_data['metadata']['edge_count'] = len(graph_data['edges'])
+            
+            return graph_data
+            
+        except Exception as e:
+            logger.error(f"Error preparing graph foundation: {e}")
+            return {'error': str(e)}
+
+    async def _analyze_symbol_relationships(self, symbol: str, analysis_type: str) -> str:
+        """Analyze relationships for a symbol (class, function, etc.) with enhanced features"""
+        try:
+            # Use smart_search to find the symbol first
+            search_result = await smart_search(f"class {symbol}", k=5)
+            
+            if not search_result['results']:
+                # Try alternative search patterns
+                alt_search = await smart_search(f"{symbol}", k=10)
+                if not alt_search['results']:
+                    return f"❌ Symbol '{symbol}' not found in codebase"
+                search_result = alt_search
+            
+            results = []
+            
+            # Find the primary definition
+            primary_result = search_result['results'][0]
+            results.append(f"\n🎯 PRIMARY DEFINITION:")
+            results.append(f"   File: {primary_result.file_path}")
+            results.append(f"   Confidence: {primary_result.confidence:.3f}")
+            results.append(f"   Snippet:\n{primary_result.snippet[:200]}...")
+            
+            # NEW: Find related files through multiple strategies
+            if analysis_type in ["related", "all"]:
+                related_files = await self._find_related_files(symbol, analysis_type)
+                if related_files:
+                    results.append(f"\n🔗 RELATED FILES ({len(related_files)} found):")
+                    for rel in related_files[:5]:  # Show top 5
+                        results.append(f"   📄 {rel['file']} (confidence: {rel['confidence']:.3f})")
+                        results.append(f"      Relationship: {rel['relationship']} - {rel['reason']}")
+                else:
+                    results.append(f"\n🔗 RELATED FILES: None found")
+            
+            # NEW: Enhanced impact analysis with dependency tracking
+            if analysis_type in ["impact", "all"]:
+                impact_data = await self._analyze_dependency_impact(symbol)
+                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
+                results.append(f"   Risk Level: {impact_data['risk_level']}")
+                results.append(f"   References Found: {impact_data['dependency_count']}")
+                results.append(f"   Files Affected: {len(impact_data.get('affected_files', []))}")
+                
+                if impact_data.get('recommendations'):
+                    results.append(f"   📋 Recommendations:")
+                    for rec in impact_data['recommendations']:
+                        results.append(f"      {rec}")
+            
+            # NEW: Graph foundation preparation
+            if analysis_type in ["graph", "all"]:
+                related_files = await self._find_related_files(symbol, analysis_type)
+                graph_data = await self._prepare_graph_foundation(symbol, related_files)
+                if 'error' not in graph_data:
+                    results.append(f"\n🕸️ GRAPH STRUCTURE PREPARED:")
+                    results.append(f"   Nodes: {graph_data['metadata']['node_count']}")
+                    results.append(f"   Edges: {graph_data['metadata']['edge_count']}")
+                    results.append(f"   Ready for Graph RAG enhancement")
+            
+            # Show usage locations
+            usage_results = search_result['results'][1:6]  # Skip primary definition
+            if usage_results:
+                results.append(f"\n📍 USAGE LOCATIONS:")
+                for usage in usage_results:
+                    results.append(f"   {usage.file_path} (confidence: {usage.confidence:.3f})")
+            
+            return '\n'.join(results)
+            results.append(f"   Snippet:\n{primary_result.snippet}")
+            
+            # Find usages of this symbol
+            if analysis_type in ["usage", "all"]:
+                usage_search = await smart_search(symbol, k=10)
+                usage_results = [r for r in usage_search['results'] if r.file_path != primary_result.file_path]
+                
+                if usage_results:
+                    results.append(f"\n📤 USAGE LOCATIONS:")
+                    for i, usage in enumerate(usage_results[:8], 1):
+                        results.append(f"   {i}. {usage.file_path} (confidence: {usage.confidence:.3f})")
+                else:
+                    results.append(f"\n📤 USAGE: No references found in other files")
+            
+            # Analyze impact
+            if analysis_type in ["impact", "all"]:
+                impact_score = len(search_result['results'])
+                risk_level = "HIGH" if impact_score > 5 else "MEDIUM" if impact_score > 2 else "LOW"
+                
+                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
+                results.append(f"   Risk Level: {risk_level}")
+                results.append(f"   References Found: {impact_score}")
+                results.append(f"   Files Affected: {len(set(r.file_path for r in search_result['results']))}")
+                
+                if impact_score > 5:
+                    results.append("   ⚠️ WARNING: This symbol is widely used - changes may have broad impact")
+                elif impact_score > 2:
+                    results.append("   ⚡ MODERATE: Changes will affect multiple locations")
+                else:
+                    results.append("   ✅ LOW RISK: Limited usage detected")
+            
+            return '\n'.join(results)
+            
+        except Exception as e:
+            return f"Error analyzing symbol relationships: {e}"
+    
+    def _extract_imports(self, content: str, file_extension: str) -> List[str]:
+        """Extract import statements from file content"""
+        imports = []
+        lines = content.split('\n')
+        
+        try:
+            if file_extension == '.py':
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith('import ') or stripped.startswith('from '):
+                        imports.append(stripped)
+            
+            elif file_extension in ['.js', '.ts', '.jsx', '.tsx']:
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith('import ') or stripped.startswith('const ') and ' require(' in stripped:
+                        imports.append(stripped)
+            
+            elif file_extension in ['.java', '.kt']:
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith('import '):
+                        imports.append(stripped)
+        
+        except Exception:
+            pass
+        
+        return imports[:20]  # Limit to 20 imports
+    
+    async def _find_file_usage(self, target_file: str) -> List[str]:
+        """Find files that reference the target file"""
+        try:
+            import subprocess
+            
+            # Get the base name of the file for searching
+            file_name = Path(target_file).stem
+            
+            # Search for references to this file
+            cmd = ["grep", "-r", "-l", file_name, "/workspace"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                references = [f.strip() for f in result.stdout.split('\n') if f.strip() and f.strip() != target_file]
+                return references[:15]  # Limit results
+            
+            return []
+            
+        except Exception as e:
+            logger.debug(f"Error finding file usage: {e}")
+            return []
+    
+    async def _analyze_change_impact(self, file_path: str, content: str) -> str:
+        """Analyze potential impact of changing this file"""
+        try:
+            # Count exports/public symbols
+            lines = content.split('\n')
+            public_symbols = 0
+            
+            for line in lines:
+                stripped = line.strip()
+                if any(keyword in stripped for keyword in ['export ', 'public ', 'def ', 'class ', 'function ']):
+                    public_symbols += 1
+            
+            # Estimate impact based on file characteristics
+            if public_symbols > 10:
+                risk = "HIGH"
+                message = f"File exports {public_symbols} symbols - likely a core module"
+            elif public_symbols > 3:
+                risk = "MEDIUM" 
+                message = f"File exports {public_symbols} symbols - moderate dependencies expected"
+            else:
+                risk = "LOW"
+                message = f"File exports {public_symbols} symbols - limited external dependencies"
+            
+            return f"   Risk Level: {risk}\n   Analysis: {message}"
+            
+        except Exception as e:
+            return f"   Error analyzing impact: {e}"
+    
+    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process a user request using native Cerebras tool calling"""
+        
+        # Log the agent processing start
+        logger.info("🤖 CEREBRAS AGENT PROCESSING START")
+        logger.info(f"Query: {user_query}")
+        logger.info(f"Projects: {mentioned_projects}")
+        logger.info(f"Has Chat History: {chat_history is not None}")
+        
+        # Reset tool context for new request to prevent cross-contamination
+        # Store previous context for debugging if needed
+        previous_context = self.tool_context.copy() if hasattr(self, 'tool_context') else {}
+        
+        self.tool_context = {
+            'last_search_results': None,
+            'discovered_files': [],
+            'query_intent': None,
+            'main_files': [],
+            'entities_found': [],
+            'examined_files': [],
+            'main_target': None,
+            'conversation_id': f"{mentioned_projects}_{hash(user_query) % 10000}",  # Unique conversation ID
+            'query_hash': hash(user_query) % 10000  # Track query uniqueness
+        }
+        logger.info("🔄 Reset tool context for new request")
+        
+        # Set up project context isolation using centralized manager
+        project_name = "workspace"  # Default
+        if mentioned_projects and len(mentioned_projects) > 0:
+            project_name = mentioned_projects[0]  # Use first mentioned project as primary
+        
+        # Set project context to prevent cross-contamination
+        context = set_project_context(project_name, mentioned_projects)
+        logger.info(f"Set project context: {project_name} (mentioned: {mentioned_projects})")
+        
+        # Add search query to context history
+        get_context_manager().add_search_to_context(user_query)
+        
+        # Always reset and properly set mentioned projects for each request to prevent state leakage
+        self.current_mentioned_projects = mentioned_projects if mentioned_projects is not None else []
+        
+        # Determine appropriate tool strategy based on query
+        query_lower = user_query.lower()
+        
+        # Analyze what type of query this is
+        is_entity_query = any(word in query_lower for word in ['entity', 'entities', 'database', 'table', 'model', 'schema'])
+        is_search_query = any(word in query_lower for word in ['find', 'search', 'locate', 'show me', 'explain', 'how'])
+        is_file_query = any(word in query_lower for word in ['file', 'read', 'content', 'source'])
+        
+        # Build system prompt with simplified 3-tool guidance
+        tool_guidance = (
+            "\n🧠 SMART_SEARCH: Your primary search tool that combines vector search, keyword search, and entity discovery"
+            "\n   - Automatically detects query intent (entity, file, general, architecture)"
+            "\n   - Routes to optimal search strategies internally"
+            "\n   - Returns ranked results with confidence scores and matched terms"
+            "\n   - Use this first for any search-related task"
+            "\n"
+            "\n📄 EXAMINE_FILES: Flexible file inspection with multiple detail levels"
+            "\n   - summary: Key sections with first/last lines"
+            "\n   - full: Complete content (truncated if large)"
+            "\n   - structure: File outline showing imports, classes, functions"
+            "\n   - Use this to inspect files found through smart_search"
+            "\n"
+            "\n🔗 ANALYZE_RELATIONSHIPS: AST-based dependency and impact analysis"
+            "\n   - imports: What a file/symbol uses"
+            "\n   - usage: What uses a file/symbol"
+            "\n   - impact: Predicted change impact"
+            "\n   - all: Comprehensive relationship analysis"
+            "\n   - Use this to understand connections and dependencies"
+        )
+        
+        # Add project filtering context if mentioned_projects provided
+        project_context = ""
+        if mentioned_projects:
+            project_context = f"\n\n🎯 PROJECT SCOPE: Focus your search on these specific projects: {', '.join(mentioned_projects)}. Filter results to only include files from these projects."
+        
+        # Initialize messages
+        messages = [
+            {
+                "role": "system", 
+                "content": (
+                    "You are CodeWise, an AI coding assistant with access to 3 powerful, intelligent tools for analyzing codebases. "
+                    "This simplified architecture eliminates complex tool selection - each tool handles multiple use cases intelligently.\n"
+                    "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
+                    f"{tool_guidance}"
+                    "\n\n📋 INVESTIGATION PATTERN:"
+                    "\n1. Use smart_search to find relevant code/files/entities"
+                    "\n2. Use examine_files to inspect key files found"
+                    "\n3. Use analyze_relationships to understand connections and dependencies"
+                    "\n4. Follow up with additional smart_search if needed"
+                    "\n5. Provide comprehensive analysis based on all findings"
+                    f"{project_context}"
+                    "\n\n💡 EXAMPLE WORKFLOWS:"
+                    "\n\nEntity Query: 'Show me database entities'"
+                    "\n1. smart_search('database entities') → automatically detects entity intent, finds all entities"
+                    "\n2. examine_files([entity_files], 'structure') → show entity structure"
+                    "\n3. analyze_relationships('User', 'all') → understand entity relationships"
+                    "\n\nArchitecture Query: 'Explain the system architecture'"
+                    "\n1. smart_search('system architecture') → finds key architectural files"
+                    "\n2. examine_files([main_files], 'summary') → understand key components"
+                    "\n3. analyze_relationships(key_file, 'imports') → map dependencies"
+                    "\n\nThe tools are intelligent - they handle complexity internally so you can focus on providing great answers!"
+                )
+            },
+            {"role": "user", "content": user_query}
+        ]
+        
+        # Add chat history if provided
+        if chat_history:
+            # Insert chat history before the current user message
+            history_messages = []
+            for msg in chat_history[-5:]:  # Last 5 messages
+                if hasattr(msg, 'content'):
+                    role = "user" if msg.type == "human" else "assistant"
+                    history_messages.append({"role": role, "content": msg.content})
+            
+            # Insert history before current user message
+            messages = [messages[0]] + history_messages + [messages[1]]
+        
+        yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
+        
+        # Multi-turn tool calling loop with duplicate detection
+        max_iterations = 6  # Reduced to prevent infinite loops
+        iteration = 0
+        recent_tool_calls = []  # Track recent tool calls to avoid repetition
+        tool_call_count = 0  # Track total tool calls made
+        
+        while iteration < max_iterations:
+            iteration += 1
+            logger.info(f"🔄 ITERATION {iteration}/{max_iterations} (Tool calls so far: {tool_call_count})")
+            
+            try:
+                # PHASE 3: Investigation Quality Gating - Fixed to allow initial tool usage
+                investigation_score = self._calculate_investigation_completeness(recent_tool_calls, messages)
+                
+                # Smart decision making: check if we have enough information
+                has_search_results = bool(self.tool_context.get('last_search_results'))
+                has_examined_files = bool(self.tool_context.get('examined_files'))
+                has_relationships = any('analyze_relationships' in call for call in recent_tool_calls)
+                
+                # Always allow tools on first iteration, then apply quality gating
+                if tool_call_count == 0:
+                    use_tools = self.tools_schema  # Always allow tools initially
+                elif tool_call_count < 6 and investigation_score < 8:  # More permissive threshold
+                    use_tools = self.tools_schema
+                else:
+                    use_tools = None
+                
+                # Make API call to Cerebras
+                response = self.client.chat.completions.create(
+                    model="llama-3.3-70b",  # Use the recommended model
+                    messages=messages,
+                    tools=use_tools,
+                    parallel_tool_calls=False  # Required for some models
+                )
+                
+                choice = response.choices[0].message
+                
+                # Check if there are tool calls
+                if choice.tool_calls:
+                    tool_call_count += len(choice.tool_calls)
+                    
+                    # Add the assistant message with tool calls
+                    messages.append({
+                        "role": "assistant",
+                        "content": choice.content or "",
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments
+                                }
+                            }
+                            for tool_call in choice.tool_calls
+                        ]
+                    })
+                    
+                    # Process each tool call
+                    for tool_call in choice.tool_calls:
+                        function_name = tool_call.function.name
+                        function_args = tool_call.function.arguments
+                        
+                        # Track tool call for duplicate detection
+                        call_signature = f"{function_name}:{function_args}"
+                        recent_tool_calls.append(call_signature)
+                        
+                        # Keep only last 5 calls for duplicate detection
+                        if len(recent_tool_calls) > 5:
+                            recent_tool_calls.pop(0)
+                        
+                        # Log detailed tool call information
+                        logger.info(f"🔧 TOOL CALL: {function_name}")
+                        logger.info(f"Input: {function_args}")
+                        
+                        yield {
+                            "type": "tool_start",
+                            "tool": function_name,
+                            "input": function_args
+                        }
+                        
+                        # Check for repetitive tool calling - improved logic
+                        call_count = recent_tool_calls.count(call_signature)
+                        
+                        # Allow legitimate 3-tool pattern: smart_search → examine_files → analyze_relationships
+                        # Only block if same tool called 3+ times with same args, or excessive total calls
+                        should_block = (
+                            call_count >= 3 or  # Same call 3+ times
+                            (tool_call_count >= 8 and call_count >= 2)  # Many calls + repetition
+                        )
+                        
+                        if should_block:
+                            warning_msg = f"Info: {function_name} has been called {call_count} times with same parameters. Skipping to avoid excessive repetition."
+                            result = warning_msg
+                        elif function_name in self.available_functions:
+                            try:
+                                # Parse arguments and call function
+                                arguments = json.loads(function_args)
+                                
+                                # Fix common parameter validation issues
+                                arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                
+                                logger.info(f"🔧 PARSED ARGS: {arguments}")
+                                result = await self.available_functions[function_name](**arguments)
+                                
+                            except json.JSONDecodeError as e:
+                                result = f"Error parsing {function_name} arguments: {str(e)}"
+                                logger.error(f"JSON decode error for {function_name}: {function_args}")
+                            except TypeError as e:
+                                result = f"Error executing {function_name}: {str(e)}"
+                                logger.error(f"Parameter error for {function_name}: {arguments} -> {str(e)}")
+                            except Exception as e:
+                                result = f"Error executing {function_name}: {str(e)}"
+                                logger.error(f"General error for {function_name}: {str(e)}")
+                        else:
+                            result = f"Unknown function: {function_name}"
+                        
+                        # PHASE 1: Negative Result Fallback System
+                        if self._detect_negative_result(result, function_name) and tool_call_count < 5:
+                            fallback_guidance = self._get_fallback_guidance(function_name)
+                            messages.append({
+                                "role": "system",
+                                "content": f"The previous search returned no results. {fallback_guidance}. Continue investigating before providing final answer."
+                            })
+                        
+                        # Log tool output (truncated for readability)
+                        result_preview = result[:300] + "..." if len(result) > 300 else result
+                        logger.info(f"🔧 TOOL RESULT ({len(result)} chars): {result_preview}")
+                        
+                        yield {
+                            "type": "tool_end",
+                            "output": result
+                        }
+                        
+                        # Add tool result to messages
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result
+                        })
+                    
+                    # After 4+ tool calls, add guidance but allow continued investigation if needed
+                    if tool_call_count >= 4:
+                        messages.append({
+                            "role": "system",
+                            "content": "You have made several tool calls. If you have found sufficient information, provide a comprehensive final answer. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently."
+                        })
+                
+                else:
+                    # No tool calls - we have the final response
+                    final_content = choice.content or "Task completed"
+                    logger.info(f"✅ FINAL RESPONSE ({len(final_content)} chars): {final_content[:500]}...")
+                    
+                    # PHASE 2: Incomplete Response Detection
+                    if self._detect_incomplete_response(final_content) and tool_call_count < 5:
+                        # Don't terminate - add follow-through prompt
+                        messages.append({
+                            "role": "system", 
+                            "content": "You mentioned you would perform additional actions. Please follow through on what you just said you would do instead of providing a final answer."
+                        })
+                        continue  # Skip termination, continue loop
+                    
+                    yield {
+                        "type": "final_result",
+                        "output": final_content
+                    }
+                    break
+                    
+            except Exception as e:
+                yield {
+                    "type": "error", 
+                    "message": f"Cerebras API error: {str(e)}"
+                }
+                break
+        
+        if iteration >= max_iterations:
+            # Force a final call without tools to get an answer
+            try:
+                response = self.client.chat.completions.create(
+                    model="llama-3.3-70b",
+                    messages=messages + [{
+                        "role": "system", 
+                        "content": "Please provide a final answer based on the information you've gathered. No more tool calls are available."
+                    }],
+                    tools=None
+                )
+                final_content = response.choices[0].message.content
+                yield {
+                    "type": "final_result",
+                    "output": final_content or "Unable to provide a complete response due to tool call limits."
+                }
+            except Exception:
+                yield {
+                    "type": "final_result",
+                    "output": "Maximum iterations reached. The response may be incomplete."
+                } 

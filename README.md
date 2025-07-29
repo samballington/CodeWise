@@ -72,7 +72,7 @@ graph TD
         WS["/workspace"]
         VC[(".vector_cache")]
     end
-
+    
     FE -->|"WebSocket / HTTP"| BE
     BE -->|"Hybrid query"| IDX
     BE -->|"Secure file ops"| MCP

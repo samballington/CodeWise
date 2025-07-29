@@ -9,35 +9,52 @@ export const useWebSocket = () => {
 
   useEffect(() => {
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws'
-    const ws = new WebSocket(wsUrl)
+    let ws: WebSocket
+    let pingInterval: NodeJS.Timeout
 
-    ws.onopen = () => {
-      console.log('WebSocket connected')
-      setConnected(true)
-    }
+    const connect = () => {
+      ws = new WebSocket(wsUrl)
 
-    ws.onclose = () => {
-      console.log('WebSocket disconnected')
-      setConnected(false)
-    }
+      ws.onopen = () => {
+        console.log('WebSocket connected')
+        setSocket(ws)
+        setConnected(true)
+        // Send ping every 25 s to keep the connection alive
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }))
+          }
+        }, 25000)
+      }
 
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-    }
+      ws.onclose = () => {
+        console.log('WebSocket disconnected')
+        setConnected(false)
+        clearInterval(pingInterval)
+        // Try to reconnect after 2 s
+        setTimeout(connect, 2000)
+      }
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        handleMessage(data)
-      } catch (error) {
-        console.error('Error parsing message:', error)
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error)
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'pong') return // ignore keep-alive
+          handleMessage(data)
+        } catch (error) {
+          console.error('Error parsing message:', error)
+        }
       }
     }
 
-    setSocket(ws)
+    connect()
 
     return () => {
-      ws.close()
+      clearInterval(pingInterval)
+      ws && ws.close()
     }
   }, [])
 

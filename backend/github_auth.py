@@ -95,6 +95,13 @@ async def clone_repo(request: Request, repo: Dict[str, Any]):
     if resp.status_code != 200 or resp.json().get("status") != "success":
         raise HTTPException(status_code=400, detail="Clone failed")
 
+    # Notify indexer
+    indexer_url = os.getenv("INDEXER_URL", "http://indexer:8002")
+    try:
+        await httpx.AsyncClient().post(f"{indexer_url}/rebuild", json={"project": name}, timeout=5)
+    except Exception as e:
+        print(f"[backend] Warning: could not notify indexer to rebuild: {e}")
+
     return {"status": "success", "message": f"Cloned {name}"}
 
 

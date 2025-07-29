@@ -12,6 +12,13 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import openai
 import requests
+from cerebras.cloud.sdk import Cerebras
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
+_local_embedder = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +79,11 @@ class OpenAIProvider(BaseProvider):
         
         super().__init__(api_key, model_name)
         openai.api_key = self.api_key
+        # Allow custom endpoint (e.g., OpenRouter) via env var
+        custom_base = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL")
+        if custom_base:
+            openai.base_url = custom_base.rstrip("/")
+            logger.info(f"OpenAI provider using custom base URL: {openai.base_url}")
         
         # Model configurations
         self.embedding_model = "text-embedding-3-small"
@@ -192,9 +204,20 @@ class OpenAIProvider(BaseProvider):
 class KimiProvider(BaseProvider):
     """Kimi K2 API provider implementation"""
     
-    def __init__(self, api_key: str = None, model_name: str = "moonshot-v1-8k"):
-        # Use provided API key or default from TODO.txt
-        api_key = api_key or ""
+    def __init__(self, api_key: str | None = None, model_name: str = "moonshot-v1-8k"):
+        """Create a Kimi (Moonshot) provider.
+
+        The key resolution order is:
+        1. Explicit ``api_key`` argument
+        2. Environment variable ``KIMI_API_KEY`` (recommended)
+        3. Fallback placeholder (will inevitably fail)
+        """
+        if api_key is None:
+            api_key = os.getenv("KIMI_API_KEY")
+        if api_key is None:
+            # Keep the original placeholder so unit-tests don’t break, but warn loudly
+            logger.warning("KIMI_API_KEY not provided – using placeholder key; requests will fail until a real key is set")
+            api_key = "sk-placeholder-key"
         
         super().__init__(api_key, model_name)
         self.base_url = "https://api.moonshot.cn/v1"
@@ -301,6 +324,104 @@ class KimiProvider(BaseProvider):
         }
 
 
+# ------------------------- Cerebras Provider ---------------------------
+
+
+class CerebrasProvider(BaseProvider):
+    """Cerebras Cloud LLM provider (free Qwen-3 235B)."""
+
+    def __init__(self, api_key: str | None = None, model_name: str = "qwen-3-235b-a22b"):
+        api_key = api_key or os.getenv("CEREBRAS_API_KEY")
+        if not api_key:
+            raise ValueError("CEREBRAS_API_KEY is required for Cerebras provider")
+
+        super().__init__(api_key, model_name)
+
+        # Initialise SDK client
+        self.client = Cerebras(api_key=api_key)
+
+    # Cerebras does not expose an embedding endpoint yet
+    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        logger.warning("Cerebras provider: embeddings not supported – returning zero vectors")
+        return [[0.0] * 1536] * len(texts)
+
+    def chat_completion(self, messages: List[Dict], **kwargs) -> APIResponse:
+        """Call Cerebras chat/completions endpoint, with optional streaming."""
+        try:
+            temperature = kwargs.get("temperature", 0.7)
+            max_tokens = kwargs.get("max_tokens", 2048)
+            stream = kwargs.get("stream", False)
+
+            # Cerebras SDK uses stream=True to return a generator
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+                stream=stream,
+            )
+
+            if stream:
+                # Accumulate tokens
+                content = ""
+                for chunk in response:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        content += delta
+                usage = {}
+            else:
+                content = response.choices[0].message.content
+                usage = response.usage if hasattr(response, "usage") else {}
+
+            return APIResponse(
+                content=content,
+                model=self.model_name,
+                provider="cerebras",
+                usage=usage,
+                metadata={}
+            )
+        except Exception as e:
+            logger.error(f"Cerebras chat completion failed: {e}")
+            return APIResponse(
+                content=f"Error: Cerebras API error: {e}",
+                model=self.model_name,
+                provider="cerebras",
+                usage={},
+                metadata={"error": str(e)},
+            )
+
+    def get_model_info(self) -> Dict[str, Any]:
+        return {
+            "provider": "cerebras",
+            "chat_model": self.model_name,
+            "embedding_model": None,
+            "max_tokens": 2048,
+            "supports_streaming": True,
+            "supports_functions": False,
+        }
+
+    def _generate_local_embeddings(self, texts: List[str]) -> List[List[float]]:
+        global _local_embedder
+        if SentenceTransformer is None:
+            logger.error("SentenceTransformer not installed; cannot generate local embeddings")
+            return [[0.0] * 768] * len(texts)
+
+        if _local_embedder is None:
+            try:
+                logger.info("Loading local embedding model 'all-MiniLM-L6-v2' …")
+                _local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception as e:
+                logger.error(f"Failed to load local embedding model: {e}")
+                return [[0.0] * 768] * len(texts)
+
+        try:
+            embs = _local_embedder.encode(texts, normalize_embeddings=True).tolist()
+            return embs
+        except Exception as e:
+            logger.error(f"Local embedding inference failed: {e}")
+            return [[0.0] * 768] * len(texts)
+
+
 class APIProviderManager:
     """Manager for switching between different API providers"""
     
@@ -314,29 +435,39 @@ class APIProviderManager:
         try:
             # Initialize OpenAI provider
             openai_key = os.getenv("OPENAI_API_KEY")
+            default_model = os.getenv("DEFAULT_PROVIDER_MODEL", "gpt-4")
             if openai_key:
-                self.providers['openai'] = OpenAIProvider(openai_key)
+                self.providers['openai'] = OpenAIProvider(openai_key, model_name=default_model)
                 logger.info("OpenAI provider initialized")
+                logger.info(f"✅ Default model slug: {default_model}")
             else:
                 logger.warning("OpenAI API key not found")
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI provider: {e}")
         
+        # (Kimi provider intentionally disabled)
+
+        # ------- Cerebras provider (optional) ---------
         try:
-            # Initialize Kimi provider
-            self.providers['kimi'] = KimiProvider()
-            logger.info("Kimi provider initialized")
+            cerebras_key = os.getenv("CEREBRAS_API_KEY")
+            if cerebras_key:
+                self.providers['cerebras'] = CerebrasProvider(cerebras_key, os.getenv("DEFAULT_PROVIDER_MODEL", "qwen-3-235b-a22b"))
+                logger.info("Cerebras provider initialized")
         except Exception as e:
-            logger.error(f"Failed to initialize Kimi provider: {e}")
+            logger.error(f"Failed to initialize Cerebras provider: {e}")
         
-        # Set default provider - temporarily use OpenAI until Kimi key is fixed
-        if 'openai' in self.providers:
+        requested_default = os.getenv("PRIMARY_PROVIDER")
+
+        if requested_default and requested_default in self.providers:
+            self.current_provider_name = requested_default
+            logger.info(f"✅ DEFAULT PROVIDER SET TO {requested_default.upper()}")
+        elif 'openai' in self.providers:
             self.current_provider_name = 'openai'
-            logger.info("✅ DEFAULT PROVIDER SET TO OPENAI (Kimi key needs to be updated)")
-        elif 'kimi' in self.providers:
-            self.current_provider_name = 'kimi'
-            logger.info("✅ DEFAULT PROVIDER SET TO KIMI K2 for cost optimization")
-            logger.info(f"✅ Kimi K2 model: {self.providers['kimi'].model_name}")
+            logger.info("✅ DEFAULT PROVIDER SET TO OPENAI (fallback)")
+        elif self.providers:
+            # pick any available provider deterministically
+            self.current_provider_name = sorted(self.providers.keys())[0]
+            logger.info(f"✅ DEFAULT PROVIDER SET TO {self.current_provider_name.upper()} (first available)")
         else:
             logger.error("❌ No API providers available")
     
@@ -371,9 +502,8 @@ class APIProviderManager:
             logger.error("No active provider for embeddings")
             return [[0.0] * 1536] * len(texts)
         
-        # If current provider doesn't support embeddings, fallback to OpenAI
-        if provider.provider_name == 'kimi':
-            logger.info("Using OpenAI for embeddings while Kimi handles chat completions")
+        if provider.provider_name == 'cerebras':
+            logger.info("Using OpenAI for embeddings while Cerebras handles chat completions")
             if 'openai' in self.providers:
                 return self.providers['openai'].generate_embeddings(texts)
             else:
