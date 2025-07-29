@@ -46,11 +46,22 @@ htmlcov/
 # Docker
 *.pid
 
-# Workspace files (user project files)
+# Workspace files (user project files) - NEVER commit these
+workspace/
 workspace/*
 !workspace/.gitkeep
 
-# Internal documentation and specs
+# Kiro IDE files - NEVER commit these
+.kiro/
+.kiro/**
+.kiro/specs/**
+
+# Claude/AI assistant files - NEVER commit these  
+.claude/
+backend/.claude/
+**/.claude/
+
+# Internal documentation and specs - NEVER commit these
 memory.md 
 TODO.txt
 feature.md
@@ -61,12 +72,13 @@ BRANCH_CONTEXT.md
 docs/**
 specs/**
 
-# Kiro IDE specs and test files (not needed for running app)
-.kiro/specs/**
+# Test files (not needed for running app)
 backend/test_*.py
 indexer/test_*.py
+**/test_*.py
 
 # Development notes and context files
 *.context.md
 *.notes.txt
 *.dev.md
+*.local.md
