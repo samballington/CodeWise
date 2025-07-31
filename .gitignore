@@ -68,6 +68,8 @@ feature.md
 scratchpad.md
 GITHUB_OAUTH.md
 BRANCH_CONTEXT.md
+CURRENTFEATURES.md
+TASK5_IMPLEMENTATION_SUMMARY.md
 *.spec.md
 docs/**
 specs/**

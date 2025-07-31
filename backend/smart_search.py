@@ -21,6 +21,8 @@ from enum import Enum
 from backend.hybrid_search import HybridSearchEngine, SearchResult
 from backend.bm25_index import BM25Index, BM25Result
 from backend.vector_store import get_vector_store
+from backend.discovery_pipeline import DiscoveryPipeline
+from backend.path_resolver import PathResolver
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +383,10 @@ class SmartSearchEngine:
         self.intent_analyzer = QueryIntentAnalyzer()
         self.entity_discovery = EntityDiscovery()
         
+        # Discovery pipeline for Task 5 extension
+        self.path_resolver = PathResolver()
+        self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
+        
         # Search configuration
         self.max_results = 15
         self.min_confidence = 0.3
@@ -442,12 +448,16 @@ class SmartSearchEngine:
         
         logger.info(f"🧠 SMART SEARCH COMPLETE: {len(filtered_results)} results in {execution_time:.2f}s")
         
+        # NEW: Discovery Pipeline Enhancement for Task 5 Extension
+        auto_examine_files = await self._enhance_with_discovery_pipeline(query, filtered_results, query_analysis)
+        
         return {
             'results': filtered_results,
             'query_analysis': query_analysis,
             'search_strategies_used': strategies_used,
             'total_results': len(all_results),
-            'execution_time': execution_time
+            'execution_time': execution_time,
+            'auto_examine_files': auto_examine_files or []  # Files recommended for auto-examination
         }
     
     async def _execute_strategy(self, strategy: str, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
@@ -650,6 +660,157 @@ class SmartSearchEngine:
         merged_results.sort(key=lambda x: x.confidence, reverse=True)
         
         return merged_results
+    
+    async def _enhance_with_discovery_pipeline(self, query: str, search_results: List[SmartSearchResult], query_analysis: Dict) -> Optional[List[str]]:
+        """
+        Enhance search results using the discovery pipeline for README-driven discovery
+        Returns list of files recommended for auto-examination
+        """
+        try:
+            logger.info("🚀 DISCOVERY PIPELINE: Starting enhancement")
+            
+            # Check if we should run discovery enhancement
+            if not self._should_enhance_discovery(query, search_results, query_analysis):
+                logger.info("🚫 DISCOVERY PIPELINE: Skipped - conditions not met")
+                return None
+            
+            # Convert search results to the format expected by discovery pipeline
+            formatted_results = []
+            for result in search_results:
+                # For documentation files, try to get full content instead of just snippets
+                content = result.snippet
+                if self._is_documentation_file(result.file_path):
+                    full_content = await self._get_full_file_content(result.file_path)
+                    if full_content:
+                        content = full_content
+                        logger.info(f"📄 DISCOVERY: Got full content for {result.file_path} ({len(content)} chars)")
+                
+                formatted_results.append({
+                    'file_path': result.file_path,
+                    'content': content,
+                    'confidence': result.confidence
+                })
+            
+            # Determine query type for discovery
+            query_type = self._classify_query_type_for_discovery(query, query_analysis)
+            
+            # Run discovery pipeline
+            enhanced_results = await self.discovery_pipeline.enhance_search_results(
+                formatted_results, 
+                query_type, 
+                []  # No specific projects filter in smart_search
+            )
+            
+            # Return files recommended for auto-examination
+            if enhanced_results.recommended_examinations:
+                logger.info(f"🔍 DISCOVERY PIPELINE: Found {len(enhanced_results.recommended_examinations)} files to auto-examine")
+                logger.info(f"🔍 DISCOVERY PIPELINE: Auto-examine files: {enhanced_results.recommended_examinations}")
+                
+                # Log discovery metadata
+                metadata = enhanced_results.discovery_metadata
+                logger.info(f"📊 DISCOVERY PIPELINE: {metadata.total_references_found} refs found, "
+                           f"{metadata.discovery_time_ms:.1f}ms")
+                
+                return enhanced_results.recommended_examinations
+            else:
+                logger.info("🔍 DISCOVERY PIPELINE: No files recommended for auto-examination")
+                return None
+            
+        except Exception as e:
+            logger.warning(f"⚠️ DISCOVERY PIPELINE: Enhancement failed: {e}")
+            # Graceful fallback - continue without discovery enhancement
+            return None
+    
+    def _should_enhance_discovery(self, query: str, search_results: List[SmartSearchResult], query_analysis: Dict) -> bool:
+        """Determine if discovery enhancement should be applied"""
+        # Check both intent and query content for architecture-related terms
+        intent = query_analysis.get('intent', QueryIntent.GENERAL)
+        
+        discovery_worthy_intents = [QueryIntent.ARCHITECTURE, QueryIntent.ENTITY, QueryIntent.GENERAL]
+        architecture_keywords = ['architecture', 'system', 'components', 'interact', 'structure', 'infinite-kanvas', 'readme']
+        
+        intent_match = intent in discovery_worthy_intents
+        keyword_match = any(keyword in query.lower() for keyword in architecture_keywords)
+        
+        logger.info(f"🔍 DISCOVERY CONDITIONS: Intent={intent}, IntentMatch={intent_match}, KeywordMatch={keyword_match}")
+        
+        if not (intent_match or keyword_match):
+            logger.info(f"🚫 DISCOVERY SKIPPED: No intent/keyword match")
+            return False
+        
+        # Only enhance if we found documentation files
+        has_documentation = any(
+            'readme' in result.file_path.lower() or 
+            'doc' in result.file_path.lower() or
+            result.file_path.endswith('.md')
+            for result in search_results
+        )
+        
+        logger.info(f"📄 DISCOVERY DOCS: HasDocs={has_documentation}")
+        if has_documentation:
+            doc_files = [r.file_path for r in search_results if 'readme' in r.file_path.lower() or r.file_path.endswith('.md')]
+            logger.info(f"📄 DISCOVERY DOC FILES: {doc_files}")
+        
+        return has_documentation
+    
+    def _classify_query_type_for_discovery(self, query: str, query_analysis: Dict):
+        """Convert query analysis to QueryType enum for discovery pipeline"""
+        from backend.response_formatter import QueryType
+        
+        intent = query_analysis.get('intent', QueryIntent.GENERAL)
+        
+        # If intent is general, analyze query content for specific patterns
+        if intent == QueryIntent.GENERAL:
+            query_lower = query.lower()
+            if any(word in query_lower for word in ['architecture', 'system', 'components', 'interact', 'structure']):
+                return QueryType.ARCHITECTURE
+            elif any(word in query_lower for word in ['database', 'entities', 'models', 'schema']):
+                return QueryType.DATABASE_ENTITIES
+            elif any(word in query_lower for word in ['auth', 'login', 'security', 'user']):
+                return QueryType.AUTHENTICATION
+        
+        # Map QueryIntent to QueryType
+        intent_mapping = {
+            QueryIntent.ARCHITECTURE: QueryType.ARCHITECTURE,
+            QueryIntent.ENTITY: QueryType.DATABASE_ENTITIES,
+            QueryIntent.FILE: QueryType.GENERAL,
+            QueryIntent.GENERAL: QueryType.GENERAL
+        }
+        
+        return intent_mapping.get(intent, QueryType.GENERAL)
+    
+    def _is_documentation_file(self, file_path: str) -> bool:
+        """Check if a file is a documentation file that should be read in full"""
+        file_path_lower = file_path.lower()
+        return (
+            'readme' in file_path_lower or
+            file_path_lower.endswith('.md') or
+            'doc' in file_path_lower
+        )
+    
+    async def _get_full_file_content(self, file_path: str) -> Optional[str]:
+        """Get full content of a file for discovery analysis"""
+        try:
+            # Construct full workspace path
+            if not file_path.startswith('/workspace/'):
+                full_path = f"/workspace/{file_path}"
+            else:
+                full_path = file_path
+            
+            # Read the file
+            with open(full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Limit content size to prevent memory issues
+            max_content_size = 50000  # 50KB limit
+            if len(content) > max_content_size:
+                content = content[:max_content_size] + "\n... [truncated]"
+            
+            return content
+            
+        except Exception as e:
+            logger.debug(f"Failed to read full content for {file_path}: {e}")
+            return None
     
     def get_search_capabilities(self) -> Dict[str, Any]:
         """Return information about search capabilities"""

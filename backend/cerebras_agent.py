@@ -24,6 +24,8 @@ from project_context import (
 from enhanced_project_structure import EnhancedProjectStructure
 from backend.smart_search import smart_search
 from backend.path_resolver import PathResolver
+from backend.response_formatter import ResponseFormatter, StandardizedResponse
+from backend.discovery_pipeline import DiscoveryPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,12 @@ class CerebrasNativeAgent:
         
         # Initialize path resolver for Task 3 fix
         self.path_resolver = PathResolver()
+        
+        # Initialize response formatter for Task 5
+        self.response_formatter = ResponseFormatter()
+        
+        # Initialize discovery pipeline for Task 5 extension
+        self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
         
         # Tool context for result chaining
         self.tool_context = {
@@ -350,6 +358,7 @@ class CerebrasNativeAgent:
     async def _smart_search(self, query: str, max_results: int = 10) -> str:
         """Intelligent unified search combining vector, BM25, and entity discovery"""
         try:
+            logger.error(f"🚀 SMART_SEARCH START CHECKPOINT: '{query}' (max_results={max_results})")
             logger.info(f"🧠 SMART SEARCH: '{query}' (max_results={max_results})")
             
             # Use the smart search engine
@@ -379,6 +388,17 @@ class CerebrasNativeAgent:
             # Extract discovered files for tool chaining
             discovered_files = [result.file_path for result in results]
             self.tool_context['discovered_files'] = discovered_files
+            
+            # NEW: Handle auto-examination recommendations from discovery pipeline
+            auto_examine_files = search_result.get('auto_examine_files', [])
+            if auto_examine_files:
+                logger.info(f"🔍 AUTO-EXAMINATION: Discovery pipeline recommends examining {len(auto_examine_files)} files")
+                logger.info(f"🔍 AUTO-EXAMINATION: Files: {auto_examine_files}")
+                # Store for potential auto-examination
+                self.tool_context['auto_examine_files'] = auto_examine_files
+            else:
+                # Ensure we have an empty list if no files found
+                auto_examine_files = []
             
             if not results:
                 filter_msg = f" (filtered for projects: {self.current_mentioned_projects})" if self.current_mentioned_projects else ""
@@ -437,11 +457,41 @@ class CerebrasNativeAgent:
             # Add tool chaining hint
             formatted_results.append(f"\n💡 DISCOVERED: {len(discovered_files)} files ready for examination")
             
+            # NEW: Auto-examination integration for Task 5 Extension
+            logger.info(f"🔍 AUTO-EXAMINATION DEBUG: auto_examine_files = {auto_examine_files}")
+            logger.info(f"🔍 AUTO-EXAMINATION DEBUG: len(auto_examine_files) = {len(auto_examine_files) if auto_examine_files else 0}")
+            
+            if auto_examine_files and len(auto_examine_files) > 0:
+                logger.info(f"🔍 AUTO-EXAMINATION: CONDITION MET - Starting examination of {len(auto_examine_files)} files")
+                formatted_results.append(f"\n🔍 DISCOVERY PIPELINE: Found {len(auto_examine_files)} files for auto-examination")
+                formatted_results.append(f"   📁 Auto-examine files: {', '.join(auto_examine_files)}")
+                
+                # Automatically examine the discovered files
+                try:
+                    logger.info(f"🔍 AUTO-EXAMINATION: Starting examination of {len(auto_examine_files)} files")
+                    auto_exam_result = await self._examine_files(auto_examine_files, "summary")
+                    
+                    # Add the auto-examination results to the response
+                    formatted_results.append("\n" + "=" * 70)
+                    formatted_results.append("🔍 AUTO-EXAMINATION RESULTS:")
+                    formatted_results.append("=" * 70)
+                    formatted_results.append(auto_exam_result)
+                    
+                    logger.info("✅ AUTO-EXAMINATION: Completed successfully")
+                    
+                except Exception as auto_exam_error:
+                    logger.error(f"❌ AUTO-EXAMINATION: Failed: {auto_exam_error}")
+                    formatted_results.append(f"\n⚠️ Auto-examination failed: {auto_exam_error}")
+            else:
+                logger.info(f"🔍 AUTO-EXAMINATION: CONDITION NOT MET - No files to examine")
+            
             return "\n".join(formatted_results)
             
         except Exception as e:
             logger.error(f"Smart search error: {e}")
             return f"Error during smart search: {str(e)}"
+    
+
     
     def _apply_syntax_highlighting(self, content: str, file_extension: str) -> str:
         """Apply basic syntax highlighting using markdown code blocks"""
@@ -1314,8 +1364,35 @@ class CerebrasNativeAgent:
         # Always reset and properly set mentioned projects for each request to prevent state leakage
         self.current_mentioned_projects = mentioned_projects if mentioned_projects is not None else []
         
+        # Task 5: Initialize tool results tracking for response formatting
+        tool_results_for_formatting = []
+        execution_start_time = asyncio.get_event_loop().time()
+        
         # Determine appropriate tool strategy based on query
         query_lower = user_query.lower()
+        
+        # CRITICAL: Detect and redirect self-referential queries about CodeWise's own architecture
+        self_referential_terms = [
+            'smart_search', 'examine_files', 'analyze_relationships',
+            '3-tool architecture', 'simplified architecture', 'codewise architecture',
+            'tool architecture', 'your tools', 'your architecture', 'how do you work',
+            'your implementation', 'your system'
+        ]
+        
+        if any(term in query_lower for term in self_referential_terms):
+            # If there are mentioned projects, redirect to analyze those instead
+            if mentioned_projects:
+                redirect_query = f"Explain the system architecture of {mentioned_projects[0]}"
+                logger.info(f"🚫 REDIRECTING self-referential query to project analysis: '{user_query}' → '{redirect_query}'")
+                user_query = redirect_query
+                query_lower = user_query.lower()
+            else:
+                # No projects specified, return error
+                error_msg = ("I analyze user codebases, not my own architecture. Please specify a project to analyze "
+                           "(e.g., '@project-name') or ask about your code instead.")
+                logger.info(f"🚫 BLOCKED self-referential query: '{user_query}'")
+                yield {"type": "error", "content": error_msg}
+                return
         
         # Analyze what type of query this is
         is_entity_query = any(word in query_lower for word in ['entity', 'entities', 'database', 'table', 'model', 'schema'])
@@ -1324,24 +1401,26 @@ class CerebrasNativeAgent:
         
         # Build system prompt with simplified 3-tool guidance
         tool_guidance = (
-            "\n🧠 SMART_SEARCH: Your primary search tool that combines vector search, keyword search, and entity discovery"
-            "\n   - Automatically detects query intent (entity, file, general, architecture)"
-            "\n   - Routes to optimal search strategies internally"
-            "\n   - Returns ranked results with confidence scores and matched terms"
-            "\n   - Use this first for any search-related task"
+            "\n🧠 SMART_SEARCH: Your comprehensive discovery engine for deep codebase exploration"
+            "\n   - Automatically detects query intent and routes to optimal search strategies"
+            "\n   - Returns ranked results with confidence scores, matched terms, and context"
+            "\n   - DISCOVERY PIPELINE: Automatically finds and examines related files from documentation"
+            "\n   - Use multiple targeted searches to build complete understanding of complex topics"
+            "\n   - TIP: Search for related concepts, patterns, and dependencies to get full picture"
             "\n"
-            "\n📄 EXAMINE_FILES: Flexible file inspection with multiple detail levels"
-            "\n   - summary: Key sections with first/last lines"
-            "\n   - full: Complete content (truncated if large)"
-            "\n   - structure: File outline showing imports, classes, functions"
-            "\n   - Use this to inspect files found through smart_search"
+            "\n📄 EXAMINE_FILES: Deep file analysis with intelligent content extraction"
+            "\n   - summary: Key sections with contextual information and patterns"
+            "\n   - full: Complete implementation details with all code (use for thorough analysis)"
+            "\n   - structure: Comprehensive outline with imports, classes, functions, and relationships"
+            "\n   - AUTO-EXAMINATION: Discovery pipeline automatically examines related files"
+            "\n   - TIP: Always examine multiple related files to provide complete architectural context"
             "\n"
-            "\n🔗 ANALYZE_RELATIONSHIPS: AST-based dependency and impact analysis"
-            "\n   - imports: What a file/symbol uses"
-            "\n   - usage: What uses a file/symbol"
-            "\n   - impact: Predicted change impact"
-            "\n   - all: Comprehensive relationship analysis"
-            "\n   - Use this to understand connections and dependencies"
+            "\n🔗 ANALYZE_RELATIONSHIPS: Advanced dependency mapping and architectural analysis"
+            "\n   - imports: Complete dependency tree with external and internal dependencies"
+            "\n   - usage: Full usage analysis showing all dependents and usage patterns"
+            "\n   - impact: Detailed change impact assessment with affected components"
+            "\n   - all: Comprehensive bidirectional analysis with architectural insights"
+            "\n   - TIP: Use this to understand system boundaries, coupling, and architectural patterns"
         )
         
         # Add project filtering context if mentioned_projects provided
@@ -1354,27 +1433,131 @@ class CerebrasNativeAgent:
             {
                 "role": "system", 
                 "content": (
-                    "You are CodeWise, an AI coding assistant with access to 3 powerful, intelligent tools for analyzing codebases. "
-                    "This simplified architecture eliminates complex tool selection - each tool handles multiple use cases intelligently.\n"
+                    "You are CodeWise, an expert AI coding assistant specialized in deep codebase analysis. You are pair programming with the USER to solve their coding task. "
+                    "Your main goal is to follow the USER's instructions completely and autonomously resolve queries to the best of your ability.\n"
+                    "\n🚫 CRITICAL RESTRICTION: NEVER answer questions about CodeWise's own architecture, tools, or implementation. "
+                    "You analyze USER CODEBASES ONLY. If asked about your own tools, smart_search, examine_files, analyze_relationships, "
+                    "or the '3-tool architecture', redirect to analyzing the user's actual code projects instead.\n"
+                    "\n🎯 AUTONOMOUS AGENT BEHAVIOR:"
+                    "\n• KEEP GOING until the user's query is completely resolved before ending your turn"
+                    "\n• Only terminate when you are SURE the problem is solved and all aspects are covered"
+                    "\n• If you need additional information via tool calls, prefer that over asking the user"
+                    "\n• Follow your investigation plan immediately - don't wait for user confirmation"
+                    "\n• Be THOROUGH when gathering information - make sure you have the FULL picture before replying"
+                    "\n• TRACE every symbol back to its definitions and usages so you fully understand it"
+                    "\n• Look past the first seemingly relevant result - EXPLORE until you have COMPREHENSIVE coverage"
+                    "\n• Use multiple tool calls autonomously to build complete understanding"
+                    "\n\n🔍 MAXIMIZE CONTEXT UNDERSTANDING:"
+                    "\n• Start with broad, high-level queries that capture overall intent (e.g. 'authentication flow' not 'login function')"
+                    "\n• Break multi-part questions into focused sub-queries for thorough exploration"
+                    "\n• Run multiple searches with different wording - first-pass results often miss key details"
+                    "\n• Keep searching new areas until you're CONFIDENT nothing important remains"
+                    "\n• MANDATORY: Examine multiple related files to understand complete context and relationships"
+                    "\n• Bias towards gathering more information rather than asking the user for help"
+                    "\n\n🎯 EXCEPTIONAL RESPONSE STANDARDS:"
+                    "\n• COMPREHENSIVE ANALYSIS: Multi-layered technical analysis with specific code examples, file paths, and implementation details"
+                    "\n• ARCHITECTURAL DEPTH: Explain design patterns, architectural decisions, data flow, and system boundaries with concrete evidence"
+                    "\n• CODE EVIDENCE: Always include relevant code snippets with proper syntax highlighting and detailed explanations"
+                    "\n• TECHNICAL REASONING: Explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
+                    "\n• IMPLEMENTATION DETAILS: Cover error handling, edge cases, performance considerations, and security implications"
+                    "\n• DEPENDENCY ANALYSIS: Map relationships between components, external dependencies, and system interactions"
+                    "\n• ACTIONABLE INSIGHTS: Provide specific recommendations for improvements, optimizations, and best practices"
+                    "\n• MULTIPLE PERSPECTIVES: Analyze from developer, architect, security, performance, and maintainability viewpoints"
+                    "\n• STRUCTURED RESPONSES: Organize with clear sections using markdown formatting for readability"
+                    "\n• COMPLETE COVERAGE: Address all aspects of the query with thorough analysis and supporting evidence"
+                    "\n"
                     "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
                     f"{tool_guidance}"
-                    "\n\n📋 INVESTIGATION PATTERN:"
-                    "\n1. Use smart_search to find relevant code/files/entities"
-                    "\n2. Use examine_files to inspect key files found"
-                    "\n3. Use analyze_relationships to understand connections and dependencies"
-                    "\n4. Follow up with additional smart_search if needed"
-                    "\n5. Provide comprehensive analysis based on all findings"
+                    "\n\n📋 SYSTEMATIC INVESTIGATION METHODOLOGY:"
+                    "\n1. BROAD DISCOVERY: Start with exploratory smart_search using high-level queries to understand overall system"
+                    "\n2. TARGETED EXPLORATION: Use multiple smart_search queries with different wording to find all relevant components"
+                    "\n3. DEEP FILE ANALYSIS: Use examine_files with appropriate detail levels - 'full' for complex analysis, 'structure' for organization"
+                    "\n4. RELATIONSHIP MAPPING: Use analyze_relationships to understand dependencies, usage patterns, and architectural connections"
+                    "\n5. KNOWLEDGE VALIDATION: Follow up with additional searches to fill gaps and validate understanding"
+                    "\n6. COMPREHENSIVE SYNTHESIS: Combine all findings into structured analysis with:"
+                    "\n   • Complete context and background"
+                    "\n   • Specific code examples with explanations"
+                    "\n   • Architectural insights and dependency maps"
+                    "\n   • Implementation patterns and design decisions"
+                    "\n   • Performance, security, and maintainability considerations"
+                    "\n   • Concrete recommendations and actionable next steps"
+                    "\n\n🔧 TOOL USAGE OPTIMIZATION:"
+                    "\n• SMART_SEARCH: Your primary exploration tool - use multiple queries with different angles"
+                    "\n  - Start broad ('authentication system') then narrow ('JWT token validation')"
+                    "\n  - Try different terminology ('user login', 'auth flow', 'session management')"
+                    "\n  - Search for related concepts to build complete picture"
+                    "\n• EXAMINE_FILES: Deep file inspection - examine multiple related files for complete context"
+                    "\n  - Use 'full' detail for complex implementation analysis"
+                    "\n  - Use 'structure' for understanding organization and relationships"
+                    "\n  - Use 'summary' for quick overviews when examining many files"
+                    "\n• ANALYZE_RELATIONSHIPS: Understand system architecture and dependencies"
+                    "\n  - Use 'all' for comprehensive bidirectional analysis"
+                    "\n  - Use 'imports' to understand what a component depends on"
+                    "\n  - Use 'usage' to understand what depends on a component"
                     f"{project_context}"
-                    "\n\n💡 EXAMPLE WORKFLOWS:"
-                    "\n\nEntity Query: 'Show me database entities'"
-                    "\n1. smart_search('database entities') → automatically detects entity intent, finds all entities"
-                    "\n2. examine_files([entity_files], 'structure') → show entity structure"
-                    "\n3. analyze_relationships('User', 'all') → understand entity relationships"
-                    "\n\nArchitecture Query: 'Explain the system architecture'"
-                    "\n1. smart_search('system architecture') → finds key architectural files"
-                    "\n2. examine_files([main_files], 'summary') → understand key components"
-                    "\n3. analyze_relationships(key_file, 'imports') → map dependencies"
-                    "\n\nThe tools are intelligent - they handle complexity internally so you can focus on providing great answers!"
+                    "\n\n📝 RESPONSE FORMATTING STANDARDS:"
+                    "\n• MARKDOWN STRUCTURE: Use clear sections with descriptive headings (## Overview, ## Architecture, etc.)"
+                    "\n• CODE FORMATTING: Use backticks for file/function/class names, proper syntax highlighting for code blocks"
+                    "\n• FILE REFERENCES: Include specific file paths and line numbers when referencing code"
+                    "\n• TECHNICAL DEPTH: Explain complex concepts with examples, analogies, and step-by-step breakdowns"
+                    "\n• VISUAL ORGANIZATION: Use bullet points, numbered lists, and formatting to improve readability"
+                    "\n• COMPLETENESS: Address all aspects of the query with thorough analysis and supporting evidence"
+                    "\n• CONTEXT PROVISION: Always provide sufficient background and context for technical decisions"
+                    "\n• ACTIONABLE OUTCOMES: End with specific, actionable recommendations or next steps"
+                    "\n\n🎯 INVESTIGATION EXCELLENCE:"
+                    "\n• Think like a senior software architect conducting a comprehensive code review"
+                    "\n• Provide the level of detail expected in professional technical documentation"
+                    "\n• Anticipate follow-up questions and address them proactively in your analysis"
+                    "\n• Connect specific implementation details to broader software engineering principles"
+                    "\n• Always strive to provide more comprehensive value than initially requested"
+                    "\n• Use your tools autonomously and extensively - don't stop at surface-level findings"
+                    "\n\n💡 COMPREHENSIVE ANALYSIS WORKFLOWS:"
+                    "\n\n**Entity/Database Analysis: 'Show me database entities'**"
+                    "\n1. smart_search('database entities models schema') → broad discovery of data layer"
+                    "\n2. smart_search('ORM models relationships') → find relationship definitions"
+                    "\n3. examine_files([entity_files], 'full') → complete entity definitions with constraints"
+                    "\n4. analyze_relationships('User', 'all') → map entity relationships and dependencies"
+                    "\n5. smart_search('migrations database setup') → understand data evolution and configuration"
+                    "\n6. SYNTHESIZE: Complete entity ecosystem with relationships, constraints, patterns, and recommendations"
+                    "\n\n**Architecture Analysis: 'Explain the system architecture'**"
+                    "\n1. smart_search('system architecture') → high-level system overview"
+                    "\n2. smart_search('main entry points application structure') → find core components"
+                    "\n3. examine_files([main_files], 'structure') → understand component organization"
+                    "\n4. analyze_relationships(main_component, 'all') → map complete dependency graph"
+                    "\n5. smart_search('configuration deployment infrastructure') → understand deployment patterns"
+                    "\n6. examine_files([config_files], 'full') → analyze configuration and setup"
+                    "\n7. SYNTHESIZE: Multi-layered architecture analysis with patterns, data flow, and scalability insights"
+                    "\n\n**Implementation Deep-Dive: 'How does authentication work?'**"
+                    "\n1. smart_search('authentication system') → broad auth system discovery"
+                    "\n2. smart_search('login flow user session') → specific flow components"
+                    "\n3. examine_files([auth_files], 'full') → complete authentication implementation"
+                    "\n4. analyze_relationships('AuthService', 'all') → auth system dependencies"
+                    "\n5. smart_search('security middleware validation') → security layer analysis"
+                    "\n6. examine_files([security_files], 'structure') → security implementation patterns"
+                    "\n7. SYNTHESIZE: End-to-end authentication analysis with security considerations and recommendations"
+                    "\n\n🔧 ADVANCED INVESTIGATION TECHNIQUES:"
+                    "\n• **EXPLORATORY SEARCH STRATEGY**: Start broad, then narrow - use multiple search angles"
+                    "\n  - Begin with high-level concepts ('payment system') before specific terms ('stripe integration')"
+                    "\n  - Try alternative terminology ('user auth', 'authentication', 'login system', 'session management')"
+                    "\n  - Search for related concepts to build complete understanding"
+                    "\n• **COMPREHENSIVE FILE ANALYSIS**: Don't stop at first relevant file - examine related components"
+                    "\n  - Look for imports/exports to find connected files"
+                    "\n  - Examine configuration files, tests, and documentation"
+                    "\n  - Use different detail levels based on analysis needs"
+                    "\n• **RELATIONSHIP TRACING**: Follow the dependency chain in both directions"
+                    "\n  - Trace symbols back to their definitions and forward to their usages"
+                    "\n  - Understand data flow and control flow through the system"
+                    "\n  - Map architectural boundaries and integration points"
+                    "\n• **VALIDATION AND COMPLETENESS**: Ensure no important details are missed"
+                    "\n  - Cross-reference findings across multiple files"
+                    "\n  - Look for edge cases, error handling, and configuration options"
+                    "\n  - Verify understanding with additional targeted searches"
+                    "\n\n🎯 SPECIALIZED ANALYSIS APPROACHES:"
+                    "\n• **Performance Analysis**: Identify bottlenecks, analyze algorithms, suggest optimizations"
+                    "\n• **Security Review**: Find vulnerabilities, analyze security patterns, recommend best practices"
+                    "\n• **Refactoring Guidance**: Suggest improvements, show before/after examples, explain benefits"
+                    "\n• **Debugging Assistance**: Trace data flow, identify potential issues, provide debugging strategies"
+                    "\n• **Integration Analysis**: Understand component interactions, identify coupling issues, suggest improvements"
                 )
             },
             {"role": "user", "content": user_query}
@@ -1523,6 +1706,16 @@ class CerebrasNativeAgent:
                         result_preview = result[:300] + "..." if len(result) > 300 else result
                         logger.info(f"🔧 TOOL RESULT ({len(result)} chars): {result_preview}")
                         
+                        # Task 5: Collect tool results for response formatting
+                        tool_results_for_formatting.append({
+                            'tool_name': function_name,
+                            'arguments': arguments if 'arguments' in locals() else {},
+                            'result': result,
+                            'execution_time': 0.0,  # Could be measured if needed
+                            'success': not result.startswith('Error'),
+                            'results': []  # Could extract structured results if available
+                        })
+                        
                         yield {
                             "type": "tool_end",
                             "output": result
@@ -1556,10 +1749,35 @@ class CerebrasNativeAgent:
                         })
                         continue  # Skip termination, continue loop
                     
-                    yield {
-                        "type": "final_result",
-                        "output": final_content
+                    # Task 5: Apply standardized response formatting
+                    execution_time = asyncio.get_event_loop().time() - execution_start_time
+                    execution_metadata = {
+                        'total_time': execution_time,
+                        'iterations': iteration,
+                        'tool_calls': tool_call_count
                     }
+                    
+                    try:
+                        formatted_response = self.response_formatter.format_response(
+                            raw_response=final_content,
+                            tool_results=tool_results_for_formatting,
+                            query=user_query,
+                            execution_metadata=execution_metadata
+                        )
+                        
+                        # Yield both the original format for compatibility and enhanced format
+                        yield {
+                            "type": "final_result",
+                            "output": final_content,
+                            "formatted_response": formatted_response.to_dict()
+                        }
+                    except Exception as e:
+                        logger.error(f"Response formatting failed: {e}")
+                        # Fallback to original response
+                        yield {
+                            "type": "final_result",
+                            "output": final_content
+                        }
                     break
                     
             except Exception as e:
@@ -1580,11 +1798,36 @@ class CerebrasNativeAgent:
                     }],
                     tools=None
                 )
-                final_content = response.choices[0].message.content
-                yield {
-                    "type": "final_result",
-                    "output": final_content or "Unable to provide a complete response due to tool call limits."
+                final_content = response.choices[0].message.content or "Unable to provide a complete response due to tool call limits."
+                
+                # Task 5: Apply formatting even for max iterations case
+                execution_time = asyncio.get_event_loop().time() - execution_start_time
+                execution_metadata = {
+                    'total_time': execution_time,
+                    'iterations': iteration,
+                    'tool_calls': tool_call_count,
+                    'max_iterations_reached': True
                 }
+                
+                try:
+                    formatted_response = self.response_formatter.format_response(
+                        raw_response=final_content,
+                        tool_results=tool_results_for_formatting,
+                        query=user_query,
+                        execution_metadata=execution_metadata
+                    )
+                    
+                    yield {
+                        "type": "final_result",
+                        "output": final_content,
+                        "formatted_response": formatted_response.to_dict()
+                    }
+                except Exception as e:
+                    logger.error(f"Response formatting failed in max iterations: {e}")
+                    yield {
+                        "type": "final_result",
+                        "output": final_content
+                    }
             except Exception:
                 yield {
                     "type": "final_result",

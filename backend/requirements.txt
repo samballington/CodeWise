@@ -22,6 +22,6 @@ cerebras-cloud-sdk>=0.2.0
 sentence-transformers>=2.6.0
 
 # --- Lightweight CPU-only PyTorch to keep Docker image small ---
-torch==2.2.1+cpu
-torchvision==0.17.1+cpu
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu 

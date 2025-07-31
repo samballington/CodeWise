@@ -16,16 +16,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy source into /app/backend so imports use backend.*
 COPY . /app/backend
 
-# Fix line endings and ensure entrypoint executable
-RUN sed -i 's/\r$//' /app/backend/entrypoint.sh && chmod +x /app/backend/entrypoint.sh
-
 # Environment variables
 ENV WORKSPACE_DIR=/workspace
 ENV OPENAI_API_KEY=""
 ENV PYTHONPATH=/app:/app/backend
 
-# Set entrypoint
-ENTRYPOINT ["/app/backend/entrypoint.sh"]
-CMD []
+# Set working directory to backend for uvicorn
+WORKDIR /app/backend
+
+# Start the FastAPI server directly
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 EXPOSE 8000 

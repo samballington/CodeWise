@@ -161,13 +161,26 @@ async def websocket_endpoint(websocket: WebSocket):
                     if update.get("type") == "final_result":
                         final_output = update.get("output", "")
                         
-                        # Log the complete response output
-                        logger.info("="*80)
-                        logger.info("📝 FULL AGENT RESPONSE OUTPUT:")
-                        logger.info(f"Response: {final_output}")
-                        logger.info(f"Response Length: {len(final_output)} chars")
-                        logger.info(f"Timestamp: {datetime.now().isoformat()}")
-                        logger.info("="*80)
+                        # Task 5: Log enhanced response formatting if available
+                        formatted_response = update.get("formatted_response")
+                        if formatted_response:
+                            logger.info("="*80)
+                            logger.info("📝 ENHANCED RESPONSE OUTPUT (Task 5):")
+                            logger.info(f"Query Type: {formatted_response.get('query_type', 'unknown')}")
+                            logger.info(f"Confidence: {formatted_response.get('confidence_level', 'unknown')} ({formatted_response.get('confidence_score', 0):.2f})")
+                            logger.info(f"Code Snippets: {len(formatted_response.get('code_snippets', []))}")
+                            logger.info(f"File References: {len(formatted_response.get('file_references', []))}")
+                            logger.info(f"Tools Used: {len(formatted_response.get('tools_used', []))}")
+                            logger.info(f"Response Time: {formatted_response.get('response_time', 0):.2f}s")
+                            logger.info("="*80)
+                        else:
+                            # Log the complete response output (original format)
+                            logger.info("="*80)
+                            logger.info("📝 FULL AGENT RESPONSE OUTPUT:")
+                            logger.info(f"Response: {final_output}")
+                            logger.info(f"Response Length: {len(final_output)} chars")
+                            logger.info(f"Timestamp: {datetime.now().isoformat()}")
+                            logger.info("="*80)
                         
                         chat_memory.add_message("assistant", final_output)
                 
