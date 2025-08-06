@@ -23,6 +23,10 @@ from backend.bm25_index import BM25Index, BM25Result
 from backend.vector_store import get_vector_store
 from backend.discovery_pipeline import DiscoveryPipeline
 from backend.path_resolver import PathResolver
+from backend.directory_filters import get_project_from_path
+from backend.project_context import get_context_manager
+from backend.file_content_cache import get_global_content_cache
+from backend.query_context import QueryExecutionContext
 
 logger = logging.getLogger(__name__)
 
@@ -387,11 +391,14 @@ class SmartSearchEngine:
         self.path_resolver = PathResolver()
         self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
         
+        # File content cache for performance
+        self.content_cache = get_global_content_cache()
+        
         # Search configuration
         self.max_results = 15
         self.min_confidence = 0.3
     
-    async def search(self, query: str, k: int = 10, strategy_override: List[str] = None) -> Dict[str, Any]:
+    async def search(self, query: str, k: int = 10, strategy_override: List[str] = None, mentioned_projects: List[str] = None) -> Dict[str, Any]:
         """
         Perform intelligent search combining multiple strategies
         
@@ -399,6 +406,7 @@ class SmartSearchEngine:
             query: Search query string
             k: Maximum number of results to return
             strategy_override: Optional list of strategies to force use
+            mentioned_projects: Optional list of projects to filter results by
             
         Returns:
             Dict containing:
@@ -411,15 +419,15 @@ class SmartSearchEngine:
         import time
         start_time = time.time()
         
-        logger.info(f"🧠 SMART SEARCH: '{query}' (k={k})")
+        logger.debug(f"🧠 SMART SEARCH: '{query}' (k={k})")
         
         # Analyze query intent
         query_analysis = self.intent_analyzer.analyze_query(query)
-        logger.info(f"Query intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
+        logger.debug(f"Query intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
         
         # Determine search strategies
         strategies = strategy_override or query_analysis['search_strategies']
-        logger.info(f"Search strategies: {strategies}")
+        logger.debug(f"Search strategies: {strategies}")
         
         # Execute search strategies
         all_results = []
@@ -438,7 +446,54 @@ class SmartSearchEngine:
         # Merge and rank results
         final_results = self._merge_and_rank_results(all_results, query_analysis)
         
-        # Apply filters and limits
+        # Apply project filtering if mentioned_projects is provided
+        if mentioned_projects:
+            project_filtered_results = []
+            context_manager = get_context_manager()
+            
+            # CRITICAL FIX: Set project context before filtering
+            if mentioned_projects and len(mentioned_projects) > 0:
+                primary_project = mentioned_projects[0]
+                logger.info(f"🔧 CONTEXT FIX: Setting project context to '{primary_project}' before filtering")
+                context_manager.set_project_context(primary_project, mentioned_projects)
+            
+            # DEBUG: Check current context state AFTER setting
+            current_context = context_manager.get_current_context()
+            logger.info(f"🔍 FILTER DEBUG: mentioned_projects={mentioned_projects}, current_context={current_context.name if current_context else None}")
+            
+            # Optimized filtering with minimal logging
+            logger.debug(f"🔍 FILTERING DEBUG: Processing {len(final_results)} results for project filtering")
+            
+            # Cache project determinations to avoid redundant calls
+            file_projects = {}
+            filtered_out_count = 0
+            
+            for result in final_results:
+                # Normalize file path to full workspace path for filtering
+                file_path = result.file_path
+                if not file_path.startswith('/workspace/'):
+                    file_path = f"/workspace/{file_path.lstrip('/')}"
+                
+                # Cache project determination to avoid redundant calls
+                if file_path not in file_projects:
+                    file_projects[file_path] = context_manager.get_context_for_file(file_path)
+                
+                file_project = file_projects[file_path]
+                
+                # Use cached project info instead of calling is_file_in_current_context
+                in_context = (file_project == current_context.name if current_context else True)
+                
+                if not in_context:
+                    filtered_out_count += 1
+                    logger.debug(f"🚫 FILTERED OUT: {file_path} (project: {file_project})")
+                else:
+                    logger.debug(f"✅ INCLUDED: {file_path} (project: {file_project})")
+                    project_filtered_results.append(result)
+            
+            logger.info(f"🎯 PROJECT FILTERING COMPLETE: {len(final_results)} -> {len(project_filtered_results)} results for projects {mentioned_projects}")
+            final_results = project_filtered_results
+        
+        # Apply confidence filters and limits
         filtered_results = [
             result for result in final_results 
             if result.confidence >= self.min_confidence
@@ -448,8 +503,13 @@ class SmartSearchEngine:
         
         logger.info(f"🧠 SMART SEARCH COMPLETE: {len(filtered_results)} results in {execution_time:.2f}s")
         
-        # NEW: Discovery Pipeline Enhancement for Task 5 Extension
-        auto_examine_files = await self._enhance_with_discovery_pipeline(query, filtered_results, query_analysis)
+        # NEW: Discovery Pipeline Enhancement for Task 5 Extension (optimized)
+        # Skip discovery pipeline for architecture queries to improve performance
+        if query_analysis['intent'] == QueryIntent.ARCHITECTURE:
+            logger.debug("🚫 DISCOVERY PIPELINE: Skipped for architecture query (performance optimization)")
+            auto_examine_files = []
+        else:
+            auto_examine_files = await self._enhance_with_discovery_pipeline(query, filtered_results, query_analysis)
         
         return {
             'results': filtered_results,
@@ -459,6 +519,231 @@ class SmartSearchEngine:
             'execution_time': execution_time,
             'auto_examine_files': auto_examine_files or []  # Files recommended for auto-examination
         }
+    
+    async def search_with_context(
+        self,
+        query: str,
+        context: QueryExecutionContext,
+        k: int = 10,
+        strategy_override: List[str] = None,
+        mentioned_projects: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Perform intelligent search with shared query context (PERFORMANCE OPTIMIZED).
+        
+        This is the KEY ARCHITECTURAL FIX - uses context to prevent multiple
+        discovery pipeline runs within the same query.
+        
+        Args:
+            query: Search query string
+            context: Shared query execution context
+            k: Maximum number of results to return
+            strategy_override: Optional list of strategies to force use
+            mentioned_projects: Optional list of projects to filter results by
+            
+        Returns:
+            Dict containing search results and metadata
+        """
+        import time
+        start_time = time.perf_counter()
+        
+        logger.info(f"🧠 CONTEXT-AWARE SEARCH: '{query}' with context {context.query_id[:8]}")
+        
+        # Mark search tool as executing
+        await context.mark_tool_executed("smart_search_start")
+        
+        # Analyze query intent (same as legacy method)
+        query_analysis = self.intent_analyzer.analyze_query(query)
+        logger.debug(f"Query intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
+        
+        # Determine search strategies (same as legacy method)
+        strategies = strategy_override or query_analysis['search_strategies']
+        logger.debug(f"Search strategies: {strategies}")
+        
+        # Execute search strategies (same as legacy method)
+        all_results = []
+        strategies_used = []
+        
+        for strategy in strategies:
+            try:
+                results = await self._execute_strategy(strategy, query, query_analysis)
+                if results:
+                    all_results.extend(results)
+                    strategies_used.append(strategy)
+                    logger.debug(f"Strategy '{strategy}' returned {len(results)} results")
+            except Exception as e:
+                logger.error(f"Strategy '{strategy}' failed: {e}")
+        
+        # Merge and rank results (same as legacy method)
+        final_results = self._merge_and_rank_results(all_results, query_analysis)
+        
+        # Apply project filtering if mentioned_projects is provided
+        if mentioned_projects:
+            project_filtered_results = []
+            for result in final_results:
+                result_project = self._extract_project_from_path(result.file_path)
+                if result_project in mentioned_projects:
+                    project_filtered_results.append(result)
+            
+            if project_filtered_results:
+                logger.info(f"🎯 PROJECT FILTERING COMPLETE: {len(final_results)} -> {len(project_filtered_results)} results for projects {mentioned_projects}")
+                filtered_results = project_filtered_results
+            else:
+                logger.warning(f"⚠️ PROJECT FILTERING: No results found for projects {mentioned_projects}, keeping all results")
+                filtered_results = final_results
+        else:
+            filtered_results = final_results
+        
+        # Limit results
+        if len(filtered_results) > k:
+            filtered_results = filtered_results[:k]
+        
+        execution_time = time.perf_counter() - start_time
+        
+        logger.info(f"🧠 SMART SEARCH COMPLETE: {len(filtered_results)} results in {execution_time:.2f}s")
+        
+        # Context-aware discovery pipeline enhancement (THE KEY FIX)
+        auto_examine_files = await self._enhance_with_discovery_pipeline_context_aware(
+            query, filtered_results, query_analysis, context
+        )
+        
+        # Build result dict
+        tool_result = {
+            'results': filtered_results,
+            'query_analysis': query_analysis,
+            'search_strategies_used': strategies_used,
+            'total_results': len(all_results),
+            'execution_time': execution_time,
+            'auto_examine_files': auto_examine_files or []
+        }
+        
+        # Mark tool execution complete with timing
+        await context.mark_tool_executed("smart_search", tool_result, execution_time)
+        
+        return tool_result
+    
+    async def _enhance_with_discovery_pipeline_context_aware(
+        self,
+        query: str,
+        search_results: List[SmartSearchResult],
+        query_analysis: Dict,
+        context: QueryExecutionContext
+    ) -> Optional[List[str]]:
+        """
+        Context-aware discovery pipeline enhancement.
+        
+        This method uses the query context to ensure discovery pipeline runs
+        ONCE per query, not once per tool execution.
+        
+        This is the CORE ARCHITECTURAL FIX.
+        """
+        try:
+            logger.info(f"🚀 DISCOVERY PIPELINE: Starting enhancement (context: {context.query_id[:8]})")
+            
+            # Check if we should run discovery enhancement
+            if not self._should_enhance_discovery(query, search_results, query_analysis):
+                logger.info("🚫 DISCOVERY PIPELINE: Skipped - conditions not met")
+                return None
+            
+            # Context-aware discovery execution (THE KEY FIX)
+            enhanced_results = await context.get_or_run_discovery(
+                self._run_discovery_pipeline_once,
+                search_results,
+                query,
+                query_analysis
+            )
+            
+            # Extract auto-examine files from results
+            if enhanced_results and 'recommended_examinations' in enhanced_results:
+                auto_examine_files = enhanced_results['recommended_examinations']
+                logger.info(f"🔍 DISCOVERY PIPELINE: Found {len(auto_examine_files)} files to auto-examine")
+                logger.info(f"🔍 DISCOVERY PIPELINE: Auto-examine files: {auto_examine_files}")
+                return auto_examine_files
+            else:
+                logger.info("🔍 DISCOVERY PIPELINE: No files recommended for auto-examination")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"⚠️ DISCOVERY PIPELINE: Context-aware enhancement failed: {e}")
+            return None
+    
+    async def _run_discovery_pipeline_once(
+        self,
+        search_results: List[SmartSearchResult],
+        query: str,
+        query_analysis: Dict
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run the discovery pipeline exactly once per query context.
+        
+        This method is called by the context's get_or_run_discovery(),
+        ensuring it runs only once even if multiple tools call it.
+        """
+        logger.info(f"🔍 DISCOVERY PIPELINE: Executing (THIS SHOULD ONLY HAPPEN ONCE PER QUERY)")
+        
+        # Deduplicate search results by file_path before processing
+        unique_results = {}
+        for result in search_results:
+            if result.file_path not in unique_results:
+                unique_results[result.file_path] = result
+            elif result.confidence > unique_results[result.file_path].confidence:
+                unique_results[result.file_path] = result
+        
+        deduplicated_results = list(unique_results.values())
+        logger.info(f"📄 DISCOVERY DOC FILES: {len(search_results)} -> {len(deduplicated_results)} unique files")
+        
+        # Convert search results to the format expected by discovery pipeline
+        formatted_results = []
+        for result in deduplicated_results:
+            # For documentation files, try to get full content instead of just snippets
+            content = result.snippet
+            if self._is_documentation_file(result.file_path):
+                full_content = await self._get_full_file_content(result.file_path)
+                if full_content:
+                    content = full_content
+                    logger.info(f"📄 DISCOVERY: Got full content for {result.file_path} ({len(content)} chars)")
+            
+            formatted_results.append({
+                'file_path': result.file_path,
+                'content': content,
+                'confidence': result.confidence
+            })
+        
+        # Determine query type for discovery
+        query_type = self._classify_query_type_for_discovery(query, query_analysis)
+        
+        # Run discovery pipeline
+        enhanced_results = await self.discovery_pipeline.enhance_search_results(
+            formatted_results,
+            query_type,
+            []  # No specific projects filter in smart_search
+        )
+        
+        # Return structured results
+        if enhanced_results and enhanced_results.recommended_examinations:
+            metadata = enhanced_results.discovery_metadata
+            logger.info(
+                f"📊 DISCOVERY PIPELINE: {metadata.total_references_found} refs found, "
+                f"{metadata.discovery_time_ms:.1f}ms"
+            )
+            
+            return {
+                'recommended_examinations': enhanced_results.recommended_examinations,
+                'metadata': {
+                    'total_references': metadata.total_references_found,
+                    'discovery_time_ms': metadata.discovery_time_ms,
+                    'files_processed': len(formatted_results)
+                }
+            }
+        else:
+            return {
+                'recommended_examinations': [],
+                'metadata': {
+                    'total_references': 0,
+                    'discovery_time_ms': 0.0,
+                    'files_processed': len(formatted_results)
+                }
+            }
     
     async def _execute_strategy(self, strategy: str, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
         """Execute a specific search strategy"""
@@ -674,9 +959,20 @@ class SmartSearchEngine:
                 logger.info("🚫 DISCOVERY PIPELINE: Skipped - conditions not met")
                 return None
             
+            # PERFORMANCE FIX: Deduplicate search results by file_path before processing
+            unique_results = {}
+            for result in search_results:
+                if result.file_path not in unique_results:
+                    unique_results[result.file_path] = result
+                elif result.confidence > unique_results[result.file_path].confidence:
+                    unique_results[result.file_path] = result
+            
+            deduplicated_results = list(unique_results.values())
+            logger.info(f"📄 DISCOVERY DOC FILES: {len(search_results)} -> {len(deduplicated_results)} unique files")
+            
             # Convert search results to the format expected by discovery pipeline
             formatted_results = []
-            for result in search_results:
+            for result in deduplicated_results:
                 # For documentation files, try to get full content instead of just snippets
                 content = result.snippet
                 if self._is_documentation_file(result.file_path):
@@ -789,7 +1085,7 @@ class SmartSearchEngine:
         )
     
     async def _get_full_file_content(self, file_path: str) -> Optional[str]:
-        """Get full content of a file for discovery analysis"""
+        """Get full content of a file for discovery analysis with caching"""
         try:
             # Construct full workspace path
             if not file_path.startswith('/workspace/'):
@@ -797,9 +1093,18 @@ class SmartSearchEngine:
             else:
                 full_path = file_path
             
+            # PERFORMANCE FIX: Check cache first
+            cached_content = self.content_cache.get(full_path)
+            if cached_content is not None:
+                logger.debug(f"📄 DISCOVERY: Using cached content for {file_path} ({len(cached_content)} chars)")
+                return cached_content
+            
             # Read the file
             with open(full_path, 'r', encoding='utf-8') as f:
                 content = f.read()
+            
+            # Cache the content for future use
+            self.content_cache.put(full_path, content)
             
             # Limit content size to prevent memory issues
             max_content_size = 50000  # 50KB limit
@@ -823,6 +1128,10 @@ class SmartSearchEngine:
             'max_results': self.max_results,
             'min_confidence': self.min_confidence
         }
+    
+    def _extract_project_from_path(self, file_path: str) -> str:
+        """Extract project name from file path using existing utility function"""
+        return get_project_from_path(file_path)
 
 
 # Singleton instance for easy import
@@ -836,7 +1145,7 @@ def get_smart_search_engine() -> SmartSearchEngine:
     return _smart_search_engine
 
 
-async def smart_search(query: str, k: int = 10, strategy_override: List[str] = None) -> Dict[str, Any]:
+async def smart_search(query: str, k: int = 10, strategy_override: List[str] = None, mentioned_projects: List[str] = None) -> Dict[str, Any]:
     """
     Main smart search function - simplified interface for the agent
     
@@ -844,9 +1153,10 @@ async def smart_search(query: str, k: int = 10, strategy_override: List[str] = N
         query: Search query string
         k: Maximum number of results to return
         strategy_override: Optional list of strategies to force use
+        mentioned_projects: Optional list of projects to filter results by
         
     Returns:
         Dict with search results and metadata
     """
     engine = get_smart_search_engine()
-    return await engine.search(query, k, strategy_override)
+    return await engine.search(query, k, strategy_override, mentioned_projects)
