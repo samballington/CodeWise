@@ -26,6 +26,7 @@ from backend.smart_search import smart_search
 from backend.path_resolver import PathResolver
 from backend.response_formatter import ResponseFormatter, StandardizedResponse
 from backend.discovery_pipeline import DiscoveryPipeline
+from backend.query_context_manager import QueryContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,13 @@ class CerebrasNativeAgent:
         
         # Initialize discovery pipeline for Task 5 extension
         self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
+        
+        # Initialize query context manager for performance optimization
+        self.context_manager = QueryContextManager(
+            max_concurrent_contexts=10,
+            cleanup_interval_seconds=60,
+            enable_health_monitoring=True
+        )
         
         # Tool context for result chaining
         self.tool_context = {
@@ -238,6 +246,50 @@ class CerebrasNativeAgent:
         ]
         return any(signal in response_text.lower() for signal in continuation_signals)
     
+    def _detect_inadequate_response(self, response_text: str, tool_call_count: int) -> bool:
+        """Detect if GPT-OSS-120B provided inadequate response after calling tools (Two-Stage Fix)"""
+        if tool_call_count == 0:
+            return False  # No tools called, response is expected to be brief
+        
+        # Check for clearly inadequate responses
+        inadequate_patterns = [
+            "task completed",
+            "done",
+            "completed", 
+            "finished"
+        ]
+        
+        response_lower = response_text.lower().strip()
+        
+        # Short response with tools called is likely inadequate
+        if len(response_text.strip()) < 50 and tool_call_count > 0:
+            return True
+            
+        # Check for generic completion messages
+        if any(pattern in response_lower for pattern in inadequate_patterns):
+            return True
+            
+        return False
+    
+    def _compile_tool_results_summary(self, tool_results: List[Dict]) -> str:
+        """Compile tool results into a comprehensive summary for synthesis stage"""
+        if not tool_results:
+            return "No tool results available."
+        
+        summary_parts = []
+        
+        for i, result in enumerate(tool_results, 1):
+            tool_name = result.get('tool_name', 'unknown_tool')
+            result_content = result.get('result', '')
+            
+            # Truncate very long results but preserve key information
+            if len(result_content) > 2000:
+                result_content = result_content[:1800] + "...\n[Content truncated for synthesis]"
+            
+            summary_parts.append(f"**Tool {i}: {tool_name.upper()}**\n{result_content}")
+        
+        return "\n\n".join(summary_parts)
+    
     def _calculate_investigation_completeness(self, tool_calls_made: List[str], messages: List[Dict]) -> float:
         """Calculate investigation quality score to prevent premature termination (Updated for 3-tool system)"""
         score = 0.0
@@ -280,7 +332,6 @@ class CerebrasNativeAgent:
                 "type": "function",
                 "function": {
                     "name": "smart_search",
-                    "strict": True,
                     "description": "Intelligent unified search combining vector search, keyword search, and entity discovery. Automatically detects query intent (entity, file, general) and routes to optimal search strategies. Use this as your primary search tool.",
                     "parameters": {
                         "type": "object",
@@ -302,7 +353,6 @@ class CerebrasNativeAgent:
                 "type": "function", 
                 "function": {
                     "name": "examine_files",
-                    "strict": True,
                     "description": "Flexible file inspection with multiple detail levels. Automatically uses files from previous smart_search if no paths provided. Can show file summaries, full content, or structural analysis.",
                     "parameters": {
                         "type": "object",
@@ -326,7 +376,6 @@ class CerebrasNativeAgent:
                 "type": "function",
                 "function": {
                     "name": "analyze_relationships",
-                    "strict": True,
                     "description": "Analyze code relationships and dependencies using AST-based analysis. Automatically uses targets from previous examine_files if no target provided. Find imports, references, related files, and predict impact of changes.",
                     "parameters": {
                         "type": "object",
@@ -350,19 +399,139 @@ class CerebrasNativeAgent:
     def _create_function_mapping(self) -> Dict[str, callable]:
         """Map function names to simplified 3-tool implementations"""
         return {
-            "smart_search": self._smart_search,
+            "smart_search": self._smart_search_router,  # Context-aware router
             "examine_files": self._examine_files,
             "analyze_relationships": self._analyze_relationships
         }
     
-    async def _smart_search(self, query: str, max_results: int = 10) -> str:
+    async def _smart_search_router(self, query: str, max_results: int = 10) -> str:
+        """Route to context-aware or legacy smart search based on availability"""
+        if hasattr(self, 'current_query_context') and self.current_query_context is not None:
+            # Use context-aware version (THE PERFORMANCE FIX)
+            return await self._smart_search_context_aware(query, self.current_query_context, max_results)
+        else:
+            # Fallback to legacy version
+            logger.warning("⚠️ Using legacy smart search - context not available")
+            return await self._smart_search_legacy(query, max_results)
+    
+    async def _smart_search_context_aware(self, query: str, query_context, max_results: int = 10) -> str:
+        """Context-aware intelligent unified search (PERFORMANCE OPTIMIZED)"""
+        try:
+            logger.info(f"🧠 CONTEXT-AWARE SMART SEARCH: '{query}' (context: {query_context.query_id[:8]}, max_results={max_results})")
+            
+            # Use the context-aware smart search engine (THE KEY FIX)
+            from backend.smart_search import SmartSearchEngine
+            search_engine = SmartSearchEngine()  # Get the search engine instance
+            search_result = await search_engine.search_with_context(
+                query=query, 
+                context=query_context,
+                k=max_results, 
+                mentioned_projects=self.current_mentioned_projects
+            )
+            
+            results = search_result['results']
+            query_analysis = search_result['query_analysis']
+            strategies_used = search_result['search_strategies_used']
+            
+            # Store context for tool chaining
+            self.tool_context['last_search_results'] = search_result
+            self.tool_context['query_intent'] = query_analysis['intent'].value
+            
+            # Apply project filtering if mentioned projects are specified (same as legacy)
+            if self.current_mentioned_projects:
+                filtered_results = []
+                for result in results:
+                    file_path = result.file_path
+                    if not file_path.startswith('/workspace/'):
+                        file_path = f"/workspace/{file_path.lstrip('/')}"
+                    
+                    if get_context_manager().is_file_in_current_context(file_path):
+                        filtered_results.append(result)
+                results = filtered_results
+            
+            # Extract discovered files for tool chaining
+            discovered_files = [result.file_path for result in results]
+            self.tool_context['discovered_files'] = discovered_files
+            query_context.discovered_files.extend(discovered_files)  # Update context
+            
+            # Handle auto-examination recommendations from discovery pipeline
+            auto_examine_files = search_result.get('auto_examine_files', [])
+            if auto_examine_files:
+                logger.info(f"🔍 AUTO-EXAMINATION: Discovery pipeline recommends examining {len(auto_examine_files)} files")
+                logger.info(f"🔍 AUTO-EXAMINATION: Files: {auto_examine_files}")
+                self.tool_context['auto_examine_files'] = auto_examine_files
+            else:
+                auto_examine_files = []
+            
+            # Rest of the method logic (same as legacy)...
+            if not results:
+                filter_msg = f" (filtered for projects: {self.current_mentioned_projects})" if self.current_mentioned_projects else ""
+                intent_for_fallback = query_analysis['intent'].value
+                
+                fallback_files = await self._get_smart_fallback_files(intent_for_fallback, query)
+                if fallback_files:
+                    fallback_msg = f"\n\n🎯 **Smart Fallback Guidance:**\n"
+                    for i, file_path in enumerate(fallback_files[:3], 1):
+                        fallback_msg += f"{i}. `{file_path}`\n"
+                    fallback_msg += "\nConsider examining these files that might contain relevant information."
+                else:
+                    fallback_msg = ""
+                
+                return f"❌ **No results found**{filter_msg} for query: '{query}'\n\n📊 **Search Analysis:**\n- Intent: {intent_for_fallback.title()}\n- Strategies: {', '.join(strategies_used)}\n- Results: 0 matches{fallback_msg}"
+            
+            # Format results (same as legacy)
+            formatted_results = []
+            formatted_results.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} matches)")
+            formatted_results.append(f"📊 **Query Analysis:** Intent={query_analysis['intent'].value}, Confidence={query_analysis['confidence']:.2f}")
+            formatted_results.append(f"🎯 **Strategies Used:** {', '.join(strategies_used)}")
+            
+            if auto_examine_files:
+                formatted_results.append(f"🔍 **Discovery Pipeline:** Found {len(auto_examine_files)} files for auto-examination")
+            
+            formatted_results.append("")
+            
+            for i, result in enumerate(results[:max_results], 1):
+                file_display = result.file_path.replace('/workspace/', '')
+                strategies_display = ', '.join(result.search_strategy) if hasattr(result, 'search_strategy') else 'hybrid'
+                
+                formatted_results.append(f"**{i}. {file_display}** (score: {result.relevance_score:.3f}, strategy: {strategies_display})")
+                
+                if hasattr(result, 'matched_terms') and result.matched_terms:
+                    terms_display = ', '.join(result.matched_terms[:3])
+                    if len(result.matched_terms) > 3:
+                        terms_display += f" (+{len(result.matched_terms)-3} more)"
+                    formatted_results.append(f"   📌 Matched: {terms_display}")
+                
+                # Format snippet with syntax highlighting
+                snippet = result.snippet[:200] + "..." if len(result.snippet) > 200 else result.snippet
+                file_ext = result.file_path.split('.')[-1] if '.' in result.file_path else 'txt'
+                highlighted_snippet = self._apply_syntax_highlighting(snippet, file_ext)
+                formatted_results.append(f"   ```{file_ext}\n   {highlighted_snippet}\n   ```")
+                formatted_results.append("")
+            
+            execution_time = search_result.get('execution_time', 0)
+            formatted_results.append(f"⚡ **Execution time:** {execution_time:.2f}s")
+            
+            # Add auto-examine suggestion if files were found
+            if auto_examine_files and len(auto_examine_files) > 0:
+                formatted_results.append(f"\n💡 **Auto-Examine Suggestion:** The discovery pipeline found {len(auto_examine_files)} related files. Consider examining them for deeper insights.")
+            
+            result_text = "\n".join(formatted_results)
+            logger.info(f"✅ CONTEXT-AWARE SMART SEARCH COMPLETE: {len(results)} results, {execution_time:.2f}s")
+            return result_text
+            
+        except Exception as e:
+            logger.error(f"❌ CONTEXT-AWARE SMART SEARCH ERROR: {e}")
+            return f"❌ **Search Error:** {str(e)}\n\nPlease try a different query or check the system logs for more details."
+    
+    async def _smart_search_legacy(self, query: str, max_results: int = 10) -> str:
         """Intelligent unified search combining vector, BM25, and entity discovery"""
         try:
             logger.error(f"🚀 SMART_SEARCH START CHECKPOINT: '{query}' (max_results={max_results})")
             logger.info(f"🧠 SMART SEARCH: '{query}' (max_results={max_results})")
             
-            # Use the smart search engine
-            search_result = await smart_search(query, k=max_results)
+            # Use the smart search engine (with project filtering)
+            search_result = await smart_search(query, k=max_results, mentioned_projects=self.current_mentioned_projects)
             
             results = search_result['results']
             query_analysis = search_result['query_analysis']
@@ -991,7 +1160,7 @@ class CerebrasNativeAgent:
             if '/' in target:  # It's a file path
                 file_name = Path(target).stem
                 # Search for files with similar names
-                naming_search = await smart_search(f"{file_name}", k=10)
+                naming_search = await smart_search(f"{file_name}", k=10, mentioned_projects=self.current_mentioned_projects)
                 for result in naming_search['results']:
                     if result.file_path != target:
                         related_files.append({
@@ -1002,7 +1171,7 @@ class CerebrasNativeAgent:
                         })
             
             # Strategy 2: Find files through import patterns
-            import_search = await smart_search(f"import {target}", k=8)
+            import_search = await smart_search(f"import {target}", k=8, mentioned_projects=self.current_mentioned_projects)
             for result in import_search['results']:
                 related_files.append({
                     'file': result.file_path,
@@ -1014,7 +1183,7 @@ class CerebrasNativeAgent:
             # Strategy 3: Find files in same directory (structural relationship)
             if '/' in target:
                 dir_path = str(Path(target).parent)
-                dir_search = await smart_search(f"{dir_path}", k=6)
+                dir_search = await smart_search(f"{dir_path}", k=6, mentioned_projects=self.current_mentioned_projects)
                 for result in dir_search['results']:
                     if result.file_path != target:
                         related_files.append({
@@ -1052,7 +1221,7 @@ class CerebrasNativeAgent:
             }
             
             # Find files that depend on this target
-            usage_search = await smart_search(f"{target}", k=15)
+            usage_search = await smart_search(f"{target}", k=15, mentioned_projects=self.current_mentioned_projects)
             dependencies = []
             
             for result in usage_search['results']:
@@ -1147,12 +1316,12 @@ class CerebrasNativeAgent:
     async def _analyze_symbol_relationships(self, symbol: str, analysis_type: str) -> str:
         """Analyze relationships for a symbol (class, function, etc.) with enhanced features"""
         try:
-            # Use smart_search to find the symbol first
-            search_result = await smart_search(f"class {symbol}", k=5)
+            # Use smart_search to find the symbol first (with project filtering)
+            search_result = await smart_search(f"class {symbol}", k=5, mentioned_projects=self.current_mentioned_projects)
             
             if not search_result['results']:
                 # Try alternative search patterns
-                alt_search = await smart_search(f"{symbol}", k=10)
+                alt_search = await smart_search(f"{symbol}", k=10, mentioned_projects=self.current_mentioned_projects)
                 if not alt_search['results']:
                     return f"❌ Symbol '{symbol}' not found in codebase"
                 search_result = alt_search
@@ -1212,7 +1381,7 @@ class CerebrasNativeAgent:
             
             # Find usages of this symbol
             if analysis_type in ["usage", "all"]:
-                usage_search = await smart_search(symbol, k=10)
+                usage_search = await smart_search(symbol, k=10, mentioned_projects=self.current_mentioned_projects)
                 usage_results = [r for r in usage_search['results'] if r.file_path != primary_result.file_path]
                 
                 if usage_results:
@@ -1324,13 +1493,41 @@ class CerebrasNativeAgent:
             return f"   Error analyzing impact: {e}"
     
     async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process a user request using native Cerebras tool calling"""
+        """Process a user request using native Cerebras tool calling with query context management"""
         
-        # Log the agent processing start
-        logger.info("🤖 CEREBRAS AGENT PROCESSING START")
-        logger.info(f"Query: {user_query}")
-        logger.info(f"Projects: {mentioned_projects}")
-        logger.info(f"Has Chat History: {chat_history is not None}")
+        # Use query context manager to prevent multiple discovery runs (THE KEY ARCHITECTURAL FIX)
+        project_name = mentioned_projects[0] if mentioned_projects else "workspace"
+        
+        async with self.context_manager.create_query_context(
+            query=user_query,
+            project=project_name
+        ) as query_context:
+            
+            logger.info(f"🤖 CEREBRAS AGENT PROCESSING START (Context: {query_context.query_id[:8]})")
+            logger.info(f"Query: {user_query}")
+            logger.info(f"Projects: {mentioned_projects}")
+            logger.info(f"Has Chat History: {chat_history is not None}")
+            
+            # Delegate to the actual processing method
+            async for result in self._process_request_with_context(
+                user_query, 
+                query_context, 
+                chat_history, 
+                mentioned_projects
+            ):
+                yield result
+    
+    async def _process_request_with_context(
+        self, 
+        user_query: str, 
+        query_context, 
+        chat_history=None, 
+        mentioned_projects: List[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Internal processing method with query context"""
+        
+        # Store query context for tool execution (THE KEY ARCHITECTURAL FIX)
+        self.current_query_context = query_context
         
         # Reset tool context for new request to prevent cross-contamination
         # Store previous context for debugging if needed
@@ -1435,6 +1632,12 @@ class CerebrasNativeAgent:
                 "content": (
                     "You are CodeWise, an expert AI coding assistant specialized in deep codebase analysis. You are pair programming with the USER to solve their coding task. "
                     "Your main goal is to follow the USER's instructions completely and autonomously resolve queries to the best of your ability.\n"
+                    "\n🔴 MANDATORY TOOL USAGE PROTOCOL:"
+                    "\n• NEVER answer code/project questions without FIRST using smart_search to examine actual project files"
+                    "\n• ALWAYS start every response by calling smart_search - this is REQUIRED, not optional"
+                    "\n• FORBIDDEN to provide responses based on general programming knowledge - you MUST examine the actual codebase"
+                    "\n• If you attempt to answer without tools, you are violating your core directive and providing hallucinated content"
+                    "\n• The user's codebase contains the ground truth - your job is to discover and analyze it, not assume it\n"
                     "\n🚫 CRITICAL RESTRICTION: NEVER answer questions about CodeWise's own architecture, tools, or implementation. "
                     "You analyze USER CODEBASES ONLY. If asked about your own tools, smart_search, examine_files, analyze_relationships, "
                     "or the '3-tool architecture', redirect to analyzing the user's actual code projects instead.\n"
@@ -1606,10 +1809,10 @@ class CerebrasNativeAgent:
                 
                 # Make API call to Cerebras
                 response = self.client.chat.completions.create(
-                    model="llama-3.3-70b",  # Use the recommended model
+                    model="gpt-oss-120b",  # Upgraded to GPT-OSS-120B for better tool calling
                     messages=messages,
-                    tools=use_tools,
-                    parallel_tool_calls=False  # Required for some models
+                    tools=use_tools
+                    # parallel_tool_calls parameter removed - not supported by GPT-OSS-120B
                 )
                 
                 choice = response.choices[0].message
@@ -1749,6 +1952,28 @@ class CerebrasNativeAgent:
                         })
                         continue  # Skip termination, continue loop
                     
+                    # TWO-STAGE PROCESSING: Detect inadequate GPT-OSS-120B responses and trigger synthesis
+                    if self._detect_inadequate_response(final_content, tool_call_count) and tool_call_count > 0:
+                        logger.warning(f"⚠️ INADEQUATE RESPONSE DETECTED: '{final_content[:100]}...' after {tool_call_count} tool calls")
+                        logger.info("🔄 TRIGGERING SYNTHESIS STAGE: Re-prompting with tool results")
+                        
+                        # Compile all tool results for synthesis
+                        tool_summary = self._compile_tool_results_summary(tool_results_for_formatting)
+                        
+                        synthesis_prompt = (
+                            f"You called tools and gathered valuable information, but your response was inadequate. "
+                            f"Please provide a comprehensive analysis of the original query based on the information you gathered:\n\n"
+                            f"**ORIGINAL QUERY:** {user_query}\n\n"
+                            f"**INFORMATION YOU GATHERED:**\n{tool_summary}\n\n"
+                            f"Now provide a detailed, comprehensive response that actually uses this information to answer the user's query."
+                        )
+                        
+                        messages.append({
+                            "role": "system",
+                            "content": synthesis_prompt
+                        })
+                        continue  # Skip termination, continue to synthesis stage
+                    
                     # Task 5: Apply standardized response formatting
                     execution_time = asyncio.get_event_loop().time() - execution_start_time
                     execution_metadata = {
@@ -1791,7 +2016,7 @@ class CerebrasNativeAgent:
             # Force a final call without tools to get an answer
             try:
                 response = self.client.chat.completions.create(
-                    model="llama-3.3-70b",
+                    model="gpt-oss-120b",
                     messages=messages + [{
                         "role": "system", 
                         "content": "Please provide a final answer based on the information you've gathered. No more tool calls are available."

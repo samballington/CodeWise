@@ -10,14 +10,21 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
 
+from path_resolution_cache import (
+    PathResolutionCache, 
+    PathResolutionCacheConfig,
+    get_global_cache
+)
+
 logger = logging.getLogger(__name__)
 
 class PathResolver:
     """Resolves various file path formats to consistent workspace paths"""
     
-    def __init__(self, workspace_root: str = "/workspace"):
+    def __init__(self, workspace_root: str = "/workspace", cache: Optional[PathResolutionCache] = None):
         self.workspace_root = Path(workspace_root)
         self.project_mappings = self._build_project_mappings()
+        self.cache = cache or get_global_cache()
         
     def _build_project_mappings(self) -> Dict[str, str]:
         """Build mapping of project names to their actual directories"""
@@ -42,7 +49,16 @@ class PathResolver:
             return "", False
             
         input_path = input_path.strip()
-        logger.info(f"🔧 PATH RESOLVER: Resolving '{input_path}'")
+        
+        # Create cache key that includes context for proper isolation
+        cache_key = f"{input_path}|{project_context or ''}" 
+        
+        # Try cache first
+        cached_result = self.cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+        
+        logger.debug(f"🔧 PATH RESOLVER: Resolving '{input_path}'")
         
         # Strategy 1: Handle @project-name prefix format
         if input_path.startswith("@"):
@@ -50,13 +66,17 @@ class PathResolver:
             if resolved:
                 exists = Path(resolved).exists()
                 logger.info(f"🔧 Project prefix resolved: {input_path} → {resolved} (exists: {exists})")
-                return resolved, exists
+                result = (resolved, exists)
+                self.cache.put(cache_key, result[0], result[1])
+                return result
         
         # Strategy 2: Handle absolute paths (already correct)
         if input_path.startswith("/workspace"):
             exists = Path(input_path).exists()
             logger.info(f"🔧 Absolute path: {input_path} (exists: {exists})")
-            return input_path, exists
+            result = (input_path, exists)
+            self.cache.put(cache_key, result[0], result[1])
+            return result
         
         # Strategy 3: Handle relative paths from search results
         if not input_path.startswith("/"):
@@ -65,7 +85,9 @@ class PathResolver:
             if full_path.exists():
                 resolved = str(full_path)
                 logger.info(f"🔧 Relative path resolved: {input_path} → {resolved}")
-                return resolved, True
+                result = (resolved, True)
+                self.cache.put(cache_key, result[0], result[1])
+                return result
         
         # Strategy 4: Try to find the file using project context
         if project_context:
@@ -73,20 +95,29 @@ class PathResolver:
             if resolved:
                 exists = Path(resolved).exists()
                 logger.info(f"🔧 Project context resolved: {input_path} → {resolved} (exists: {exists})")
-                return resolved, exists
+                result = (resolved, exists)
+                self.cache.put(cache_key, result[0], result[1])
+                return result
         
         # Strategy 5: Search across all projects for the filename
         resolved = self._search_across_projects(input_path)
         if resolved:
             exists = Path(resolved).exists()
-            logger.info(f"🔧 Cross-project search resolved: {input_path} → {resolved} (exists: {exists})")
-            return resolved, exists
+            logger.debug(f"🔧 Cross-project search resolved: {input_path} → {resolved} (exists: {exists})")
+            result = (resolved, exists)
+            self.cache.put(cache_key, result[0], result[1])
+            return result
         
         # Fallback: Return as-is with workspace prefix
         fallback = str(self.workspace_root / input_path.lstrip('./'))
         exists = Path(fallback).exists()
-        logger.info(f"🔧 Fallback resolution: {input_path} → {fallback} (exists: {exists})")
-        return fallback, exists
+        logger.debug(f"🔧 Fallback resolution: {input_path} → {fallback} (exists: {exists})")
+        
+        # Cache the result
+        result = (fallback, exists)
+        self.cache.put(cache_key, result[0], result[1])
+        
+        return result
     
     def _resolve_project_prefix(self, path: str) -> Optional[str]:
         """Convert @project-name file.ext to workspace/project-name/path/file.ext"""
@@ -157,6 +188,18 @@ class PathResolver:
                     return found
         
         return None
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get path resolution cache statistics for monitoring"""
+        return self.cache.get_stats()
+    
+    def clear_cache(self) -> None:
+        """Clear the path resolution cache"""
+        self.cache.clear()
+    
+    def cleanup_expired_cache_entries(self) -> int:
+        """Remove expired entries from cache and return count removed"""
+        return self.cache.cleanup_expired()
     
     def resolve_from_search_results(self, search_results: List[Dict]) -> List[str]:
         """Resolve file paths from smart_search results"""
