@@ -199,48 +199,7 @@ async def websocket_endpoint(websocket: WebSocket):
         })
         del active_connections[connection_id]
 
-# Pydantic models for API provider endpoints
-class ProviderSwitchRequest(BaseModel):
-    provider: str
-
-# API Provider endpoints
-@app.get("/api/provider/info")
-async def get_provider_info():
-    """Get current API provider information"""
-    try:
-        provider_manager = get_provider_manager()
-        info = provider_manager.get_provider_info()
-        return info
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get provider info: {str(e)}")
-
-@app.post("/api/provider/switch")
-async def switch_provider(request: ProviderSwitchRequest):
-    """Switch to a different API provider"""
-    try:
-        provider_manager = get_provider_manager()
-        success = provider_manager.switch_provider(request.provider)
-        
-        if success:
-            # Reinitialize the agent with the new provider
-            global global_agent
-            if global_agent:
-                openai_api_key = os.getenv("OPENAI_API_KEY")
-                global_agent.reinitialize_with_provider(openai_api_key)
-                logger.info(f"Agent reinitialized after switching to {request.provider}")
-            
-            return {
-                "success": True,
-                "message": f"Successfully switched to {request.provider}",
-                "current_provider": request.provider
-            }
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to switch to provider: {request.provider}"
-            )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Provider switch error: {str(e)}")
+# API Provider endpoints removed - OpenAI functionality disabled
 
 @app.get("/api/provider/health")
 async def get_provider_health():
@@ -260,4 +219,16 @@ async def health_check():
 async def indexer_status():
     """Return whether the vector index has finished building."""
     ready = Path("/workspace/.vector_cache/index.faiss").exists()
-    return {"ready": ready} 
+    return {"ready": ready}
+
+@app.post("/indexer/refresh")
+async def refresh_vector_store():
+    """Force refresh the vector store from disk"""
+    try:
+        from vector_store import get_vector_store
+        vs = get_vector_store()
+        vs.force_refresh()
+        return {"status": "success", "message": "Vector store refreshed from disk"}
+    except Exception as e:
+        logger.error(f"Failed to refresh vector store: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to refresh vector store: {str(e)}") 
