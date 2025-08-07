@@ -15,22 +15,26 @@ jobs:
         
     - name: Check PR title format
       run: |
-        if [[ "${{ github.event.pull_request.title }}" =~ ^(feat|fix|docs|style|refactor|test|chore)(\(.+\))?: .+ ]]; then
+        title="${{ github.event.pull_request.title }}"
+        # Use grep instead of bash regex for better compatibility
+        if echo "$title" | grep -qE '^(feat|fix|docs|style|refactor|test|chore)(\([^)]+\))?: '; then
           echo "✅ PR title follows conventional commit format"
         else
           echo "❌ PR title must follow format: type(scope): description"
           echo "Examples: feat: add new search feature, fix(backend): resolve query timeout"
+          echo "Current title: $title"
           exit 1
         fi
         
     - name: Check for documentation files
       run: |
-        if git diff --name-only origin/main...HEAD | grep -E '\.(md|txt)$'; then
+        # Exclude requirements.txt and other legitimate .txt files
+        if git diff --name-only origin/main...HEAD | grep -E '\.(md)$|\.txt$' | grep -v 'requirements\.txt$'; then
           echo "❌ Documentation files detected in PR"
-          echo "Please remove .md and .txt files as they should be gitignored"
+          echo "Please remove .md files as they should be gitignored"
           exit 1
         else
-          echo "✅ No documentation files in PR"
+          echo "✅ No unwanted documentation files in PR"
         fi
         
     - name: Check file size limits

@@ -12,7 +12,8 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import openai
 import requests
-from cerebras.cloud.sdk import Cerebras
+# Lazy import Cerebras to avoid Pydantic compatibility issues during module load
+Cerebras = None
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError:
@@ -337,6 +338,14 @@ class CerebrasProvider(BaseProvider):
 
         super().__init__(api_key, model_name)
 
+        # Lazy load Cerebras SDK to avoid Pydantic compatibility issues during module import
+        global Cerebras
+        if Cerebras is None:
+            try:
+                from cerebras.cloud.sdk import Cerebras
+            except ImportError as e:
+                raise ImportError(f"Cerebras SDK not available: {e}")
+        
         # Initialise SDK client
         self.client = Cerebras(api_key=api_key)
 

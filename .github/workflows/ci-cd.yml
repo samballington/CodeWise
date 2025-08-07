@@ -39,6 +39,7 @@ jobs:
       run: |
         cd backend
         export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+        export CEREBRAS_API_KEY="csk-9cn6tmncp9deppcdnxryevjr68j3wfpx3j65p552mph82t4x"
         python -m pytest tests/ -v --tb=short
         
     - name: Run backend linting
