@@ -880,6 +880,8 @@ class CodeWiseAgent:
             self.use_native_cerebras = False
             
             if current_provider and provider_info.get('provider') == 'openai':
+                if not openai_api_key:
+                    raise ValueError("OpenAI API key required when using OpenAI provider")
                 self.llm = ChatOpenAI(
                     api_key=openai_api_key,
                     model=provider_info.get('chat_model', 'gpt-4-turbo-preview'),
@@ -887,22 +889,20 @@ class CodeWiseAgent:
                     streaming=True
                 )
                 logger.info(f"Using OpenAI provider with model: {provider_info.get('chat_model')}")
-            elif current_provider and provider_info.get('provider') == 'kimi':
-                # Use custom provider-managed chat model for Kimi
+            elif current_provider and provider_info.get('provider') in ['kimi', 'cerebras']:
+                # Use custom provider-managed chat model for Kimi/Cerebras
                 self.llm = ProviderManagedChatModel(
                     provider_manager=self.provider_manager,
                     temperature=0
                 )
-                logger.info("✅ Using Kimi K2 provider with custom LangChain wrapper")
+                logger.info(f"✅ Using {provider_info.get('provider')} provider with custom LangChain wrapper")
             else:
-                # Fallback to OpenAI if no provider available
-                self.llm = ChatOpenAI(
-                    api_key=openai_api_key,
-                    model="gpt-4-turbo-preview",
-                    temperature=0,
-                    streaming=True
+                # Default to provider-managed chat model (Cerebras/Kimi) instead of OpenAI
+                self.llm = ProviderManagedChatModel(
+                    provider_manager=self.provider_manager,
+                    temperature=0
                 )
-                logger.info("Using fallback OpenAI provider")
+                logger.info("✅ Using default provider-managed chat model (no OpenAI key required)")
         
         # Initialize shared components for LangChain agents only
         if not self.use_native_cerebras:
