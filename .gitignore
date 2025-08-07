@@ -97,3 +97,11 @@ indexer/test_*.py
 *.notes.txt
 *.dev.md
 *.local.md
+planning/**
+planning.md
+requirements.md
+design.md
+tasks.md
+**/requirements.md
+**/design.md
+**/tasks.md

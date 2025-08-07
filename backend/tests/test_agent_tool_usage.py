@@ -1,6 +1,6 @@
 import json
 import pytest
-from backend.agent import CodeWiseAgent
+from agent import CodeWiseAgent
 
 
 @pytest.mark.asyncio
