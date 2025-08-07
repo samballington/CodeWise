@@ -1,6 +1,6 @@
 import importlib, sys
 from langchain.globals import get_llm_cache
-from langchain.cache import SQLiteCache, InMemoryCache
+from langchain_community.cache import SQLiteCache, InMemoryCache
 
 
 def _reload_agent():
