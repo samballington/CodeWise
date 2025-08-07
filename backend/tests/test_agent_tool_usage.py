@@ -19,22 +19,13 @@ async def test_code_search_tool_works(tmp_path, monkeypatch):
     # Build real tools via CodeWiseAgent (will use local embedder)
     agent_wrapper = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
     
-    # Get the code_search tool function from tools - use coroutine if available
-    tool_map = {}
-    for tool in agent_wrapper.tools:
-        if hasattr(tool, 'coroutine') and tool.coroutine:
-            tool_map[tool.name] = tool.coroutine
-        else:
-            tool_map[tool.name] = tool.func
-    
+    # Use sync functions only since the underlying functions are sync
+    tool_map = {tool.name: tool.func for tool in agent_wrapper.tools}
     code_search_func = tool_map.get("code_search")
     
     # Test: invoke code_search tool function directly
     if code_search_func:
-        if asyncio.iscoroutinefunction(code_search_func):
-            results = await code_search_func("database")
-        else:
-            results = code_search_func("database")
+        results = code_search_func("database")
         # For CI environment without proper indexing, just verify it returns a string
         assert isinstance(results, str), f"code_search should return string, got: {type(results)}"
         print(f"Code search returned: {results}")

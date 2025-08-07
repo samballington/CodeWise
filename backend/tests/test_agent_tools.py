@@ -18,37 +18,20 @@ async def test_tools_callable(tmp_path, monkeypatch):
 
     agent = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
 
-    # Map tool names to callables - use coroutine if available, else sync func
-    tool_map = {}
-    for tool in agent.tools:
-        if hasattr(tool, 'coroutine') and tool.coroutine:
-            tool_map[tool.name] = tool.coroutine
-        else:
-            tool_map[tool.name] = tool.func
+    # Use sync functions only since the underlying functions are sync
+    tool_map = {tool.name: tool.func for tool in agent.tools}
 
     # code_search should return string (even if "No results")
     if "code_search" in tool_map:
-        func = tool_map["code_search"]
-        if asyncio.iscoroutinefunction(func):
-            code_search_result = await func("dummy search")
-        else:
-            code_search_result = func("dummy search")
+        code_search_result = tool_map["code_search"]("dummy search")
         assert isinstance(code_search_result, str)
 
     # file_glimpse should return file content
     if "file_glimpse" in tool_map:
-        func = tool_map["file_glimpse"]
-        if asyncio.iscoroutinefunction(func):
-            glimpse_result = await func("test_dummy.txt")
-        else:
-            glimpse_result = func("test_dummy.txt")
+        glimpse_result = tool_map["file_glimpse"]("test_dummy.txt")
         assert "hello world" in glimpse_result
 
     # list_entities returns str (may be empty)
     if "list_entities" in tool_map:
-        func = tool_map["list_entities"]
-        if asyncio.iscoroutinefunction(func):
-            entities_result = await func(None)
-        else:
-            entities_result = func(None)
+        entities_result = tool_map["list_entities"](None)
         assert isinstance(entities_result, str) 
