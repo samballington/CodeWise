@@ -1,11 +1,13 @@
 import json
 import asyncio
 import pytest
+from unittest.mock import patch, AsyncMock
 from agent import CodeWiseAgent
 
 
-@pytest.mark.asyncio
-async def test_code_search_tool_works(tmp_path, monkeypatch):
+@pytest.mark.asyncio  
+@patch('agent.MCPToolWrapper')
+async def test_code_search_tool_works(mock_mcp_class, tmp_path, monkeypatch):
     """Test that code_search tool can be invoked directly and returns results."""
     # --- create tiny workspace ---
     workspace_dir = tmp_path / "workspace"
@@ -15,6 +17,12 @@ async def test_code_search_tool_works(tmp_path, monkeypatch):
     schema_file.write_text("CREATE TABLE book(id INT PRIMARY KEY, title TEXT);")
     # env patch
     monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
+
+    # Mock MCP wrapper methods to avoid network calls
+    mock_mcp = mock_mcp_class.return_value
+    mock_mcp.read_file = AsyncMock(return_value="dummy file content")
+    mock_mcp.list_files = AsyncMock(return_value="schema.sql\napp.py\n")
+    mock_mcp.run_command = AsyncMock(return_value="find results")
 
     # Build real tools via CodeWiseAgent (will use local embedder)
     agent_wrapper = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
@@ -37,7 +45,8 @@ async def test_code_search_tool_works(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio  
-async def test_file_glimpse_tool_works(tmp_path, monkeypatch):
+@patch('agent.MCPToolWrapper')
+async def test_file_glimpse_tool_works(mock_mcp_class, tmp_path, monkeypatch):
     """Test that file_glimpse tool can access file content."""
     # --- create tiny workspace ---
     workspace_dir = tmp_path / "workspace"
@@ -48,6 +57,10 @@ async def test_file_glimpse_tool_works(tmp_path, monkeypatch):
     src_file.write_text(file_content)
     # env patch
     monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
+
+    # Mock MCP wrapper to avoid network calls
+    mock_mcp = mock_mcp_class.return_value
+    mock_mcp.read_file = AsyncMock(return_value=file_content)
 
     # Build real tools via CodeWiseAgent
     agent_wrapper = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
@@ -72,13 +85,19 @@ async def test_file_glimpse_tool_works(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_tools_are_available(tmp_path, monkeypatch):
+@patch('agent.MCPToolWrapper')
+async def test_agent_tools_are_available(mock_mcp_class, tmp_path, monkeypatch):
     """Test that the agent has the expected tools available."""
     # --- create tiny workspace ---
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir()
     # env patch
     monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
+
+    # Mock MCP wrapper to avoid network calls  
+    mock_mcp = mock_mcp_class.return_value
+    mock_mcp.read_file = AsyncMock(return_value="dummy content")
+    mock_mcp.list_files = AsyncMock(return_value="file1.txt")
 
     # Build real tools via CodeWiseAgent
     agent_wrapper = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
