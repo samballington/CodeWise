@@ -7,6 +7,25 @@ export interface Message {
   timestamp: Date
   isError?: boolean
   isComplete?: boolean
+  isProcessing?: boolean
+  contextData?: {
+    sources?: string[]
+    chunksFound?: number
+    filesAnalyzed?: number
+    query?: string
+  }
+  toolCalls?: Array<{
+    tool: string
+    input: string
+    output: string
+    status: 'running' | 'completed' | 'error'
+  }>
+  bufferedToolCalls?: Array<{
+    tool: string
+    input: string
+    output: string
+    status: 'running' | 'completed' | 'error'
+  }>
 }
 
 export interface ContextActivity {
@@ -25,6 +44,7 @@ interface ChatStore {
   messages: Message[]
   addMessage: (message: Message) => void
   updateLastMessage: (updates: Partial<Message>) => void
+  addToolCallToLastMessage: (toolCall: { tool: string; input: string; output: string; status: 'running' | 'completed' | 'error' }) => void
   clearMessages: () => void
 }
 
@@ -57,6 +77,22 @@ export const useChatStore = create<ChatStore>((set) => ({
       const messages = [...state.messages]
       const lastMessage = messages[messages.length - 1]
       messages[messages.length - 1] = { ...lastMessage, ...updates }
+      
+      return { messages }
+    }),
+  
+  addToolCallToLastMessage: (toolCall) =>
+    set((state) => {
+      if (state.messages.length === 0) return state
+      
+      const messages = [...state.messages]
+      const lastMessage = messages[messages.length - 1]
+      const existingToolCalls = lastMessage.toolCalls || []
+      
+      messages[messages.length - 1] = {
+        ...lastMessage,
+        toolCalls: [...existingToolCalls, toolCall]
+      }
       
       return { messages }
     }),

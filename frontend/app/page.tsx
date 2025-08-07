@@ -108,6 +108,8 @@ export default function Home() {
             >
               Projects
             </button>
+
+
             
             <div className="flex items-center gap-2">
               <div

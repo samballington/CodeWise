@@ -1577,6 +1577,8 @@ class CerebrasNativeAgent:
         get_context_manager().add_search_to_context(user_query)
         
         # Always reset and properly set mentioned projects for each request to prevent state leakage
+        # Clear any previous project context first to prevent contamination
+        self.current_mentioned_projects = None
         self.current_mentioned_projects = mentioned_projects if mentioned_projects is not None else []
         
         # Task 5: Initialize tool results tracking for response formatting

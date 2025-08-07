@@ -6,6 +6,7 @@ import ReactMarkdown from 'react-markdown'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { Copy, Check, User, Bot, Terminal, FileText, Loader2, CheckCircle, Circle } from 'lucide-react'
+import { ContextDropdown } from './ContextDropdown'
 
 interface MessageItemProps {
   message: Message
@@ -117,31 +118,43 @@ function ToolOutput({ tool, input, output, status }: ToolOutputProps) {
 export default function MessageItem({ message }: MessageItemProps) {
   const isUser = message.role === 'user'
   
-  // Parse tool outputs and plan steps from message content
+  // If message is processing, show loading indicator
+  if (message.isProcessing) {
+    return (
+      <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-6 message-enter`}>
+        <div className={`flex gap-3 max-w-[85%] ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+          {/* Avatar */}
+          <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
+            isUser 
+              ? 'bg-primary text-white' 
+              : 'bg-gradient-to-br from-accent to-primary text-white'
+          }`}>
+            {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+          </div>
+          
+          {/* Processing Message */}
+          <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+            <div className={`rounded-2xl px-4 py-3 bg-background-secondary text-text-primary border border-border`}>
+              <div className="flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-accent" />
+                <span>Processing request...</span>
+              </div>
+            </div>
+            
+            {/* Timestamp */}
+            <div className="text-xs text-text-secondary mt-2 px-1">
+              {message.timestamp.toLocaleTimeString()}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  
+  // Only parse legacy tool outputs for old messages - new messages handle tools via context dropdown
   const parseMessageContent = (content: string): 
-    | { type: 'tool_output'; tools: Array<{ tool: string; input: string; output: string; status: 'completed' }> }
     | { type: 'plan'; steps: string[]; remainingContent: string }
     | { type: 'normal'; content: string } => {
-    
-    // Check for tool output patterns
-    const toolPattern = /🛠️ Running tool: (\w+)[\s\S]*?Input: (.*?)[\s\S]*?✅ Tool output:\n([\s\S]*?)(?=🛠️|$)/g
-    const toolMatches: RegExpExecArray[] = []
-    let match
-    while ((match = toolPattern.exec(content)) !== null) {
-      toolMatches.push(match)
-    }
-    
-    if (toolMatches.length > 0) {
-      return {
-        type: 'tool_output',
-        tools: toolMatches.map(match => ({
-          tool: match[1],
-          input: match[2],
-          output: match[3],
-          status: 'completed' as const
-        }))
-      }
-    }
     
     // Check for plan/checklist patterns
     const planPattern = /(?:Plan|Steps):\s*\n((?:\d+\.\s*.*\n?)+)/i
@@ -187,21 +200,6 @@ export default function MessageItem({ message }: MessageItemProps) {
               : 'bg-background-secondary text-text-primary border border-border'
           }`}>
             
-            {/* Tool Output Rendering */}
-            {parsedContent.type === 'tool_output' && (
-              <div className="space-y-3">
-                {parsedContent.tools.map((tool, index) => (
-                  <ToolOutput
-                    key={index}
-                    tool={tool.tool}
-                    input={tool.input}
-                    output={tool.output}
-                    status={tool.status}
-                  />
-                ))}
-              </div>
-            )}
-            
             {/* Plan/Checklist Rendering */}
             {parsedContent.type === 'plan' && (
               <div className="space-y-3">
@@ -246,6 +244,50 @@ export default function MessageItem({ message }: MessageItemProps) {
                             </code>
                           )
                         },
+                        table({ children, ...props }: any) {
+                          return (
+                            <div className="overflow-x-auto my-4">
+                              <table className="min-w-full border-collapse border border-border rounded-lg" {...props}>
+                                {children}
+                              </table>
+                            </div>
+                          )
+                        },
+                        thead({ children, ...props }: any) {
+                          return (
+                            <thead className="bg-background-secondary" {...props}>
+                              {children}
+                            </thead>
+                          )
+                        },
+                        tbody({ children, ...props }: any) {
+                          return (
+                            <tbody {...props}>
+                              {children}
+                            </tbody>
+                          )
+                        },
+                        tr({ children, ...props }: any) {
+                          return (
+                            <tr className="border-b border-border hover:bg-background-secondary/50" {...props}>
+                              {children}
+                            </tr>
+                          )
+                        },
+                        th({ children, ...props }: any) {
+                          return (
+                            <th className="border border-border px-4 py-2 text-left font-semibold text-text-primary" {...props}>
+                              {children}
+                            </th>
+                          )
+                        },
+                        td({ children, ...props }: any) {
+                          return (
+                            <td className="border border-border px-4 py-2 text-text-primary" {...props}>
+                              {children}
+                            </td>
+                          )
+                        },
                       }}
                     >
                       {parsedContent.remainingContent}
@@ -288,6 +330,50 @@ export default function MessageItem({ message }: MessageItemProps) {
                         </code>
                       )
                     },
+                    table({ children, ...props }: any) {
+                      return (
+                        <div className="overflow-x-auto my-4">
+                          <table className="min-w-full border-collapse border border-border rounded-lg" {...props}>
+                            {children}
+                          </table>
+                        </div>
+                      )
+                    },
+                    thead({ children, ...props }: any) {
+                      return (
+                        <thead className="bg-background-secondary" {...props}>
+                          {children}
+                        </thead>
+                      )
+                    },
+                    tbody({ children, ...props }: any) {
+                      return (
+                        <tbody {...props}>
+                          {children}
+                        </tbody>
+                      )
+                    },
+                    tr({ children, ...props }: any) {
+                      return (
+                        <tr className="border-b border-border hover:bg-background-secondary/50" {...props}>
+                          {children}
+                        </tr>
+                      )
+                    },
+                    th({ children, ...props }: any) {
+                      return (
+                        <th className="border border-border px-4 py-2 text-left font-semibold text-text-primary" {...props}>
+                          {children}
+                        </th>
+                      )
+                    },
+                    td({ children, ...props }: any) {
+                      return (
+                        <td className="border border-border px-4 py-2 text-text-primary" {...props}>
+                          {children}
+                        </td>
+                      )
+                    },
                   }}
                 >
                   {parsedContent.content || message.content}
@@ -295,6 +381,17 @@ export default function MessageItem({ message }: MessageItemProps) {
               </div>
             )}
           </div>
+          
+          {/* Context Dropdown - Only show for assistant messages */}
+          {!isUser && (
+            <div className="w-full mt-2">
+              <ContextDropdown 
+                toolCalls={message.toolCalls || []}
+                messageId={message.id}
+                contextData={message.contextData}
+              />
+            </div>
+          )}
           
           {/* Timestamp */}
           <div className="text-xs text-text-secondary mt-2 px-1">

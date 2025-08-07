@@ -69,17 +69,31 @@ class VectorStore:
         return paths
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # encode locally in batches of 256
+        # encode locally in smaller batches to prevent memory issues
         embeddings: List[List[float]] = []
-        batch_size = 256
+        batch_size = 100  # Reduced from 256 to prevent memory exhaustion
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        
+        logger.info(f"Processing {len(texts)} texts in {total_batches} batches of {batch_size}")
+        
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            
             try:
+                logger.debug(f"Processing embedding batch {batch_num}/{total_batches}")
                 vecs = _vs_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
                 embeddings.extend(vecs.tolist())
+                
+                # Small delay to prevent memory pressure
+                import time
+                time.sleep(0.05)
+                
             except Exception as e:
-                logger.error(f"Local embedding error: {e}")
+                logger.error(f"Batch {batch_num} embedding error: {e}")
                 embeddings.extend([[0.0] * 384] * len(batch))
+        
+        logger.info(f"Successfully generated {len(embeddings)} embeddings")
         return embeddings
 
     def _build(self):
@@ -182,6 +196,14 @@ class VectorStore:
         if self._index_mtime is None or current_mtime != self._index_mtime:
             logger.info("Detected updated vector index on disk – reloading")
             self._load()
+    
+    def force_refresh(self):
+        """Force reload the index from disk regardless of mtime"""
+        if self.index_path.exists() and self.meta_path.exists():
+            logger.info("Force refreshing vector index from disk")
+            self._load()
+        else:
+            logger.warning("Cannot force refresh - index files do not exist")
 
     def _calculate_relevance_score(self, distance: float, file_path: str, query: str) -> float:
         """Calculate relevance score combining distance with contextual factors (optimized)"""
