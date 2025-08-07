@@ -26,8 +26,8 @@ CodeWise is an AI-powered development assistant that combines deep code understa
 * **Context Re-ranking & Token Optimisation**  
   Merges adjacent chunks, prioritises relevance and fits responses inside model token limits.
 
-### 3. Multi-Provider AI Backend
-* Pluggable adapters for **OpenAI GPT-4 Turbo** and **Kimi K2** with real-time provider toggling from the UI.
+### 3. Advanced AI Backend
+* Powered by **GPT-OSS-120B** through Cerebras AI for superior tool calling and comprehensive code analysis.
 
 ### 4. Real-Time Diagnostics
 * Structured logging & metrics on search precision, zero-result rate and response latency.
@@ -35,12 +35,12 @@ CodeWise is an AI-powered development assistant that combines deep code understa
 ### 5. Container-Based Architecture
 | Container | Tech Stack | Port | Responsibilities |
 |-----------|-----------|------|-------------------|
-| **frontend** | Next.js 14 / React 18 | 3000 | Chat UI, provider toggle, live code viewer |
-| **backend**  | FastAPI / LangChain   | 8000 | Hybrid search, context assembly, provider orchestration |
+| **frontend** | Next.js 14 / React 18 | 3000 | Chat UI, dark/light theme, live code viewer |
+| **backend**  | FastAPI / LangChain   | 8000 | Hybrid search, context assembly, Cerebras AI integration |
 | **indexer**  | Python 3.11 + FAISS   | — | AST chunking, embeddings, BM25 index, coverage metrics |
 | **mcp_server** | FastAPI             | 8001 | Secure workspace file operations |
 
-_Sequence overview:_ the browser streams user input to **backend → backend** consults **indexer** (vector + BM25 + re-ranking) → assembles a token-optimised prompt and proxies it to the selected LLM provider.
+_Sequence overview:_ the browser streams user input to **backend → backend** consults **indexer** (vector + BM25 + re-ranking) → assembles a token-optimised prompt and processes it through Cerebras AI's GPT-OSS-120B model.
 
 ### Key Metrics
 | Metric | Current | Target |

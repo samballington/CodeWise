@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from typing import Dict, Any, List, AsyncGenerator
 from cerebras.cloud.sdk import Cerebras
 from pathlib import Path
@@ -40,6 +41,11 @@ class CerebrasNativeAgent:
         self.tools_schema = self._create_tools_schema()
         self.available_functions = self._create_function_mapping()
         self.current_mentioned_projects = None  # Store current project context
+        
+        # Rate limiting: Enforced as 1 request per second (not just 30/minute window)  
+        # Use 1.1s for safety buffer
+        self.min_request_interval = 1.1
+        self.last_request_time = 0
         
         # Initialize enhanced project structure analyzer
         self.enhanced_structure = EnhancedProjectStructure(self._call_mcp_tool_wrapper)
@@ -289,6 +295,18 @@ class CerebrasNativeAgent:
             summary_parts.append(f"**Tool {i}: {tool_name.upper()}**\n{result_content}")
         
         return "\n\n".join(summary_parts)
+    
+    async def _enforce_rate_limit(self):
+        """Enforce rate limiting to prevent 429 errors - 1 request per second max"""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        
+        if time_since_last_request < self.min_request_interval:
+            wait_time = self.min_request_interval - time_since_last_request
+            logger.info(f"🕒 RATE LIMITING: Waiting {wait_time:.1f}s before next API request")
+            await asyncio.sleep(wait_time)
+        
+        self.last_request_time = time.time()
     
     def _calculate_investigation_completeness(self, tool_calls_made: List[str], messages: List[Dict]) -> float:
         """Calculate investigation quality score to prevent premature termination (Updated for 3-tool system)"""
@@ -1785,6 +1803,7 @@ class CerebrasNativeAgent:
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made
+        synthesis_mode = False  # Track if we're in synthesis stage (no more tools allowed)
         
         while iteration < max_iterations:
             iteration += 1
@@ -1799,21 +1818,42 @@ class CerebrasNativeAgent:
                 has_examined_files = bool(self.tool_context.get('examined_files'))
                 has_relationships = any('analyze_relationships' in call for call in recent_tool_calls)
                 
-                # Always allow tools on first iteration, then apply quality gating
-                if tool_call_count == 0:
+                # CRITICAL FIX: Prevent tools during synthesis stage to avoid message pairing issues
+                if synthesis_mode:
+                    use_tools = None  # NO TOOLS during synthesis - prevents message structure corruption
+                    logger.info(f"🚫 SYNTHESIS MODE: Tools disabled (synthesis_mode={synthesis_mode})")
+                elif tool_call_count == 0:
                     use_tools = self.tools_schema  # Always allow tools initially
+                    logger.info(f"🔧 TOOLS ENABLED: Initial iteration (tool_count={tool_call_count})")
                 elif tool_call_count < 6 and investigation_score < 8:  # More permissive threshold
                     use_tools = self.tools_schema
+                    logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f})")
                 else:
                     use_tools = None
+                    logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
+                
+                # RATE LIMITING: Enforce 1.1s delay to prevent 429 errors  
+                await self._enforce_rate_limit()
+                
+                # DEBUG: Log message structure before API call
+                logger.info(f"🔍 DEBUG: About to make API call with {len(messages)} messages, tools={use_tools is not None}")
+                for i, msg in enumerate(messages[-3:]):  # Log last 3 messages
+                    msg_type = msg.get('role', 'unknown')
+                    has_tools = 'tool_calls' in msg
+                    has_tool_id = 'tool_call_id' in msg
+                    logger.info(f"🔍 MSG[{len(messages)-3+i}]: {msg_type}, tools={has_tools}, tool_id={has_tool_id}")
                 
                 # Make API call to Cerebras
-                response = self.client.chat.completions.create(
-                    model="gpt-oss-120b",  # Upgraded to GPT-OSS-120B for better tool calling
-                    messages=messages,
-                    tools=use_tools
-                    # parallel_tool_calls parameter removed - not supported by GPT-OSS-120B
-                )
+                api_params = {
+                    "model": "gpt-oss-120b",
+                    "messages": messages
+                }
+                if use_tools is not None:
+                    api_params["tools"] = use_tools
+                logger.info(f"🔍 API PARAMS: tools_provided={use_tools is not None}, synthesis_mode={synthesis_mode}")
+                
+                response = self.client.chat.completions.create(**api_params)
+                # parallel_tool_calls parameter removed - not supported by GPT-OSS-120B
                 
                 choice = response.choices[0].message
                 
@@ -1837,6 +1877,9 @@ class CerebrasNativeAgent:
                             for tool_call in choice.tool_calls
                         ]
                     })
+                    
+                    # Collect system messages to add AFTER all tool responses (prevent API pairing issues)
+                    pending_system_messages = []
                     
                     # Process each tool call
                     for tool_call in choice.tool_calls:
@@ -1897,10 +1940,10 @@ class CerebrasNativeAgent:
                         else:
                             result = f"Unknown function: {function_name}"
                         
-                        # PHASE 1: Negative Result Fallback System
+                        # PHASE 1: Negative Result Fallback System - COLLECT instead of adding immediately
                         if self._detect_negative_result(result, function_name) and tool_call_count < 5:
                             fallback_guidance = self._get_fallback_guidance(function_name)
-                            messages.append({
+                            pending_system_messages.append({
                                 "role": "system",
                                 "content": f"The previous search returned no results. {fallback_guidance}. Continue investigating before providing final answer."
                             })
@@ -1931,6 +1974,11 @@ class CerebrasNativeAgent:
                             "content": result
                         })
                     
+                    # CRITICAL FIX: Add pending system messages AFTER all tool responses are processed
+                    for system_msg in pending_system_messages:
+                        messages.append(system_msg)
+                        logger.info(f"📝 ADDED DELAYED SYSTEM MESSAGE: {system_msg['content'][:100]}...")
+                    
                     # After 4+ tool calls, add guidance but allow continued investigation if needed
                     if tool_call_count >= 4:
                         messages.append({
@@ -1957,6 +2005,12 @@ class CerebrasNativeAgent:
                         logger.warning(f"⚠️ INADEQUATE RESPONSE DETECTED: '{final_content[:100]}...' after {tool_call_count} tool calls")
                         logger.info("🔄 TRIGGERING SYNTHESIS STAGE: Re-prompting with tool results")
                         
+                        # CRITICAL FIX: Add the assistant's inadequate response to messages first
+                        messages.append({
+                            "role": "assistant",
+                            "content": final_content
+                        })
+                        
                         # Compile all tool results for synthesis
                         tool_summary = self._compile_tool_results_summary(tool_results_for_formatting)
                         
@@ -1972,6 +2026,10 @@ class CerebrasNativeAgent:
                             "role": "system",
                             "content": synthesis_prompt
                         })
+                        
+                        # CRITICAL FIX: Enter synthesis mode to prevent additional tool calls
+                        synthesis_mode = True
+                        logger.info("🚫 SYNTHESIS MODE ACTIVATED: No more tools allowed to prevent message pairing issues")
                         continue  # Skip termination, continue to synthesis stage
                     
                     # Task 5: Apply standardized response formatting
@@ -2015,6 +2073,9 @@ class CerebrasNativeAgent:
         if iteration >= max_iterations:
             # Force a final call without tools to get an answer
             try:
+                # RATE LIMITING: Enforce delay before final API call  
+                await self._enforce_rate_limit()
+                
                 response = self.client.chat.completions.create(
                     model="gpt-oss-120b",
                     messages=messages + [{
