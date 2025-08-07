@@ -816,8 +816,7 @@ Files:
 class ProviderManagedChatModel(BaseChatModel):
     """Custom LangChain chat model that routes through the provider manager"""
     
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = {"arbitrary_types_allowed": True}
     
     def __init__(self, provider_manager, **kwargs):
         super().__init__(**kwargs)
