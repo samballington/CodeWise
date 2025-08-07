@@ -2,7 +2,7 @@ import os
 import asyncio
 import pytest
 
-from backend.agent import CodeWiseAgent
+from agent import CodeWiseAgent
 
 @pytest.mark.asyncio
 async def test_tools_callable(tmp_path, monkeypatch):
