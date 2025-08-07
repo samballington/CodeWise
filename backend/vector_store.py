@@ -69,17 +69,31 @@ class VectorStore:
         return paths
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # encode locally in batches of 256
+        # encode locally in smaller batches to prevent memory issues
         embeddings: List[List[float]] = []
-        batch_size = 256
+        batch_size = 100  # Reduced from 256 to prevent memory exhaustion
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        
+        logger.info(f"Processing {len(texts)} texts in {total_batches} batches of {batch_size}")
+        
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
+            batch_num = (i // batch_size) + 1
+            
             try:
+                logger.debug(f"Processing embedding batch {batch_num}/{total_batches}")
                 vecs = _vs_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
                 embeddings.extend(vecs.tolist())
+                
+                # Small delay to prevent memory pressure
+                import time
+                time.sleep(0.05)
+                
             except Exception as e:
-                logger.error(f"Local embedding error: {e}")
+                logger.error(f"Batch {batch_num} embedding error: {e}")
                 embeddings.extend([[0.0] * 384] * len(batch))
+        
+        logger.info(f"Successfully generated {len(embeddings)} embeddings")
         return embeddings
 
     def _build(self):
@@ -182,56 +196,44 @@ class VectorStore:
         if self._index_mtime is None or current_mtime != self._index_mtime:
             logger.info("Detected updated vector index on disk – reloading")
             self._load()
+    
+    def force_refresh(self):
+        """Force reload the index from disk regardless of mtime"""
+        if self.index_path.exists() and self.meta_path.exists():
+            logger.info("Force refreshing vector index from disk")
+            self._load()
+        else:
+            logger.warning("Cannot force refresh - index files do not exist")
 
     def _calculate_relevance_score(self, distance: float, file_path: str, query: str) -> float:
-        """Calculate relevance score combining distance with contextual factors"""
+        """Calculate relevance score combining distance with contextual factors (optimized)"""
         # Start with similarity score (lower distance = higher similarity)
-        # Use a more generous normalization to avoid filtering out good results
-        base_score = max(0.1, 1.0 - (distance / 3.0))  # More generous normalization
+        base_score = max(0.1, 1.0 - (distance / 3.0))
         
-        # Enhanced project name boosting
-        project_boost = 0.0
-        path_parts = file_path.split('/')
+        # Simplified boosting for performance
+        boost = 0.0
         query_lower = query.lower()
+        file_lower = file_path.lower()
         
+        # Quick project name boost
+        path_parts = file_path.split('/')
         if len(path_parts) > 0:
             project_name = path_parts[0].lower()
-            
-            # Multiple ways to match project names
-            if (project_name in query_lower or 
-                query_lower in project_name or
-                any(word in project_name for word in query_lower.split() if len(word) > 2)):
-                project_boost = 0.15  # Increased boost
-                logger.debug(f"Project boost applied for {project_name} in query: {query}")
+            if project_name in query_lower or query_lower in project_name:
+                boost += 0.15
         
-        # Enhanced file type boosting
-        file_type_boost = 0.0
+        # Quick file type boost
         if file_path.endswith(('.py', '.js', '.ts', '.tsx', '.jsx')):
-            file_type_boost = 0.08  # Increased for code files
+            boost += 0.08
         elif file_path.endswith(('.md', '.txt', '.rst')):
-            file_type_boost = 0.05  # Increased for documentation
-        elif file_path.endswith(('.json', '.yaml', '.yml', '.toml')):
-            file_type_boost = 0.03  # Config files
+            boost += 0.05
         
-        # Additional context-based boosting
-        context_boost = 0.0
+        # Quick context boost
+        if 'readme' in file_lower and any(word in query_lower for word in ['what', 'how', 'explain']):
+            boost += 0.1
         
-        # Boost for README files when asking general questions
-        if 'readme' in file_path.lower() and any(word in query_lower for word in ['what', 'how', 'explain', 'describe']):
-            context_boost += 0.1
-            
-        # Boost for main/index files
-        if any(name in file_path.lower() for name in ['main.', 'index.', 'app.', '__init__']):
-            context_boost += 0.05
-        
-        # Combine scores
-        final_score = base_score + project_boost + file_type_boost + context_boost
-        
-        logger.debug(f"Relevance score for {file_path}: {final_score:.3f} "
-                    f"(base: {base_score:.3f}, project: {project_boost:.3f}, "
-                    f"file: {file_type_boost:.3f}, context: {context_boost:.3f})")
-        
-        return min(1.0, final_score)  # Cap at 1.0
+        final_score = base_score + boost
+        return min(1.0, final_score)
 
     # --------------------------- public API ---------------------------
     def query(self, query: str, k: int = 3, min_relevance: float = 0.3) -> List[Tuple[str, str]]:
@@ -239,7 +241,7 @@ class VectorStore:
         # Ensure we are using the latest index built by the indexer
         self._refresh_if_updated()
 
-        logger.info(f"Vector search query: '{query}' (k={k}, min_relevance={min_relevance})")
+        logger.debug(f"Vector search query: '{query}' (k={k}, min_relevance={min_relevance})")
         
         if self.index is None or not self.meta:
             logger.warning("No vector index available for search")
@@ -249,8 +251,8 @@ class VectorStore:
             # Generate embedding for query
             emb_vec = np.array(self._embed_batch([query])[0]).astype("float32").reshape(1, -1)
             
-            # Search for more candidates than requested to allow for filtering
-            search_k = min(k * 5, len(self.meta))  # Search 5x more candidates for better filtering
+            # Search for more candidates than requested to allow for filtering (optimized)
+            search_k = min(k * 2, len(self.meta))  # Search 2x more candidates (reduced from 5x for performance)
             distances, indices = self.index.search(emb_vec, search_k)
             
             # Calculate relevance scores for all candidates
@@ -277,30 +279,25 @@ class VectorStore:
             current_threshold = min_relevance
             scored_results = [r for r in all_scored_results if r[0] >= current_threshold]
             
-            # If no results meet the threshold, progressively lower it
+            # Simplified adaptive threshold logic for performance
             if not scored_results and all_scored_results:
-                logger.info(f"No results found with threshold {current_threshold:.3f}, trying adaptive thresholds")
+                logger.debug(f"No results found with threshold {current_threshold:.3f}, using adaptive threshold")
                 
-                # Try progressively lower thresholds
-                adaptive_thresholds = [min_relevance * 0.8, min_relevance * 0.6, min_relevance * 0.4, 0.1]
-                
-                for threshold in adaptive_thresholds:
-                    scored_results = [r for r in all_scored_results if r[0] >= threshold]
-                    if scored_results:
-                        logger.info(f"Found {len(scored_results)} results with adaptive threshold {threshold:.3f}")
-                        current_threshold = threshold
-                        break
+                # Single adaptive threshold instead of multiple iterations
+                adaptive_threshold = min_relevance * 0.5
+                scored_results = [r for r in all_scored_results if r[0] >= adaptive_threshold]
                 
                 # If still no results, take the top results regardless of threshold
-                if not scored_results and all_scored_results:
+                if not scored_results:
                     scored_results = all_scored_results[:k]
                     current_threshold = all_scored_results[-1][0] if scored_results else 0.0
-                    logger.info(f"Using top {len(scored_results)} results with minimum threshold {current_threshold:.3f}")
+                else:
+                    current_threshold = adaptive_threshold
             
             # Return top k results
             final_results = [(path, snippet) for _, path, snippet in scored_results[:k]]
             
-            logger.info(f"Vector search returned {len(final_results)} results from {len(all_scored_results)} candidates "
+            logger.debug(f"Vector search returned {len(final_results)} results from {len(all_scored_results)} candidates "
                        f"(threshold: {current_threshold:.3f})")
             
             # Log details about top results with enhanced information

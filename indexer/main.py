@@ -63,14 +63,43 @@ def discover_files() -> List[FileInfo]:
     
     return discovered_files
 
-def embed_batch(texts: List[str]):
-    """Generate embeddings locally using MiniLM; returns float32 numpy array."""
+def embed_batch(texts: List[str], batch_size: int = 100):
+    """Generate embeddings locally using MiniLM with batch processing; returns float32 numpy array."""
     import numpy as np
-    try:
-        vectors = _local_embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return np.array(vectors, dtype="float32")
-    except Exception as e:
-        print(f"[indexer] Local embedding error: {e}", flush=True)
+    
+    if not texts:
+        return np.zeros((0, 384), dtype="float32")
+    
+    all_vectors = []
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    
+    print(f"[indexer] Processing {len(texts)} chunks in {total_batches} batches of {batch_size}", flush=True)
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        
+        try:
+            print(f"[indexer] Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)", flush=True)
+            vectors = _local_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+            all_vectors.append(np.array(vectors, dtype="float32"))
+            
+            # Add small delay to prevent memory pressure
+            import time
+            time.sleep(0.1)
+            
+        except Exception as e:
+            print(f"[indexer] Batch {batch_num} embedding error: {e}, using zero vectors", flush=True)
+            # Create zero vectors for failed batch
+            zero_vectors = np.zeros((len(batch), 384), dtype="float32")
+            all_vectors.append(zero_vectors)
+    
+    if all_vectors:
+        result = np.vstack(all_vectors)
+        print(f"[indexer] Successfully generated {result.shape[0]} embeddings", flush=True)
+        return result
+    else:
+        print(f"[indexer] No embeddings generated, returning zero array", flush=True)
         return np.zeros((len(texts), 384), dtype="float32")
 
 def build_index(project: str | None = None):
@@ -243,17 +272,117 @@ def build_index(project: str | None = None):
         return
         
     print(f"[indexer] processed {processed_files} files into {total_chunks} intelligent chunks", flush=True)
-    print(f"[indexer] generating embeddings for {len(texts)} chunks", flush=True)
     
-    embs = embed_batch(texts)
-    dim = embs.shape[1]
+    if not texts:
+        print("[indexer] no text chunks to embed")
+        return
+    
+    # Check for existing checkpoint
+    checkpoint_file = CACHE_DIR / "embedding_checkpoint.json"
+    progress_file = CACHE_DIR / "embedding_progress.faiss"
+    
+    start_batch = 0
+    existing_embeddings = []
+    
+    # Try to resume from checkpoint
+    if checkpoint_file.exists() and progress_file.exists():
+        try:
+            with checkpoint_file.open("r") as f:
+                checkpoint_data = json.load(f)
+            
+            # Verify checkpoint matches current data
+            if (checkpoint_data.get("total_chunks") == len(texts) and 
+                checkpoint_data.get("metadata_hash") == hash(str(enhanced_meta))):
+                
+                start_batch = checkpoint_data.get("completed_batches", 0)
+                if start_batch > 0:
+                    # Load existing embeddings
+                    existing_index = faiss.read_index(str(progress_file))
+                    existing_embeddings = []
+                    for i in range(existing_index.ntotal):
+                        existing_embeddings.append(existing_index.reconstruct(i))
+                    
+                    print(f"[indexer] Resuming from checkpoint: {start_batch} batches completed ({existing_index.ntotal} embeddings)", flush=True)
+            else:
+                print("[indexer] Checkpoint data mismatch, starting fresh", flush=True)
+                # Clean up invalid checkpoint
+                checkpoint_file.unlink(missing_ok=True)
+                progress_file.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[indexer] Failed to load checkpoint: {e}, starting fresh", flush=True)
+            checkpoint_file.unlink(missing_ok=True)
+            progress_file.unlink(missing_ok=True)
+    
+    print(f"[indexer] generating embeddings for {len(texts)} chunks with batch processing", flush=True)
+    
+    # Process embeddings with checkpointing
+    batch_size = 100
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    all_embeddings = existing_embeddings.copy()
+    
+    for batch_idx in range(start_batch, total_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, len(texts))
+        batch_texts = texts[start_idx:end_idx]
+        
+        print(f"[indexer] Processing embedding batch {batch_idx + 1}/{total_batches} ({len(batch_texts)} chunks)", flush=True)
+        
+        try:
+            batch_embeddings = embed_batch(batch_texts, batch_size=len(batch_texts))
+            
+            # Add batch embeddings to collection
+            for embedding in batch_embeddings:
+                all_embeddings.append(embedding)
+            
+            # Save checkpoint after each batch
+            checkpoint_data = {
+                "total_chunks": len(texts),
+                "completed_batches": batch_idx + 1,
+                "metadata_hash": hash(str(enhanced_meta)),
+                "timestamp": time.time()
+            }
+            
+            # Save progress embeddings
+            if all_embeddings:
+                progress_embeddings = np.array(all_embeddings, dtype="float32")
+                dim = progress_embeddings.shape[1]
+                progress_index = faiss.IndexFlatL2(dim)
+                progress_index.add(progress_embeddings)
+                faiss.write_index(progress_index, str(progress_file))
+                
+                # Save checkpoint metadata
+                with checkpoint_file.open("w") as f:
+                    json.dump(checkpoint_data, f, indent=2)
+                
+                print(f"[indexer] Checkpoint saved: {len(all_embeddings)} embeddings processed", flush=True)
+            
+        except Exception as e:
+            print(f"[indexer] Error processing batch {batch_idx + 1}: {e}", flush=True)
+            # Don't fail completely, continue with next batch
+            continue
+    
+    # Convert to final numpy array
+    if all_embeddings:
+        embs = np.array(all_embeddings, dtype="float32")
+        print(f"[indexer] Final embedding array shape: {embs.shape}", flush=True)
+    else:
+        print("[indexer] No embeddings generated, creating empty index", flush=True)
+        embs = np.zeros((0, 384), dtype="float32")
+    
+    # Create and save final index
+    dim = embs.shape[1] if embs.size > 0 else 384
     index = faiss.IndexFlatL2(dim)
-    index.add(embs)
+    if embs.size > 0:
+        index.add(embs)
     faiss.write_index(index, str(INDEX_FILE))
     
     # Save enhanced metadata
     with META_FILE.open("w", encoding="utf-8") as f:
         json.dump(enhanced_meta, f, indent=2)
+    
+    # Clean up checkpoint files on successful completion
+    checkpoint_file.unlink(missing_ok=True)
+    progress_file.unlink(missing_ok=True)
     
     print(f"[indexer] index built with {len(texts)} chunks using AST-based chunking", flush=True)
     

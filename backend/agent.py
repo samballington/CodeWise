@@ -816,8 +816,7 @@ Files:
 class ProviderManagedChatModel(BaseChatModel):
     """Custom LangChain chat model that routes through the provider manager"""
     
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = {"arbitrary_types_allowed": True}
     
     def __init__(self, provider_manager, **kwargs):
         super().__init__(**kwargs)
@@ -873,7 +872,11 @@ class CodeWiseAgent:
                 mcp_server_url=mcp_server_url
             )
             logger.info("✅ Using native Cerebras agent with proper tool calling")
-            # Skip LangChain initialization entirely for native Cerebras
+            
+            # Add compatibility attributes for tests
+            self.hybrid_search = HybridSearchEngine()
+            self.mcp_wrapper = MCPToolWrapper(mcp_server_url)
+            self.tools = self._create_tools()
             return
             
         else:
@@ -881,6 +884,8 @@ class CodeWiseAgent:
             self.use_native_cerebras = False
             
             if current_provider and provider_info.get('provider') == 'openai':
+                if not openai_api_key:
+                    raise ValueError("OpenAI API key required when using OpenAI provider")
                 self.llm = ChatOpenAI(
                     api_key=openai_api_key,
                     model=provider_info.get('chat_model', 'gpt-4-turbo-preview'),
@@ -888,22 +893,20 @@ class CodeWiseAgent:
                     streaming=True
                 )
                 logger.info(f"Using OpenAI provider with model: {provider_info.get('chat_model')}")
-            elif current_provider and provider_info.get('provider') == 'kimi':
-                # Use custom provider-managed chat model for Kimi
+            elif current_provider and provider_info.get('provider') in ['kimi', 'cerebras']:
+                # Use custom provider-managed chat model for Kimi/Cerebras
                 self.llm = ProviderManagedChatModel(
                     provider_manager=self.provider_manager,
                     temperature=0
                 )
-                logger.info("✅ Using Kimi K2 provider with custom LangChain wrapper")
+                logger.info(f"✅ Using {provider_info.get('provider')} provider with custom LangChain wrapper")
             else:
-                # Fallback to OpenAI if no provider available
-                self.llm = ChatOpenAI(
-                    api_key=openai_api_key,
-                    model="gpt-4-turbo-preview",
-                    temperature=0,
-                    streaming=True
+                # Default to provider-managed chat model (Cerebras/Kimi) instead of OpenAI
+                self.llm = ProviderManagedChatModel(
+                    provider_manager=self.provider_manager,
+                    temperature=0
                 )
-                logger.info("Using fallback OpenAI provider")
+                logger.info("✅ Using default provider-managed chat model (no OpenAI key required)")
         
         # Initialize shared components for LangChain agents only
         if not self.use_native_cerebras:
@@ -1437,13 +1440,32 @@ class CodeWiseAgent:
         except Exception as e:
             return f"Directory fallback failed: {str(e)}"
 
+    def _run_async_safe(self, coro):
+        """Run async function safely, handling existing event loops"""
+        try:
+            # Try to get current event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, we can't use asyncio.run()
+            # Instead, we need to create a task or use run_until_complete
+            if loop.is_running():
+                # Create a new event loop in a thread to avoid conflicts
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, coro)
+                    return future.result()
+            else:
+                return loop.run_until_complete(coro)
+        except RuntimeError:
+            # No event loop running, safe to use asyncio.run()
+            return asyncio.run(coro)
+
     def _create_tools(self) -> List[Tool]:
         """Create LangChain tools from MCP wrapper methods"""
         return [
             Tool(
                 name="read_file",
                 description="Read the contents of a file. Provide the file path relative to the workspace. If the file doesn't exist, use list_files to explore the directory structure first.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.read_file(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.read_file(x)),
                 coroutine=self.mcp_wrapper.read_file
             ),
             Tool(
@@ -1458,79 +1480,79 @@ class CodeWiseAgent:
             Tool(
                 name="file_glimpse",
                 description="Same as read_file but optimized for quickly scanning file contents. Use this when you need to check multiple files rapidly or when read_file fails.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.read_file(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.read_file(x)),
                 coroutine=self.mcp_wrapper.read_file
             ),
             Tool(
                 name="list_files",
                 description="List files in a directory. Always use this first when exploring an unknown project structure. Provide the directory path relative to the workspace. Use '.' for root workspace.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.list_files(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.list_files(x)),
                 coroutine=self.mcp_wrapper.list_files
             ),
             Tool(
                 name="list_entities",
                 description="List all directories and files in a path recursively. Use this to get a comprehensive view of project structure when list_files isn't enough.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.list_files(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.list_files(x)),
                 coroutine=self.mcp_wrapper.list_files
             ),
             Tool(
                 name="write_file",
                 description="Write content to a file. Provide a JSON string with 'file_path' and 'content' keys.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.write_file(**json.loads(x))),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.write_file(**json.loads(x))),
                 coroutine=lambda x: self.mcp_wrapper.write_file(**json.loads(x))
             ),
             Tool(
                 name="run_command",
                 description="Run a shell command. Use for running tests, linters, or installing packages. Also useful for finding files with commands like 'find . -name \"*.py\" | head -20'.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.run_command(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.run_command(x)),
                 coroutine=self.mcp_wrapper.run_command
             ),
             Tool(
                 name="find_files",
                 description="Find files matching a pattern using shell commands. Use JSON format: {\"pattern\": \"*.py\", \"directory\": \".\"}. Returns up to 20 results.",
-                func=lambda x: asyncio.run(self._handle_find_files(x)),
+                func=lambda x: self._run_async_safe(self._handle_find_files(x)),
                 coroutine=lambda x: self._handle_find_files(x)
             ),
             Tool(
                 name="grep_search",
                 description="Search for text patterns across files. Use JSON format: {\"pattern\": \"search_term\", \"directory\": \".\", \"file_type\": \"py\"}. Returns up to 20 results.",
-                func=lambda x: asyncio.run(self._handle_grep_search(x)),
+                func=lambda x: self._run_async_safe(self._handle_grep_search(x)),
                 coroutine=lambda x: self._handle_grep_search(x)
             ),
             Tool(
                 name="get_file_info",
                 description="Get detailed file information (size, type, permissions). Provide a file path as a simple string.",
-                func=lambda x: asyncio.run(self.mcp_wrapper.get_file_info(x)),
+                func=lambda x: self._run_async_safe(self.mcp_wrapper.get_file_info(x)),
                 coroutine=self.mcp_wrapper.get_file_info
             ),
             Tool(
                 name="explore_directory_tree",
                 description="Get a tree view of directory structure. Use JSON format: {\"directory\": \".\", \"max_depth\": 3}. Returns up to 30 directory entries.",
-                func=lambda x: asyncio.run(self._handle_explore_tree(x)),
+                func=lambda x: self._run_async_safe(self._handle_explore_tree(x)),
                 coroutine=lambda x: self._handle_explore_tree(x)
             ),
             Tool(
                 name="search_by_extension",
                 description="Search for files by specific extension patterns with project composition analysis. Use JSON format: {\"extensions\": [\"py\", \"js\"], \"directory\": \"Gymmy\"} for specific projects, or simple string like 'py' for all Python files. Automatically searches /workspace. Returns up to 100 results with composition stats.",
-                func=lambda x: asyncio.run(self._handle_search_by_extension(x)),
+                func=lambda x: self._run_async_safe(self._handle_search_by_extension(x)),
                 coroutine=lambda x: self._handle_search_by_extension(x)
             ),
             Tool(
                 name="search_file_content",
                 description="Search for specific text patterns within files, including context lines. Use JSON format: {\"pattern\": \"search_term\", \"directory\": \".\", \"file_types\": [\"py\", \"js\"], \"context_lines\": 2}. Returns up to 50 lines of context per match.",
-                func=lambda x: asyncio.run(self._handle_search_file_content(x)),
+                func=lambda x: self._run_async_safe(self._handle_search_file_content(x)),
                 coroutine=lambda x: self._handle_search_file_content(x)
             ),
             Tool(
                 name="get_project_structure",
                 description="Generate enhanced project structure analysis with framework detection, @ annotations for codebase highlighting, and context awareness. Use JSON format: {\"directory\": \".\", \"max_depth\": 4, \"include_files\": true, \"project_name\": \"ProjectName\"}. Returns comprehensive analysis with framework detection, entry points, and structured tree view.",
-                func=lambda x: asyncio.run(self._handle_get_project_structure(x)),
+                func=lambda x: self._run_async_safe(self._handle_get_project_structure(x)),
                 coroutine=lambda x: self._handle_get_project_structure(x)
             ),
             Tool(
                 name="find_related_files",
                 description="Find files related to a given file through various relationships (imports, tests, configs, naming patterns). Use JSON format: {\"file_path\": \"path/to/file.py\", \"relationship_types\": [\"import\", \"test\", \"config\"]}. Returns a formatted summary of related files.",
-                func=lambda x: asyncio.run(self._handle_find_related_files(x)),
+                func=lambda x: self._run_async_safe(self._handle_find_related_files(x)),
                 coroutine=lambda x: self._handle_find_related_files(x)
             )
         ]

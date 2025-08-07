@@ -4,7 +4,7 @@ import { useChatStore, useContextStore, ContextActivity } from '@/lib/store'
 export const useWebSocket = () => {
   const [socket, setSocket] = useState<WebSocket | null>(null)
   const [connected, setConnected] = useState(false)
-  const { addMessage, updateLastMessage } = useChatStore()
+  const { addMessage, updateLastMessage, addToolCallToLastMessage } = useChatStore()
   const { setGatheringContext, addContextActivity, clearContextActivities } = useContextStore()
 
   useEffect(() => {
@@ -64,8 +64,9 @@ export const useWebSocket = () => {
         addMessage({
           id: Date.now().toString(),
           role: 'assistant',
-          content: data.message,
+          content: 'Processing request...',
           timestamp: new Date(),
+          isProcessing: true,
         })
         break
 
@@ -111,29 +112,86 @@ export const useWebSocket = () => {
 
 
       case 'agent_action':
-        updateLastMessage({
-          content: `🔧 ${data.action}: ${data.log}`,
-        })
+        // Buffer agent actions - don't display in main content, store for context dropdown
         break
 
       case 'tool_start':
-        updateLastMessage({
-          content: `🛠️ Running tool: ${data.tool}\nInput: ${data.input}`,
-        })
+        // Buffer tool calls - don't display during processing
+        const startState = useChatStore.getState()
+        const startLastMessage = startState.messages[startState.messages.length - 1]
+        if (startLastMessage && startLastMessage.isProcessing) {
+          const bufferedToolCalls = startLastMessage.bufferedToolCalls || []
+          updateLastMessage({
+            bufferedToolCalls: [...bufferedToolCalls, {
+              tool: data.tool,
+              input: data.input,
+              output: '',
+              status: 'running'
+            }]
+          })
+        }
         break
 
       case 'tool_end':
-        updateLastMessage({
-          content: `✅ Tool output:\n${data.output}`,
-        })
+        // Update buffered tool call with output - still don't display
+        const endState = useChatStore.getState()
+        const endLastMessage = endState.messages[endState.messages.length - 1]
+        if (endLastMessage && endLastMessage.bufferedToolCalls && endLastMessage.bufferedToolCalls.length > 0) {
+          const updatedBufferedToolCalls = [...endLastMessage.bufferedToolCalls]
+          const lastToolCall = updatedBufferedToolCalls[updatedBufferedToolCalls.length - 1]
+          updatedBufferedToolCalls[updatedBufferedToolCalls.length - 1] = {
+            ...lastToolCall,
+            output: data.output,
+            status: 'completed'
+          }
+          updateLastMessage({
+            bufferedToolCalls: updatedBufferedToolCalls
+          })
+        }
         break
 
       case 'final_result':
-        addMessage({
-          id: Date.now().toString(),
-          role: 'assistant',
-          content: data.output,
-          timestamp: new Date(),
+        // Get the most recent complete context activity to attach to the message
+        const contextState = useContextStore.getState()
+        const recentCompleteActivity = contextState.recentActivities.find(
+          activity => activity.type === 'complete'
+        )
+        
+        console.log('🔍 Final result - context debug:', {
+          recentActivities: contextState.recentActivities,
+          recentCompleteActivity,
+          contextDataToAttach: recentCompleteActivity ? {
+            sources: recentCompleteActivity.sources,
+            chunksFound: recentCompleteActivity.chunksFound,
+            filesAnalyzed: recentCompleteActivity.filesAnalyzed,
+            query: recentCompleteActivity.query
+          } : undefined
+        })
+        
+        // Update the existing processing message with the final result and move buffered tool calls to visible
+        const finalState = useChatStore.getState()
+        const finalLastMessage = finalState.messages[finalState.messages.length - 1]
+        
+        // Clean the output to remove any tool output that might have leaked through
+        let cleanOutput = data.output
+        if (cleanOutput) {
+          cleanOutput = cleanOutput.replace(/✅ Tool output:[\s\S]*?\n\n/g, '')
+          cleanOutput = cleanOutput.replace(/🛠️ Running tool:[\s\S]*?\n\n/g, '')
+          cleanOutput = cleanOutput.replace(/Unknown function:.*?\n/g, '')
+        }
+        
+        updateLastMessage({
+          content: cleanOutput,
+          isProcessing: false,
+          isComplete: true,
+          toolCalls: finalLastMessage?.bufferedToolCalls || [],
+          bufferedToolCalls: undefined,
+          contextData: recentCompleteActivity ? {
+            sources: recentCompleteActivity.sources || [],
+            chunksFound: recentCompleteActivity.chunksFound || 0,
+            filesAnalyzed: recentCompleteActivity.filesAnalyzed || 0,
+            query: recentCompleteActivity.query || ''
+          } : undefined
         })
         break
 
@@ -159,6 +217,14 @@ export const useWebSocket = () => {
 
       case 'stream_token':
         {
+          // Skip tool output tokens - don't display them in main chat
+          if (data.token.includes('Tool output:') || 
+              data.token.includes('✅ Tool output') || 
+              data.token.includes('🛠️ Running tool:') ||
+              data.token.includes('Unknown function:')) {
+            break
+          }
+          
           const state = useChatStore.getState()
           const { messages } = state
           if (messages.length === 0 || messages[messages.length - 1].role !== 'assistant' || messages[messages.length - 1].isComplete) {
@@ -168,11 +234,21 @@ export const useWebSocket = () => {
               role: 'assistant',
               content: data.token,
               timestamp: new Date(),
+              isProcessing: false,
             })
           } else {
             // append token to last assistant message
             const lastMsg = messages[messages.length - 1]
-            updateLastMessage({ content: lastMsg.content + data.token })
+            // Only append if not in processing mode
+            if (!lastMsg.isProcessing) {
+              updateLastMessage({ content: lastMsg.content + data.token })
+            } else {
+              // Replace processing message with streamed content
+              updateLastMessage({ 
+                content: data.token,
+                isProcessing: false 
+              })
+            }
           }
         }
         break

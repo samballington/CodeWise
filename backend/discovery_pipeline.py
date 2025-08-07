@@ -208,7 +208,7 @@ class DiscoveryPipeline:
         import time
         start_time = time.time()
         
-        logger.info(f"🔍 Starting discovery pipeline for query type: {query_type}")
+        logger.debug(f"🔍 Starting discovery pipeline for query type: {query_type}")
         
         try:
             # Extract file references from search results
@@ -224,7 +224,7 @@ class DiscoveryPipeline:
                     all_references.extend(references)
                     source_files_analyzed.append(file_path)
                     
-                    logger.info(f"📄 Analyzed {file_path}: found {len(references)} references")
+                    logger.debug(f"📄 Analyzed {file_path}: found {len(references)} references")
             
             # Prioritize discoveries based on query type
             prioritized_references = self.prioritize_discoveries(all_references, query_type)
@@ -246,7 +246,7 @@ class DiscoveryPipeline:
                 source_files_analyzed=source_files_analyzed
             )
             
-            logger.info(f"✅ Discovery complete: {len(all_references)} refs, {len(recommended_examinations)} auto-exams")
+            logger.debug(f"✅ Discovery complete: {len(all_references)} refs, {len(recommended_examinations)} auto-exams")
             
             return EnhancedSearchResults(
                 original_results=search_results,
@@ -274,7 +274,7 @@ class DiscoveryPipeline:
                 try:
                     refs = extractor.extract_references(content, source_file)
                     references.extend(refs)
-                    logger.debug(f"🔧 {extractor_name} extractor found {len(refs)} references")
+                    pass  # Removed debug logging for performance
                 except Exception as e:
                     logger.warning(f"⚠️ {extractor_name} extractor failed: {e}")
         
@@ -343,12 +343,24 @@ class DiscoveryPipeline:
         references: List[FileReference], 
         projects: List[str]
     ) -> List[str]:
-        """Select files for automatic examination"""
+        """Select files for automatic examination with deduplication"""
         selected = []
         
-        logger.info(f"🔍 AUTO-EXAM SELECTION: {len(references)} references to evaluate")
+        # CRITICAL FIX: Deduplicate references by file_path before processing
+        unique_refs = {}
+        for ref in references:
+            key = ref.file_path
+            if key not in unique_refs or ref.confidence > unique_refs[key].confidence:
+                unique_refs[key] = ref
         
-        for i, ref in enumerate(references):
+        deduplicated_refs = list(unique_refs.values())
+        
+        logger.info(f"🔍 AUTO-EXAM SELECTION: {len(references)} references -> {len(deduplicated_refs)} unique after deduplication")
+        
+        # Cache for resolved paths to avoid redundant resolution
+        resolved_cache = {}
+        
+        for i, ref in enumerate(deduplicated_refs):
             logger.info(f"🔍 AUTO-EXAM REF {i+1}: {ref.file_path} (confidence: {ref.confidence}, type: {ref.reference_type})")
             
             if len(selected) >= self.MAX_AUTO_EXAMINATIONS:
@@ -359,9 +371,16 @@ class DiscoveryPipeline:
                 logger.info(f"🔍 AUTO-EXAM: Skipped {ref.file_path} - low confidence ({ref.confidence} < {self.MIN_CONFIDENCE_THRESHOLD})")
                 continue
             
-            # Resolve the file path
-            resolved_path = self._resolve_file_path(ref.file_path, projects)
-            logger.info(f"🔍 AUTO-EXAM: Resolved {ref.file_path} -> {resolved_path}")
+            # Check local cache first to avoid redundant calls
+            cache_key = f"{ref.file_path}|{','.join(projects) if projects else ''}" 
+            if cache_key in resolved_cache:
+                resolved_path = resolved_cache[cache_key]
+                logger.info(f"🔍 AUTO-EXAM: Resolved {ref.file_path} -> {resolved_path} (local cache hit)")
+            else:
+                # Resolve the file path
+                resolved_path = self._resolve_file_path(ref.file_path, projects)
+                resolved_cache[cache_key] = resolved_path
+                logger.info(f"🔍 AUTO-EXAM: Resolved {ref.file_path} -> {resolved_path}")
             
             if resolved_path and resolved_path not in selected:
                 selected.append(resolved_path)
@@ -369,23 +388,25 @@ class DiscoveryPipeline:
             elif not resolved_path:
                 logger.info(f"❌ AUTO-EXAM: Failed to resolve {ref.file_path}")
             else:
-                logger.info(f"⚠️ AUTO-EXAM: Duplicate {resolved_path}")
+                logger.debug(f"⚠️ AUTO-EXAM: Duplicate {resolved_path}")
         
         logger.info(f"🎯 AUTO-EXAM FINAL: Selected {len(selected)} files: {selected}")
         return selected
     
+
+    
     def _resolve_file_path(self, file_path: str, projects: List[str]) -> Optional[str]:
-        """Resolve a discovered file path to an actual file"""
+        """Resolve a discovered file path to an actual file with optimized caching"""
         try:
             # Handle wildcard patterns (like src/components/**/*.tsx)
             if '**' in file_path or '*' in file_path:
                 logger.debug(f"Skipping wildcard pattern: {file_path}")
                 return None
             
-            # Try different resolution strategies
+            # PERFORMANCE FIX: Try most likely candidates first to minimize cache misses
             candidates = []
             
-            # Strategy 1: Try with projects if provided
+            # Strategy 1: Try with projects first (most likely to succeed)
             if projects:
                 for project in projects:
                     candidates.append(f"{project}/{file_path}")
@@ -393,18 +414,22 @@ class DiscoveryPipeline:
             # Strategy 2: Try direct path resolution
             candidates.append(file_path)
             
-            # Strategy 3: Try with infinite-kanvas prefix (since that's our main project)
-            if not file_path.startswith('infinite-kanvas/'):
+            # Strategy 3: Try with infinite-kanvas prefix only if not already covered
+            if not file_path.startswith('infinite-kanvas/') and 'infinite-kanvas' not in (projects or []):
                 candidates.append(f"infinite-kanvas/{file_path}")
             
-            # Test each candidate
-            for candidate in candidates:
+            # CRITICAL FIX: Test candidates with minimal logging for cache hits
+            for i, candidate in enumerate(candidates):
                 try:
-                    logger.info(f"🔍 AUTO-EXAM: Trying to resolve candidate: {candidate}")
+                    # Only log first attempt to reduce noise
+                    if i == 0:
+                        logger.info(f"🔍 AUTO-EXAM: Trying to resolve candidate: {candidate}")
+                    
                     resolved_path, exists = self.path_resolver.resolve_file_path(candidate)
-                    logger.info(f"🔍 AUTO-EXAM: Candidate {candidate} -> {resolved_path} (exists: {exists})")
+                    
                     if exists:
-                        logger.info(f"✅ AUTO-EXAM: Successfully resolved {file_path} -> {resolved_path}")
+                        if i > 0:  # Log successful resolution if not first attempt  
+                            logger.debug(f"✅ AUTO-EXAM: Successfully resolved {file_path} -> {resolved_path} (attempt {i+1})")
                         return resolved_path
                 except Exception as e:
                     logger.warning(f"❌ AUTO-EXAM: Failed to resolve candidate {candidate}: {e}")
