@@ -15,7 +15,7 @@ jobs:
         
     - name: Check PR title format
       run: |
-        if [[ "${{ github.event.pull_request.title }}" =~ ^(feat|fix|docs|style|refactor|test|chore)(\(.+\))?: .+ ]]; then
+        if [[ "${{ github.event.pull_request.title }}" =~ ^(feat|fix|docs|style|refactor|test|chore)(\([^)]+\))?: .+ ]]; then
           echo "✅ PR title follows conventional commit format"
         else
           echo "❌ PR title must follow format: type(scope): description"
