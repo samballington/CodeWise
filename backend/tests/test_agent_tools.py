@@ -7,12 +7,14 @@ from agent import CodeWiseAgent
 @pytest.mark.asyncio
 async def test_tools_callable(tmp_path, monkeypatch):
     """Ensure code_search, file_glimpse, list_entities tools execute without error."""
-    # Prepare dummy workspace file for file_glimpse
-    workspace_dir = "/workspace"
-    dummy_path = os.path.join(workspace_dir, "test_dummy.txt")
-    os.makedirs(workspace_dir, exist_ok=True)
-    with open(dummy_path, "w", encoding="utf-8") as f:
-        f.write("hello world\n" * 5)
+    # Prepare dummy workspace file for file_glimpse using tmp_path
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    dummy_path = workspace_dir / "test_dummy.txt"
+    dummy_path.write_text("hello world\n" * 5)
+    
+    # Set workspace environment variable for the agent
+    monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
 
     agent = CodeWiseAgent(openai_api_key="", mcp_server_url="http://mcp_server:8001")
 

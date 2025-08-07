@@ -872,7 +872,11 @@ class CodeWiseAgent:
                 mcp_server_url=mcp_server_url
             )
             logger.info("✅ Using native Cerebras agent with proper tool calling")
-            # Skip LangChain initialization entirely for native Cerebras
+            
+            # Add compatibility attributes for tests
+            self.hybrid_search = HybridSearchEngine()
+            self.mcp_wrapper = MCPToolWrapper(mcp_server_url)
+            self.tools = self._create_tools()
             return
             
         else:
