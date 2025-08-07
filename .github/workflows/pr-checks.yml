@@ -28,12 +28,13 @@ jobs:
         
     - name: Check for documentation files
       run: |
-        if git diff --name-only origin/main...HEAD | grep -E '\.(md|txt)$'; then
+        # Exclude requirements.txt and other legitimate .txt files
+        if git diff --name-only origin/main...HEAD | grep -E '\.(md)$|\.txt$' | grep -v 'requirements\.txt$'; then
           echo "❌ Documentation files detected in PR"
-          echo "Please remove .md and .txt files as they should be gitignored"
+          echo "Please remove .md files as they should be gitignored"
           exit 1
         else
-          echo "✅ No documentation files in PR"
+          echo "✅ No unwanted documentation files in PR"
         fi
         
     - name: Check file size limits
