@@ -29,7 +29,7 @@ body {
   font-family: 'Inter', system-ui, sans-serif;
   background-color: var(--background-primary);
   color: var(--text-primary);
-  line-height: 1.6;
+  line-height: 1.55;
   min-height: 100vh;
   overflow-x: hidden;
 }
@@ -207,6 +207,31 @@ pre:hover .copy-button {
 
 .status-disconnected {
   background-color: #ef4444;
+}
+
+/* Mermaid diagram styling - force black text */
+.mermaid-diagram svg {
+  color: #000000 !important;
+}
+
+.mermaid-diagram svg text {
+  fill: #000000 !important;
+}
+
+.mermaid-diagram svg .node text {
+  fill: #000000 !important;
+}
+
+.mermaid-diagram svg .label text {
+  fill: #000000 !important;
+}
+
+.mermaid-diagram svg .edgeLabel text {
+  fill: #000000 !important;
+}
+
+.status-disconnected {
+  background-color: #ef4444;
   box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
 }
 
@@ -277,3 +302,32 @@ pre:hover .copy-button {
   min-width: 0 !important;
   flex: 1 !important;
 } 
+
+/* Make markdown tables robust and wrap content */
+.prose table {
+  table-layout: fixed;
+  width: 100% !important;
+}
+.prose th, .prose td {
+  word-break: break-word;
+  white-space: normal;
+}
+
+/* Slightly smaller default font to reduce overflow */
+.prose {
+  font-size: 0.95rem;
+}
+.prose code {
+  font-size: 0.9rem;
+}
+
+/* Add responsive horizontal padding so content doesn't touch edges */
+.chat-page-padding {
+  padding-left: clamp(12px, 2vw, 24px);
+  padding-right: clamp(12px, 2vw, 24px);
+}
+
+/* Prevent page-level horizontal scroll caused by nested elements */
+.prose, .tool-output, .tool-content, .message-enter {
+  max-width: 100% !important;
+}

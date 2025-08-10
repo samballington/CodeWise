@@ -2,10 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install deps first for better caching
-COPY requirements.txt ./requirements.txt
+# Install production deps first for better caching
+COPY requirements-prod.txt ./requirements-prod.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-prod.txt
 
 # Copy source code into /app/indexer
 COPY . /app/indexer

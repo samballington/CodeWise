@@ -7,6 +7,7 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+      - NODE_OPTIONS=--max-old-space-size=512
     depends_on:
       - backend
     networks:
@@ -14,20 +15,24 @@ services:
 
   backend:
     build: ./backend
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:
-      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
+      - CEREBRAS_API_KEY=csk-n5httje822yh4844kddmcmwwrcnhc6m64x9mty8xfjw5emdp
       - DEFAULT_PROVIDER_MODEL=${DEFAULT_PROVIDER_MODEL}
       - PRIMARY_PROVIDER=cerebras
       - MCP_SERVER_URL=http://mcp_server:8001
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - PYTHONMALLOC=malloc
     depends_on:
       - mcp_server
     volumes:
       - ./workspace:/workspace
       - ./backend:/app/backend
+      - vector_cache:/workspace/.vector_cache
     networks:
       - codewise-network
 
@@ -49,9 +54,13 @@ services:
       - WORKSPACE_DIR=/workspace
     volumes:
       - ./workspace:/workspace
+      - vector_cache:/workspace/.vector_cache
     networks:
       - codewise-network
 
 networks:
   codewise-network:
-    driver: bridge 
+    driver: bridge
+
+volumes:
+  vector_cache: 

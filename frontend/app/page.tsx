@@ -6,16 +6,16 @@ import ChatOverlay from '../components/ChatOverlay'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
 import GitHubAuth from '../components/GitHubAuth'
-import { ProjectLayout } from '../components/ProjectLayout'
+import ImportDialog from '../components/ImportDialog'
 
 export default function Home() {
   const { connected, sendMessage } = useWebSocket()
   const { messages } = useChatStore()
   const { isDarkMode, toggleTheme } = useThemeStore()
   const [showGitHub, setShowGitHub] = useState(false)
-  const [showProjects, setShowProjects] = useState(false)
   const [githubSession, setGithubSession] = useState<string | null>(null)
   const [showChatOverlay, setShowChatOverlay] = useState(false)
+  const [showImportDialog, setShowImportDialog] = useState(false)
 
   // Apply theme to document
   useEffect(() => {
@@ -67,6 +67,18 @@ export default function Home() {
             </button>
 
 
+            {/* Import button */}
+            <button
+              onClick={() => setShowImportDialog(true)}
+              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
+                isDarkMode
+                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              Import
+            </button>
+
             {/* GitHub toggle */}
             <button
               onClick={() => setShowGitHub(!showGitHub)}
@@ -95,19 +107,6 @@ export default function Home() {
               Chat
             </button>
 
-            {/* Projects toggle */}
-            <button
-              onClick={() => setShowProjects(!showProjects)}
-              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
-                showProjects
-                  ? 'bg-primary text-white'
-                  : isDarkMode
-                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
-                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-              }`}
-            >
-              Projects
-            </button>
 
 
             
@@ -130,19 +129,7 @@ export default function Home() {
       </header>
       
       <div className="flex-1 flex min-h-0">
-        {showProjects ? (
-          <div className="flex-1 flex min-h-0">
-            <ProjectLayout />
-            {showGitHub && (
-              <div className="w-96 border-l border-gray-200 bg-white p-4 overflow-y-auto">
-                <GitHubAuth onAuthSuccess={(session) => {
-                  setGithubSession(session)
-                  setShowGitHub(false) // Close GitHub panel after successful auth
-                }} />
-              </div>
-            )}
-          </div>
-        ) : showGitHub ? (
+        {showGitHub ? (
           <div className="flex-1 p-6">
             <GitHubAuth onAuthSuccess={(session) => setGithubSession(session)} />
           </div>
@@ -152,6 +139,11 @@ export default function Home() {
       </div>
       {/* Chat overlay */}
       {showChatOverlay && <ChatOverlay onClose={() => setShowChatOverlay(false)} />}
+      {/* Import dialog */}
+      <ImportDialog 
+        isOpen={showImportDialog} 
+        onClose={() => setShowImportDialog(false)} 
+      />
     </main>
   )
 }

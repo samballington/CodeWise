@@ -3,20 +3,25 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
+import { useProjectStore } from '../lib/projectStore'
 import MessageList from './MessageList'
 import MessageInput from './MessageInput'
 import { ContextPopup } from './ContextPopup'
+import { ChevronDown, Folder, FolderOpen } from 'lucide-react'
 
 export default function ChatInterface() {
   const { sendMessage } = useWebSocket()
   const { messages } = useChatStore()
   const { isDarkMode } = useThemeStore()
+  const { projects, fetchProjects } = useProjectStore()
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [showProjects, setShowProjects] = useState(false)
+  const projectsDropdownRef = useRef<HTMLDivElement>(null)
 
   // Indexer ready state
   const [indexReady, setIndexReady] = useState<boolean>(true)
 
-  // Poll indexer status on mount
+  // Poll indexer status on mount and fetch projects
   useEffect(() => {
     const fetchStatus = async () => {
       try {
@@ -28,9 +33,10 @@ export default function ChatInterface() {
       }
     }
     fetchStatus()
+    fetchProjects() // Fetch projects when component mounts
     const interval = setInterval(fetchStatus, 5000)
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchProjects])
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -39,6 +45,20 @@ export default function ChatInterface() {
   useEffect(() => {
     scrollToBottom()
   }, [messages])
+
+  // Close projects dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (projectsDropdownRef.current && !projectsDropdownRef.current.contains(event.target as Node)) {
+        setShowProjects(false)
+      }
+    }
+    
+    if (showProjects) {
+      document.addEventListener('mousedown', handleClickOutside)
+      return () => document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [showProjects])
 
   // Enhanced sendMessage handler that supports project mentions
   const handleSendMessage = (message: string, mentionedProjects?: string[]) => {
@@ -53,9 +73,57 @@ export default function ChatInterface() {
   }
 
   return (
-    <div className="flex flex-col h-full w-full max-w-4xl mx-auto relative">
+    <div className="flex flex-col h-full w-full max-w-none mx-0 relative chat-page-padding">
       {/* Context Popup - positioned absolutely for overlay effect */}
       <ContextPopup />
+      
+      {/* Projects Indicator */}
+      {projects.length > 0 && (
+        <div className="px-4 pt-4 pb-2">
+          <div className="relative" ref={projectsDropdownRef}>
+            <button
+              onClick={() => setShowProjects(!showProjects)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                isDarkMode 
+                  ? 'bg-background-secondary hover:bg-slate-600 text-text-primary border border-border' 
+                  : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-200'
+              }`}
+            >
+              <Folder className="w-4 h-4" />
+              <span>{projects.length} indexed project{projects.length !== 1 ? 's' : ''}</span>
+              <ChevronDown className={`w-4 h-4 transition-transform ${showProjects ? 'rotate-180' : ''}`} />
+            </button>
+            
+            {showProjects && (
+              <div className={`absolute top-full left-0 mt-2 w-64 rounded-lg shadow-lg border z-50 ${
+                isDarkMode 
+                  ? 'bg-background-secondary border-border' 
+                  : 'bg-white border-gray-200'
+              }`}>
+                <div className="p-2 max-h-48 overflow-y-auto">
+                  {projects.map((project, index) => (
+                    <div
+                      key={project.name}
+                      className={`flex items-center gap-2 px-3 py-2 rounded text-sm ${
+                        isDarkMode 
+                          ? 'text-text-primary hover:bg-slate-600' 
+                          : 'text-gray-700 hover:bg-gray-100'
+                      }`}
+                    >
+                      <div className={`w-2 h-2 rounded-full ${
+                        project.is_workspace_root ? 'bg-orange-500' : 'bg-blue-500'
+                      }`} />
+                      <span className="font-medium truncate">
+                        {project.is_workspace_root ? 'workspace' : project.name}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       
       {/* Messages Area */}
       <div className="flex-1 overflow-y-auto px-4 py-4">
@@ -105,7 +173,7 @@ export default function ChatInterface() {
             🔄 Indexer is still building the code index. Answers may be incomplete for a minute…
           </div>
         )}
-        <div className="max-w-4xl mx-auto px-4 py-4">
+        <div className="w-full px-4 py-4">
           <MessageInput onSendMessage={handleSendMessage} disabled={!indexReady} />
         </div>
       </div>

@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 import faiss
 # type: ignore
@@ -236,8 +236,18 @@ class VectorStore:
         return min(1.0, final_score)
 
     # --------------------------- public API ---------------------------
-    def query(self, query: str, k: int = 3, min_relevance: float = 0.3) -> List[Tuple[str, str]]:
-        """Query the vector store with enhanced relevance scoring and adaptive filtering"""
+    def query(
+        self,
+        query: str,
+        k: int = 3,
+        min_relevance: float = 0.3,
+        allowed_projects: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str]]:
+        """Query the vector store with enhanced relevance scoring and adaptive filtering.
+
+        If allowed_projects is provided, only return results whose file paths belong to those
+        projects. This restriction is applied BEFORE scoring/logging to avoid cross-project noise.
+        """
         # Ensure we are using the latest index built by the indexer
         self._refresh_if_updated()
 
@@ -251,8 +261,13 @@ class VectorStore:
             # Generate embedding for query
             emb_vec = np.array(self._embed_batch([query])[0]).astype("float32").reshape(1, -1)
             
-            # Search for more candidates than requested to allow for filtering (optimized)
-            search_k = min(k * 2, len(self.meta))  # Search 2x more candidates (reduced from 5x for performance)
+            # Search for more candidates than requested to allow for in-project filtering
+            if allowed_projects:
+                # Be more generous to compensate for cross-project pruning
+                search_k = min(max(k * 8, k), len(self.meta))
+            else:
+                # Search 2x more candidates (reduced from 5x for performance)
+                search_k = min(k * 2, len(self.meta))
             distances, indices = self.index.search(emb_vec, search_k)
             
             # Calculate relevance scores for all candidates
@@ -268,6 +283,15 @@ class VectorStore:
                         # New enhanced format: dict
                         file_path = meta_item.get("relative_path", meta_item.get("file_path", "unknown"))
                         snippet = meta_item.get("chunk_text", "")
+                    
+                    # Enforce project scoping early
+                    if allowed_projects:
+                        try:
+                            project_dir = file_path.split('/')[0]
+                        except Exception:
+                            project_dir = ""
+                        if project_dir not in set(allowed_projects):
+                            continue
                     
                     relevance_score = self._calculate_relevance_score(distance, file_path, query)
                     all_scored_results.append((relevance_score, file_path, snippet))
@@ -300,10 +324,18 @@ class VectorStore:
             logger.debug(f"Vector search returned {len(final_results)} results from {len(all_scored_results)} candidates "
                        f"(threshold: {current_threshold:.3f})")
             
-            # Log details about top results with enhanced information
+            # Log details about top results with enhanced information (in-scope only)
             for i, (score, path, snippet) in enumerate(scored_results[:min(k, 3)]):  # Log top 3
-                logger.info(f"Result {i+1}: {path} (score: {score:.3f}, "
-                           f"snippet: {len(snippet)} chars, distance: {distances[0][i]:.3f})")
+                try:
+                    dist_val = distances[0][i]
+                except Exception:
+                    dist_val = 0.0
+                logger.info(
+                    (
+                        f"Result {i+1}: {path} (score: {score:.3f}, "
+                        f"snippet: {len(snippet)} chars, distance: {dist_val:.3f})"
+                    )
+                )
             
             # Log threshold adaptation if it occurred
             if current_threshold != min_relevance:

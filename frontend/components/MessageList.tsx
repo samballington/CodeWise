@@ -10,7 +10,7 @@ interface MessageListProps {
 
 export default function MessageList({ messages }: MessageListProps) {
   return (
-    <div className="space-y-1 max-w-4xl mx-auto px-4">
+    <div className="space-y-1 w-full px-0">
       {messages.map((message) => (
         <MessageItem key={message.id} message={message} />
       ))}

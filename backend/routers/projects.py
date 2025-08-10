@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
@@ -481,3 +481,56 @@ async def clone_github_repo(request: CloneRequest):
         raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
+
+@router.post("/import")
+async def import_project(
+    project_name: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """Import a project from uploaded files"""
+    try:
+        workspace_path = Path(WORKSPACE_DIR)
+        project_path = workspace_path / project_name
+        
+        # Create project directory
+        project_path.mkdir(exist_ok=True)
+        
+        files_imported = 0
+        
+        # Save all uploaded files
+        for file in files:
+            if file.filename:
+                # Extract relative path from filename (should include subdirectories)
+                relative_path = file.filename
+                target_file_path = project_path / relative_path
+                
+                # Create subdirectories if needed
+                target_file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Write file content
+                content = await file.read()
+                with open(target_file_path, 'wb') as f:
+                    f.write(content)
+                
+                files_imported += 1
+        
+        # Trigger indexing for the specific imported project only
+        try:
+            import requests
+            indexer_url = "http://indexer:8002/rebuild"
+            payload = {"project": project_name}
+            indexer_response = requests.post(indexer_url, json=payload, timeout=30)
+            indexer_success = indexer_response.status_code in [200, 202]
+        except Exception as e:
+            print(f"Failed to trigger indexer: {e}")
+            indexer_success = False
+        
+        return JSONResponse(content={
+            "message": f"Successfully imported project '{project_name}'",
+            "files_imported": files_imported,
+            "indexer_triggered": indexer_success,
+            "project_path": str(project_path)
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")

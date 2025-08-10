@@ -3,7 +3,10 @@
 [![CI/CD](https://github.com/samballington/CodeWise/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/samballington/CodeWise/actions/workflows/ci-cd.yml)
 [![PR Checks](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml/badge.svg)](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml)
 
-![UI Example](uiexample.png)
+<div align="center">
+  <img src="example1.png" alt="Example 1" width="45%" style="margin-right: 2%;">
+  <img src="example2.png" alt="Example 2" width="45%;">
+</div>
 
 CodeWise is an AI-powered development assistant that combines deep code understanding with a hybrid search engine to deliver precise, context-aware answers for large, multi-language codebases.
 

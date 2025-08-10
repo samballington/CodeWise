@@ -1,0 +1,5 @@
+# Development Dependencies - Testing
+-r requirements-prod.txt
+
+# Development and Testing Dependencies
+pytest==7.4.4

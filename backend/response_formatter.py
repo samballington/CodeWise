@@ -6,6 +6,7 @@ and structured metadata for the simplified 3-tool architecture.
 """
 
 import re
+from pathlib import Path
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -415,20 +416,30 @@ class ResponseFormatter:
         """Extract file references from search results"""
         references = []
         
-        # Pattern to match search results
-        result_pattern = r'📄 RESULT #\d+: ([^\n]+)\s+🎯 Relevance: [🟢🟡🔴] \w+ \(([0-9.]+)\)'
-        matches = re.findall(result_pattern, result_text)
-        
-        for file_path, relevance_str in matches:
+        # Legacy pattern: 📄 RESULT #n: path  🎯 Relevance: TIER (score)
+        legacy_pattern = r'📄 RESULT #\d+: ([^\n]+)\s+🎯 Relevance: [🟢🟡🔴] \w+ \(([0-9.]+)\)'
+        for file_path, relevance_str in re.findall(legacy_pattern, result_text):
             try:
-                relevance_score = float(relevance_str)
                 references.append(FileReference(
                     file_path=file_path.strip(),
-                    relevance_score=relevance_score,
+                    relevance_score=float(relevance_str),
                     context="Found in search results"
                 ))
             except ValueError:
-                continue
+                pass
+
+        # New context-aware format: **1. path** (score: 0.800, strategy: ...)
+        modern_pattern = r"\*\*\s*\d+\.\s*([^*\n]+)\*\*\s*\(score:\s*([0-9.]+)"
+        for file_path, score_str in re.findall(modern_pattern, result_text):
+            # Normalize and record
+            try:
+                references.append(FileReference(
+                    file_path=file_path.strip(),
+                    relevance_score=float(score_str),
+                    context="Found in search results"
+                ))
+            except ValueError:
+                pass
         
         return references
     
@@ -446,6 +457,45 @@ class ResponseFormatter:
                 relevance_score=0.8,  # High relevance for examined files
                 context="Examined in detail"
             ))
+        
+        # Maven POM enrichment: detect parent POM and dependencyManagement sections
+        try:
+            # Only proceed if we examined a pom.xml
+            pom_files = [fp for fp in matches if fp.strip().lower().endswith('pom.xml')]
+            if pom_files:
+                # Extract XML blocks (best-effort) to inspect parent/dependencyManagement
+                # Look for relativePath inside the examine output
+                rel_match = re.search(r'<relativePath>\s*([^<]+)\s*</relativePath>', result_text)
+                depmgmt_present = bool(re.search(r'<\s*dependencyManagement\b', result_text))
+
+                # Add a reference for dependencyManagement section presence
+                if depmgmt_present:
+                    for pom in pom_files:
+                        references.append(FileReference(
+                            file_path=pom.strip(),
+                            relevance_score=0.6,
+                            context="dependencyManagement section present"
+                        ))
+
+                # Resolve parent POM file path if relativePath found (best-effort without FS IO)
+                if rel_match:
+                    parent_rel = rel_match.group(1).strip()
+                    for pom in pom_files:
+                        try:
+                            pom_path = Path(pom.strip())
+                            parent_path = (pom_path.parent / parent_rel).resolve().as_posix()
+                            # Normalize to workspace-style relative if path includes /workspace already omitted
+                            references.append(FileReference(
+                                file_path=parent_path,
+                                relevance_score=0.55,
+                                context="Parent POM"
+                            ))
+                        except Exception:
+                            # On any failure, skip adding parent path
+                            pass
+        except Exception:
+            # Do not fail reference extraction for enrichment errors
+            pass
         
         return references
     

@@ -93,12 +93,19 @@ class QueryProcessor:
         if file_type_hints:
             suggested_file_filters.extend(file_type_hints)
         
+        # Detect filename token (e.g., pom.xml, package.json, app.py)
+        filename_token = None
+        m = re.search(r"([A-Za-z0-9._\-]+\.(?:xml|yaml|yml|json|md|gradle|properties|txt|py|js|jsx|ts|tsx|java|sh|bash|toml|ini|cfg))", query_lower)
+        if m:
+            filename_token = m.group(1)
+
         return {
             'has_technical_terms': has_technical_terms,
             'file_type_hints': file_type_hints,
             'is_exact_match_query': is_exact_match_query,
             'suggested_file_filters': suggested_file_filters,
-            'query_terms': words
+            'query_terms': words,
+            'filename_token': filename_token
         }
 
 
@@ -254,6 +261,37 @@ class ResultFusion:
                     if technical_matches > 0:
                         result.relevance_score *= (1.0 + 0.1 * technical_matches)
 
+        # HARD GUARD: Filename-focused queries should prefer exact filename/path matches
+        filename_token = (query_analysis.get('filename_token') or '').lower()
+        if filename_token:
+            # Determine if any result exactly matches the filename (basename equality)
+            exact_matches = set()
+            for key, res in results.items():
+                basename = res.file_path.split('/')[-1].lower()
+                if basename == filename_token or res.file_path.lower().endswith('/' + filename_token):
+                    exact_matches.add(key)
+
+            # If there are exact matches, heavily penalize non-matching files
+            if exact_matches:
+                for key, res in results.items():
+                    if key in exact_matches:
+                        res.relevance_score *= 1.35
+                    else:
+                        # If extension also mismatches, penalize more
+                        ext = filename_token.split('.')[-1]
+                        if not res.file_path.lower().endswith('.' + ext):
+                            res.relevance_score *= 0.2
+                        else:
+                            res.relevance_score *= 0.5
+            else:
+                # If no exact matches, soften: prefer same-extension files
+                ext = filename_token.split('.')[-1]
+                for res in results.values():
+                    if res.file_path.lower().endswith('.' + ext):
+                        res.relevance_score *= 1.2
+                    else:
+                        res.relevance_score *= 0.6
+
 
 class HybridSearchEngine:
     """Main hybrid search engine combining vector and BM25 search"""
@@ -306,7 +344,7 @@ class HybridSearchEngine:
             logger.error(f"Error building BM25 index: {e}")
             return False
     
-    def search(self, query: str, k: int = 5, min_relevance: float = None) -> List[SearchResult]:
+    def search(self, query: str, k: int = 5, min_relevance: float = None, allowed_projects: Optional[List[str]] = None) -> List[SearchResult]:
         """
         Perform hybrid search combining vector and BM25 results
         
@@ -327,18 +365,26 @@ class HybridSearchEngine:
         query_analysis = self.query_processor.analyze_query(query)
         logger.debug(f"Query analysis: {query_analysis}")
         
-        # Perform vector search
+        # Perform vector search (project-scoped if provided)
         vector_results = []
         try:
-            vector_results = self.vector_store.query(query, k=self.max_results)
+            vector_results = self.vector_store.query(
+                query,
+                k=self.max_results,
+                allowed_projects=allowed_projects,
+            )
             logger.debug(f"Vector search returned {len(vector_results)} results")
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
         
-        # Perform BM25 search
+        # Perform BM25 search (project-scoped if provided)
         bm25_results = []
         try:
-            bm25_results = self.bm25_index.search(query, k=self.max_results)
+            bm25_results = self.bm25_index.search(
+                query,
+                k=self.max_results,
+                allowed_projects=allowed_projects,
+            )
             logger.debug(f"BM25 search returned {len(bm25_results)} results")
         except Exception as e:
             logger.error(f"BM25 search failed: {e}")
@@ -354,6 +400,10 @@ class HybridSearchEngine:
             if result.relevance_score >= min_relevance
         ][:k]
 
+        # Check for empty project indexing and trigger auto-reindex if needed
+        if allowed_projects and len(vector_results) == 0 and len(bm25_results) == 0:
+            self._check_and_trigger_reindex(allowed_projects)
+        
         # Adaptive retry: if too few results, relax threshold once
         if len(filtered_results) < 8 and min_relevance > 0.05:
             logger.info(f"Only {len(filtered_results)} results ≥{min_relevance:.2f}; retrying with lower threshold")
@@ -417,3 +467,78 @@ class HybridSearchEngine:
         """Set minimum relevance threshold"""
         self.min_relevance_threshold = threshold
         logger.info(f"Updated relevance threshold to {threshold}")
+    
+    def _check_and_trigger_reindex(self, allowed_projects: List[str]):
+        """Check if projects exist but have no indexed content, trigger reindex if needed"""
+        from pathlib import Path
+        import requests
+        import asyncio
+        import threading
+        
+        workspace_dir = Path("/workspace")
+        
+        for project in allowed_projects:
+            project_path = workspace_dir / project
+            
+            # Check if project directory exists
+            if not project_path.exists() or not project_path.is_dir():
+                logger.debug(f"Project directory does not exist: {project}")
+                continue
+            
+            # Check if project has files that should be indexed
+            indexable_files = []
+            try:
+                for ext in ['.py', '.js', '.ts', '.tsx', '.jsx', '.md', '.txt', '.json', '.html', '.css']:
+                    indexable_files.extend(project_path.glob(f"**/*{ext}"))
+                
+                if len(indexable_files) < 3:  # Skip if very few indexable files
+                    logger.debug(f"Project {project} has too few indexable files ({len(indexable_files)})")
+                    continue
+            
+            except Exception as e:
+                logger.warning(f"Failed to scan project directory {project}: {e}")
+                continue
+            
+            # Check if project has indexed content in metadata
+            try:
+                project_chunk_count = 0
+                if hasattr(self.vector_store, 'meta') and self.vector_store.meta:
+                    for meta_item in self.vector_store.meta:
+                        # Handle both tuple and dict metadata formats
+                        if isinstance(meta_item, tuple):
+                            file_path = meta_item[0]
+                        else:
+                            file_path = meta_item.get("relative_path", meta_item.get("file_path", ""))
+                        
+                        if file_path.startswith(f"{project}/"):
+                            project_chunk_count += 1
+                
+                # Trigger reindex if project has indexable files but very few chunks
+                threshold = max(5, len(indexable_files) // 10)  # At least 5 chunks or 10% of files
+                
+                if project_chunk_count < threshold:
+                    logger.warning(f"🔄 AUTO-REINDEX TRIGGERED: Project '{project}' has {len(indexable_files)} indexable files but only {project_chunk_count} chunks (threshold: {threshold})")
+                    
+                    # Trigger async reindex in background thread to avoid blocking search
+                    def trigger_reindex():
+                        try:
+                            response = requests.post(
+                                "http://indexer:8002/rebuild",
+                                json={"project": project},
+                                timeout=5
+                            )
+                            if response.status_code == 202:
+                                logger.info(f"✅ AUTO-REINDEX: Successfully triggered reindex for project '{project}'")
+                            else:
+                                logger.error(f"❌ AUTO-REINDEX: Failed to trigger reindex for project '{project}': HTTP {response.status_code}")
+                        except Exception as e:
+                            logger.error(f"❌ AUTO-REINDEX: Request failed for project '{project}': {e}")
+                    
+                    # Run in background thread to avoid blocking search response
+                    threading.Thread(target=trigger_reindex, daemon=True).start()
+                else:
+                    logger.debug(f"Project {project} has adequate indexing: {project_chunk_count} chunks for {len(indexable_files)} files")
+                    
+            except Exception as e:
+                logger.error(f"Failed to check indexing status for project {project}: {e}")
+                continue

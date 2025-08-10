@@ -39,13 +39,31 @@ export const useWebSocket = () => {
         console.error('WebSocket error:', error)
       }
 
-      ws.onmessage = (event) => {
+      ws.onmessage = (event: MessageEvent) => {
         try {
+          // 🔍 DEBUG: Log ALL WebSocket messages
+          console.log('🌐 WEBSOCKET MESSAGE RECEIVED:', {
+            messageSize: event.data.length,
+            messageType: event.data.substring(0, 100) + '...',
+            timestamp: new Date().toISOString()
+          })
+          
           const data = JSON.parse(event.data)
+          
+          // 🔍 DEBUG: Log parsed message details
+          console.log('🔍 WEBSOCKET PARSED MESSAGE:', {
+            type: data.type,
+            hasOutput: !!data.output,
+            outputLength: data.output?.length || 0,
+            hasStructuredResponse: !!data.structured_response,
+            hasFormattedResponse: !!data.formatted_response,
+            allKeys: Object.keys(data)
+          })
+          
           if (data.type === 'pong') return // ignore keep-alive
           handleMessage(data)
         } catch (error) {
-          console.error('Error parsing message:', error)
+          console.error('Error parsing message:', error, 'Raw data:', event.data)
         }
       }
     }
@@ -151,6 +169,15 @@ export const useWebSocket = () => {
         break
 
       case 'final_result':
+        // 🔍 COMPREHENSIVE DEBUG: Log everything about the final result
+        console.log('🚨 FINAL_RESULT DEBUG - PARSED DATA:', data)
+        console.log('🚨 FINAL_RESULT DEBUG - DATA KEYS:', Object.keys(data))
+        console.log('🚨 FINAL_RESULT DEBUG - OUTPUT LENGTH:', data.output?.length || 0)
+        console.log('🚨 FINAL_RESULT DEBUG - OUTPUT CONTENT:', data.output)
+        console.log('🚨 FINAL_RESULT DEBUG - STRUCTURED_RESPONSE:', data.structured_response)
+        console.log('🚨 FINAL_RESULT DEBUG - FORMATTED_RESPONSE:', data.formatted_response)
+        console.log('🚨 FINAL_RESULT DEBUG - CONSOLIDATION_METADATA:', data.consolidation_metadata)
+        
         // Get the most recent complete context activity to attach to the message
         const contextState = useContextStore.getState()
         const recentCompleteActivity = contextState.recentActivities.find(
@@ -172,6 +199,8 @@ export const useWebSocket = () => {
         const finalState = useChatStore.getState()
         const finalLastMessage = finalState.messages[finalState.messages.length - 1]
         
+        console.log('🚨 FINAL_RESULT DEBUG - CURRENT MESSAGE STATE:', finalLastMessage)
+        
         // Clean the output to remove any tool output that might have leaked through
         let cleanOutput = data.output
         if (cleanOutput) {
@@ -180,19 +209,43 @@ export const useWebSocket = () => {
           cleanOutput = cleanOutput.replace(/Unknown function:.*?\n/g, '')
         }
         
-        updateLastMessage({
-          content: cleanOutput,
+        console.log('🚨 FINAL_RESULT DEBUG - CLEAN OUTPUT:', cleanOutput)
+        
+        const structured = data.structured_response || undefined
+        const formatted = data.formatted_response || undefined
+        
+        console.log('🚨 FINAL_RESULT DEBUG - STRUCTURED:', !!structured)
+        console.log('🚨 FINAL_RESULT DEBUG - FORMATTED:', !!formatted)
+        
+        // Get current structured response to prevent overwriting
+        const currentStructured = finalLastMessage?.structuredResponse
+        const hasExistingStructured = currentStructured && currentStructured.response && Array.isArray(currentStructured.response.sections)
+        
+        console.log('🚨 FINAL_RESULT DEBUG - HAS EXISTING STRUCTURED:', hasExistingStructured)
+        
+        // ALWAYS prioritize structured response over formatted, and never overwrite existing structured
+        const finalStructuredResponse = hasExistingStructured ? currentStructured : (structured || formatted || undefined)
+        
+        console.log('🚨 FINAL_RESULT DEBUG - FINAL STRUCTURED RESPONSE:', finalStructuredResponse)
+        
+        const messageUpdate = {
+          content: (structured || hasExistingStructured) ? '' : cleanOutput,
           isProcessing: false,
           isComplete: true,
           toolCalls: finalLastMessage?.bufferedToolCalls || [],
           bufferedToolCalls: undefined,
+          structuredResponse: finalStructuredResponse,
           contextData: recentCompleteActivity ? {
             sources: recentCompleteActivity.sources || [],
             chunksFound: recentCompleteActivity.chunksFound || 0,
             filesAnalyzed: recentCompleteActivity.filesAnalyzed || 0,
             query: recentCompleteActivity.query || ''
           } : undefined
-        })
+        }
+        
+        console.log('🚨 FINAL_RESULT DEBUG - MESSAGE UPDATE OBJECT:', messageUpdate)
+        
+        updateLastMessage(messageUpdate)
         break
 
       case 'error':

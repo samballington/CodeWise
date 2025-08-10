@@ -138,7 +138,13 @@ class BM25Index:
         
         return filtered_terms
     
-    def search(self, query: str, k: int = 10, min_score: float = 0.1) -> List[BM25Result]:
+    def search(
+        self,
+        query: str,
+        k: int = 10,
+        min_score: float = 0.1,
+        allowed_projects: Optional[List[str]] = None,
+    ) -> List[BM25Result]:
         """
         Search the index using BM25 scoring
         
@@ -161,12 +167,21 @@ class BM25Index:
         
         logger.debug(f"BM25 search for terms: {query_terms}")
         
-        # Calculate BM25 scores for all documents
+        # Calculate BM25 scores for all documents (optionally pre-filter by project)
         scores = []
         for doc_id in range(len(self.documents)):
             score = self._calculate_bm25_score(doc_id, query_terms)
             if score >= min_score:
                 matched_terms = self._get_matched_terms(doc_id, query_terms)
+                # Project scoping: drop docs outside allowed projects early
+                if allowed_projects:
+                    try:
+                        file_path = self.documents[doc_id]['file_path']
+                        project_dir = file_path.split('/')[0]
+                        if project_dir not in set(allowed_projects):
+                            continue
+                    except Exception:
+                        pass
                 scores.append((doc_id, score, matched_terms))
         
         # Sort by score (descending) and return top k
