@@ -807,7 +807,7 @@ class SmartSearchEngine:
     async def _hybrid_search_strategy(self, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
         """Execute hybrid search strategy"""
         try:
-            search_results = self.hybrid_search.search(query, k=self.max_results)
+            search_results = await self.hybrid_search.search(query, k=self.max_results)
             return [
                 SmartSearchResult(
                     chunk_id=result.chunk_id,

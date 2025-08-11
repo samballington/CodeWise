@@ -7,6 +7,7 @@ with keyword-based BM25 search for comprehensive code retrieval.
 
 import logging
 import re
+import asyncio
 from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
 from collections import defaultdict
@@ -344,7 +345,7 @@ class HybridSearchEngine:
             logger.error(f"Error building BM25 index: {e}")
             return False
     
-    def search(self, query: str, k: int = 5, min_relevance: float = None, allowed_projects: Optional[List[str]] = None) -> List[SearchResult]:
+    async def search(self, query: str, k: int = 5, min_relevance: float = None, allowed_projects: Optional[List[str]] = None) -> List[SearchResult]:
         """
         Perform hybrid search combining vector and BM25 results
         
@@ -365,29 +366,45 @@ class HybridSearchEngine:
         query_analysis = self.query_processor.analyze_query(query)
         logger.debug(f"Query analysis: {query_analysis}")
         
-        # Perform vector search (project-scoped if provided)
-        vector_results = []
-        try:
-            vector_results = self.vector_store.query(
-                query,
-                k=self.max_results,
-                allowed_projects=allowed_projects,
-            )
-            logger.debug(f"Vector search returned {len(vector_results)} results")
-        except Exception as e:
-            logger.error(f"Vector search failed: {e}")
+        # Perform vector and BM25 searches in parallel
+        logger.info("🚀 Starting parallel vector and BM25 searches")
         
-        # Perform BM25 search (project-scoped if provided)
-        bm25_results = []
-        try:
-            bm25_results = self.bm25_index.search(
-                query,
-                k=self.max_results,
-                allowed_projects=allowed_projects,
-            )
-            logger.debug(f"BM25 search returned {len(bm25_results)} results")
-        except Exception as e:
-            logger.error(f"BM25 search failed: {e}")
+        # Create async tasks for parallel execution
+        async def vector_search_task():
+            try:
+                results = await asyncio.to_thread(
+                    self.vector_store.query,
+                    query,
+                    k=self.max_results,
+                    allowed_projects=allowed_projects,
+                )
+                logger.debug(f"Vector search returned {len(results)} results")
+                return results
+            except Exception as e:
+                logger.error(f"Vector search failed: {e}")
+                return []
+        
+        async def bm25_search_task():
+            try:
+                results = await asyncio.to_thread(
+                    self.bm25_index.search,
+                    query,
+                    k=self.max_results,
+                    allowed_projects=allowed_projects,
+                )
+                logger.debug(f"BM25 search returned {len(results)} results")
+                return results
+            except Exception as e:
+                logger.error(f"BM25 search failed: {e}")
+                return []
+        
+        # Execute both searches in parallel
+        vector_results, bm25_results = await asyncio.gather(
+            vector_search_task(),
+            bm25_search_task()
+        )
+        
+        logger.info(f"✅ Parallel search completed: {len(vector_results)} vector, {len(bm25_results)} BM25 results")
         
         # Fuse results
         unified_results = self.result_fusion.fuse_results(

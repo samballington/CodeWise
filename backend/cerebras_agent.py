@@ -26,6 +26,7 @@ from enhanced_project_structure import EnhancedProjectStructure
 from backend.smart_search import smart_search
 from backend.path_resolver import PathResolver
 from backend.response_formatter import ResponseFormatter, StandardizedResponse
+from backend.tools.mermaid_generator import create_mermaid_diagram
 from backend.json_prompt_schema import parse_json_prompt
 from backend.json_prompt_postprocess import improve_json_prompt_readability
 from backend.response_consolidator import ResponseConsolidator, ResponseSource
@@ -79,6 +80,76 @@ class CerebrasNativeAgent:
             'entities_found': []
         }
     
+    def _repair_truncated_json(self, truncated_json: str) -> str:
+        """Attempt to repair truncated JSON for mermaid diagrams"""
+        try:
+            # Remove any trailing incomplete text
+            json_str = truncated_json.strip()
+            
+            # Find the last complete object/array structure
+            bracket_count = 0
+            brace_count = 0
+            last_valid_pos = 0
+            in_string = False
+            escape_next = False
+            
+            for i, char in enumerate(json_str):
+                if escape_next:
+                    escape_next = False
+                    continue
+                
+                if char == '\\' and in_string:
+                    escape_next = True
+                    continue
+                
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                
+                if not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                    elif char == '[':
+                        bracket_count += 1
+                    elif char == ']':
+                        bracket_count -= 1
+                    
+                    # Check if we have a complete structure
+                    if brace_count == 0 and bracket_count == 0 and i > 0:
+                        last_valid_pos = i + 1
+            
+            # If we found a complete structure, use it
+            if last_valid_pos > 0:
+                repaired = json_str[:last_valid_pos]
+                logger.info(f"🔧 JSON repair: truncated from {len(json_str)} to {len(repaired)} chars")
+                return repaired
+            
+            # Otherwise, attempt to close unclosed structures
+            repaired = json_str
+            
+            # Close unclosed strings
+            if in_string:
+                repaired += '"'
+            
+            # Close unclosed arrays
+            while bracket_count > 0:
+                repaired += ']'
+                bracket_count -= 1
+            
+            # Close unclosed objects
+            while brace_count > 0:
+                repaired += '}'
+                brace_count -= 1
+            
+            logger.info(f"🔧 JSON repair: added {len(repaired) - len(json_str)} closing characters")
+            return repaired
+            
+        except Exception as e:
+            logger.error(f"❌ JSON repair failed: {e}")
+            return None
+
     async def _call_mcp_tool_wrapper(self, tool_name: str, params):
         """Wrapper method for MCP tool calls to match the expected signature"""
         if tool_name == "run_command":
@@ -415,16 +486,104 @@ class CerebrasNativeAgent:
                         "required": []
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mermaid_generator",
+                    "description": "Generate professional Mermaid.js diagrams from structured data. Converts semantic diagram descriptions into syntactically correct, styled Mermaid code using predefined templates.",
+                    "parameters": {
+                        "type": "object", 
+                        "properties": {
+                            "diagram_type": {
+                                "type": "string",
+                                "enum": ["Full-Stack Application", "API / Microservice Interaction", "Database Schema", "Internal Component Flow", "CI/CD Pipeline", "General System Architecture"],
+                                "description": "The type of diagram template to use for styling and structure"
+                            },
+                            "nodes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string", "description": "Unique alphanumeric identifier"},
+                                        "label": {"type": "string", "description": "Display text (will be auto-escaped)"},
+                                        "shape": {"type": "string", "enum": ["square", "round-edge", "database", "rhombus", "circle", "hexagon"], "description": "Mermaid node shape"},
+                                        "group": {"type": "string", "description": "Optional subgraph name"}
+                                    },
+                                    "required": ["id", "label"]
+                                },
+                                "description": "List of all diagram nodes/components"
+                            },
+                            "edges": {
+                                "type": "array", 
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "from": {"type": "string", "description": "Source node ID"},
+                                        "to": {"type": "string", "description": "Target node ID"}, 
+                                        "label": {"type": "string", "description": "Optional edge label"}
+                                    },
+                                    "required": ["from", "to"]
+                                },
+                                "description": "List of connections between nodes"
+                            }
+                        },
+                        "required": ["diagram_type", "nodes", "edges"]
+                    }
+                }
             }
         ]
     
     def _create_function_mapping(self) -> Dict[str, callable]:
-        """Map function names to simplified 3-tool implementations"""
+        """Map function names to simplified 4-tool implementations"""
         return {
             "smart_search": self._smart_search_router,  # Context-aware router
             "examine_files": self._examine_files,
-            "analyze_relationships": self._analyze_relationships
+            "analyze_relationships": self._analyze_relationships,
+            "mermaid_generator": self._mermaid_generator_wrapper
         }
+    
+    async def _mermaid_generator_wrapper(self, diagram_type: str, nodes: List[Dict], edges: List[Dict]) -> str:
+        """Async wrapper for mermaid generator tool"""
+        try:
+            # Validate input
+            if not nodes:
+                return "❌ **Error**: No nodes provided for diagram generation"
+               
+            if not edges:
+                return "❌ **Error**: No edges provided for diagram generation"
+            
+            logger.info(f"🎨 Generating {diagram_type} diagram with {len(nodes)} nodes and {len(edges)} edges")
+            
+            # Call the tool
+            diagram_data = {
+                "diagram_type": diagram_type,
+                "nodes": nodes,
+                "edges": edges
+            }
+            
+            result = create_mermaid_diagram(diagram_data)
+            
+            # Format for structured response
+            response = f"✅ **Mermaid Diagram Generated Successfully**\n\n"
+            response += f"**📊 Diagram Details:**\n"
+            response += f"- **Type:** {diagram_type}\n"
+            response += f"- **Nodes:** {len(nodes)} components\n"
+            response += f"- **Connections:** {len(edges)} relationships\n"
+            response += f"- **Diagram Length:** {len(result)} characters\n\n"
+            response += "```mermaid\n"
+            response += result
+            response += "\n```"
+            
+            logger.info(f"🎨 Successfully generated Mermaid diagram ({len(result)} chars)")
+            return response
+            
+        except ValueError as ve:
+            logger.error(f"Mermaid validation error: {ve}")
+            return f"❌ **Mermaid Validation Error:** {str(ve)}\n\nPlease check your input data format and try again."
+        except Exception as e:
+            logger.error(f"Mermaid generator error: {e}")
+            return f"❌ **Mermaid Generation Failed:** {str(e)}\n\nThe diagram could not be generated. Please verify your input data."
     
     async def _smart_search_router(self, query: str, max_results: int = 10) -> str:
         """Route to context-aware or legacy smart search based on availability"""
@@ -1843,48 +2002,171 @@ class CerebrasNativeAgent:
             "\"sections\": [], \"follow_up_suggestions\": [] } }. "
             "The output MUST begin with '{' as the first character and end with '}'. Do not prepend headings, prose, or code fences. "
             "Sections must be typed using: paragraph, heading(level 1-6), table(columns, rows, note), list(style bullet|numbered), "
-            "code_block(language, content), callout(style info|warning|error|success), tree(root.label, root.children), diagram(format mermaid, content). "
-            "If you include a diagram, you MUST use a dedicated diagram section: {\"type\":\"diagram\", \"format\":\"mermaid\", \"content\":\"graph TD;subgraph FE[\\\"Frontend\\\"];UI[\\\"Component\\\"];end\"}. Do NOT emit markdown or code fences for diagrams. "
-            "CRITICAL: The diagram content is a JSON string. ESCAPE ALL internal double quotes as \\\" (e.g., UI[\\\"React Canvas\\\"]). Use semicolons (;) as line delimiters for proper formatting. "
+            "code_block(language, content), callout(style info|warning|error|success), tree(root.label, root.children). "
+            "IMPORTANT: For diagrams, you MUST call the mermaid_generator tool - NEVER generate diagram content inline. "
             "Do not include markdown in contents; use the section types. "
-            "\n\n**🧠 MERMAID DIAGRAM GENERATION GUIDELINES**\n"
-            "**IMPORTANT: Only generate diagrams when explicitly requested by the user OR when a visual representation would be significantly more helpful than text for explaining architecture, relationships, or complex flows. Do not create diagrams for simple explanations that can be communicated clearly with text and tables.**\n\n"
-            "You are an expert AI assistant specializing in generating styled Mermaid.js diagrams to visualize software architecture. Your primary function is to analyze a user's request, select the most appropriate architectural template from the library below, and then populate it with the specific details provided.\n\n"
-            "**CRITICAL INSTRUCTIONS: YOU MUST FOLLOW THIS PROCESS EXACTLY.**\n\n"
-            "**ANALYZE AND CLASSIFY:** First, analyze the user's request to determine which of the following scenarios it best fits:\n"
-            "• Full-Stack Application: A high-level overview of a complete application.\n"
-            "• API / Microservice Interaction: The communication flow between different services or APIs.\n"
-            "• Database Schema: The structure and relationships of database tables.\n"
-            "• Internal Component Flow: A detailed look at how components within a single service interact.\n"
-            "• CI/CD Pipeline: The flow of code from commit to deployment.\n"
-            "• General System Architecture: A flexible, high-level diagram for requests that don't fit other categories.\n\n"
-            "**SELECT MANDATORY TEMPLATE:** Once you have classified the request, you MUST select the corresponding template from the Template Library below. This is your required starting point. DO NOT START FROM SCRATCH.\n\n"
-            "**MODIFY THE TEMPLATE:** Your task is to adapt the chosen template to perfectly match the user's request.\n"
-            "• Rename the generic nodes in the template to match the entities in the user's request.\n"
-            "• Add new nodes and define their relationships using arrows (-->).\n"
-            "• Remove any nodes from the template that are not relevant to the user's specific scenario.\n"
-            "• Create multiple subgraph blocks to logically group different parts of the architecture and draw connections between them.\n"
-            "• Optionally, add text to arrows to describe the relationship (e.g., -->|Uses|, -->|Sends Data To|). This helps clarify the interaction between components.\n"
-            "• You MUST keep the existing classDef styling and apply the appropriate classes to new nodes you create.\n\n"
-            "**SYNTAX REQUIREMENTS:** You MUST generate only valid Mermaid.js syntax inside a single code block. Do not include any explanatory text or conversational filler.\n\n"
-            "**CRITICAL SYNTAX RULES (MUST FOLLOW):**\n"
-            "• **Subgraph Syntax**: Use `subgraph \"Title\"` NOT `subgraph Title[\"Label\"]`. Example: `subgraph \"Frontend\"` is CORRECT.\n"
-            "• **Nested Quotes**: Use `&quot;` for inner quotes inside node labels. Example: `Node[\"Label &quot;with quotes&quot;\"]` is CORRECT.\n"
-            "• **Node Labels**: If a label contains double quotes, escape them with `&quot;`. Example: `FalAI[\"Fal.AI &quot;Service&quot;\"]`\n"
-            "• **Consistent Escaping**: Always escape ALL inner double quotes within node and edge labels using `&quot;`\n\n"
-            "**TEMPLATE LIBRARY (CHOOSE ONE AND BUILD UPON IT)**\n\n"
-            "**Template 1: Full-Stack Application** (Use for high-level, end-to-end application views)\n"
-            "graph TD\n    %% --- Style Definitions ---\n    classDef userStyle fill:#99d98c,stroke:#333,stroke-width:2px\n    classDef frontendStyle fill:#76c893,stroke:#333,stroke-width:2px\n    classDef backendStyle fill:#52b69a,stroke:#333,stroke-width:2px\n    classDef dbStyle fill:#34a0a4,stroke:#333,stroke-width:2px\n    classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n\n    %% --- Core Structure ---\n    User([User]):::userStyle\n\n    subgraph \\\"Primary Application\\\"\n        direction LR\n        WebApp[Frontend]:::frontendStyle\n        Server[Backend API]:::backendStyle\n        Database[(Database)]:::dbStyle\n    end\n    \n    subgraph \\\"External Services\\\"\n        PaymentGateway[(Payment Gateway)]:::externalStyle\n    end\n\n    %% --- Relationships ---\n    User --> WebApp\n    WebApp --> Server\n    Server --> Database\n    Server -->|Processes Payment| PaymentGateway\n\n"
-            "**Template 2: API / Microservice Interaction** (Use for showing how different services communicate)\n"
-            "graph TD\n    %% --- Style Definitions ---\n    classDef apiStyle fill:#1a759f,stroke:#333,stroke-width:2px,color:#fff\n    classDef serviceStyle fill:#184e77,stroke:#333,stroke-width:2px,color:#fff\n    classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n\n    %% --- Core Structure ---\n    ApiGateway[API Gateway]:::apiStyle\n\n    subgraph \\\"User Service\\\"\n        ServiceA{{Authentication}}:::serviceStyle\n    end\n    \n    subgraph \\\"Order Service\\\"\n        ServiceB{{Order Processing}}:::serviceStyle\n    end\n\n    ThirdParty[(3rd Party API)]:::externalStyle\n\n    %% --- Relationships ---\n    ApiGateway -->|Routes to| ServiceA\n    ApiGateway -->|Routes to| ServiceB\n    ServiceB -->|Fetches Data| ThirdParty\n\n"
-            "**Template 3: Database Schema** (Use for visualizing database tables and their relationships)\n"
-            "erDiagram\n    %% --- Table Definitions ---\n    USERS {\n        int id PK\n        string username\n        string email\n    }\n    POSTS {\n        int id PK\n        string title\n        string content\n        int user_id FK\n    }\n    COMMENTS {\n        int id PK\n        string text\n        int post_id FK\n        int user_id FK\n    }\n\n    %% --- Relationships ---\n    USERS ||--o{ POSTS : \\\"writes\\\"\n    POSTS ||--o{ COMMENTS : \\\"has\\\"\n    USERS ||--o{ COMMENTS : \\\"writes\\\"\n\n"
-            "**Template 4: Internal Component Flow** (Use for detailed views inside a single application or service)\n"
-            "graph TD\n    %% --- Style Definitions ---\n    classDef entrypointStyle fill:#ef476f,stroke:#333,stroke-width:2px,color:white\n    classDef controllerStyle fill:#f78c6b,stroke:#333,stroke-width:2px\n    classDef serviceStyle fill:#ffd166,stroke:#333,stroke-width:2px\n    classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px\n\n    %% --- Core Structure ---\n    subgraph \\\"Backend Logic Flow\\\"\n        direction LR\n        A_Request[Request]\n        B_Controller{Controller}\n        C_Service[Service Logic]\n        D_Model[(Data Model)]\n    end\n\n    %% --- Relationships ---\n    A_Request --> B_Controller\n    B_Controller --> C_Service\n    C_Service --> D_Model\n\n    %% --- Apply Styles ---\n    class A_Request entrypointStyle\n    class B_Controller controllerStyle\n    class C_Service serviceStyle\n    class D_Model modelStyle\n\n"
-            "**Template 5: CI/CD Pipeline** (Use for visualizing code deployment flows)\n"
-            "graph LR\n    %% --- Style Definitions ---\n    classDef vcsStyle fill:#fca311,stroke:#333,stroke-width:2px\n    classDef buildStyle fill:#14213d,stroke:#333,stroke-width:2px,color:white\n    classDef testStyle fill:#5a189a,stroke:#333,stroke-width:2px,color:white\n    classDef deployStyle fill:#008000,stroke:#333,stroke-width:2px,color:white\n\n    %% --- Core Structure ---\n    subgraph \\\"CI/CD Pipeline\\\"\n        A(Code Commit) --> B{Build Server}\n        B --> C(Run Tests)\n        C -- On Success --> D[Deploy to Staging]\n        D --> E((Production))\n    end\n\n    %% --- Apply Styles ---\n    class A vcsStyle\n    class B buildStyle\n    class C testStyle\n    class D,E deployStyle\n\n"
-            "**Template 6: General System Architecture** (Use as a flexible, high-level template for various architectures)\n"
-            "graph TD\n    %% --- Style Definitions ---\n    classDef sourceStyle fill:#8ecae6,stroke:#333,stroke-width:2px\n    classDef processStyle fill:#219ebc,stroke:#333,stroke-width:2px,color:white\n    classDef dataStyle fill:#023047,stroke:#333,stroke-width:2px,color:white\n    classDef consumerStyle fill:#ffb703,stroke:#333,stroke-width:2px\n\n    %% --- Core Structure ---\n    subgraph \\\"Data Ingestion\\\"\n        Input_Source([Input Source]):::sourceStyle\n    end\n\n    subgraph \\\"Core Processing\\\"\n        Processing_Unit[/Processing Unit/]:::processStyle\n        Data_Store[(Data Store)]:::dataStyle\n    end\n    \n    subgraph \\\"Data Consumption\\\"\n        System_Consumer([System Consumer]):::consumerStyle\n    end\n\n    %% --- Relationships ---\n    Input_Source --> Processing_Unit\n    Processing_Unit <--> Data_Store\n    Processing_Unit --> System_Consumer"
+            "\n\n**🧠 MERMAID DIAGRAM GENERATION - TOOL USAGE ONLY**\n"
+            "**CRITICAL: For ANY diagram generation, you MUST use the mermaid_generator tool. NEVER generate diagrams inline.**\n\n"
+            "**WHEN TO CREATE DIAGRAMS:**\n"
+            "Only generate diagrams when explicitly requested by the user OR when a visual representation would be significantly more helpful than text for explaining architecture, relationships, or complex flows.\n\n"
+            "**HOW TO CREATE DIAGRAMS:**\n"
+            "1. **ANALYZE THE REQUEST:** Determine diagram type needed (flowchart, graph, erDiagram, etc.)\n"
+            "2. **IDENTIFY COMPONENTS:** Extract nodes, relationships, and groupings from the information\n"
+            "3. **CALL THE TOOL:** Use mermaid_generator with diagram_type, nodes array, and edges array\n"
+            "4. **INCLUDE IN RESPONSE:** Extract the mermaid code from the tool result and add it as a diagram section: {\"type\": \"diagram\", \"format\": \"mermaid\", \"content\": \"<mermaid_code_here>\"}\n\n"
+            "**STEP 1: Generate the Structure (Unstyled)**\n"
+            "• Analyze & Classify: First, analyze the user's request to determine which scenario it best fits from the Template Library.\n"
+            "• Select Structural Template: You MUST select the corresponding Structural Template for that scenario. This is your required starting point. It contains only nodes and connections, with no styling.\n"
+            "• Modify the Structure: Adapt the structural template to match the user's request by renaming, adding, or removing nodes, and adding or changing connections. The output of this step should be a complete but unstyled Mermaid diagram.\n\n"
+            "**STEP 2: Apply the Styling**\n"
+            "• Get the Style Definitions: Find the Style Definitions that correspond to the template you chose in Step 1.\n"
+            "• Add Style Blocks: Copy the '%% --- Style Definitions ---' block to the top of the diagram and the '%% --- Apply Styles ---' block to the bottom.\n"
+            "• Intermediate Output: The result of this step is a single, complete Mermaid code block that is fully structured and styled.\n\n"
+            "**STEP 3: Verify the Final Output**\n"
+            "• Before providing the final output, you MUST verify that the generated Mermaid code strictly adheres to all rules listed in the 'Common Pitfalls & Syntax Rules' section. This is a mandatory final check to prevent errors.\n\n"
+            "**COMMON PITFALLS & SYNTAX RULES**\n"
+            "• Quotation Marks: To include a double quote (\") inside a node's label, you MUST use the HTML entity &quot;. Example: Node[\"A &quot;good&quot; label\"]\n"
+            "• Reserved Words: Words like 'graph', 'end', 'subgraph' are reserved. If you must use them in a label, enclose the label in quotes. Example: A --> B[\"end\"]\n"
+            "• Node IDs: A node's ID must be a single, unbroken string. Example: MyNode[\"This is the label\"]\n"
+            "• HTML Characters: To display characters like '<' or '>' in a label, use HTML entities &lt; and &gt; to avoid parsing errors.\n"
+            "• Closing Subgraphs: Every 'subgraph' MUST be closed with a corresponding 'end' keyword.\n\n"
+            "**TEMPLATE LIBRARY**\n\n"
+            "**Full-Stack Application**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    User([User])\n"
+            "    subgraph \"Primary Application\"\n"
+            "        direction LR\n"
+            "        WebApp[Frontend]\n"
+            "        Server[Backend API]\n"
+            "        Database[(Database)]\n"
+            "    end\n"
+            "    subgraph \"External Services\"\n"
+            "        PaymentGateway[(Payment Gateway)]\n"
+            "    end\n"
+            "    User --> WebApp\n"
+            "    WebApp --> Server\n"
+            "    Server --> Database\n"
+            "    Server -->|Processes Payment| PaymentGateway\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef userStyle fill:#99d98c,stroke:#333,stroke-width:2px\n"
+            "classDef frontendStyle fill:#76c893,stroke:#333,stroke-width:2px\n"
+            "classDef backendStyle fill:#52b69a,stroke:#333,stroke-width:2px\n"
+            "classDef dbStyle fill:#34a0a4,stroke:#333,stroke-width:2px\n"
+            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class User userStyle\n"
+            "class WebApp frontendStyle\n"
+            "class Server backendStyle\n"
+            "class Database dbStyle\n"
+            "class PaymentGateway externalStyle\n\n"
+            "**API / Microservice Interaction**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    ApiGateway[API Gateway]\n"
+            "    subgraph \"User Service\"\n"
+            "        ServiceA{{Authentication}}\n"
+            "    end\n"
+            "    subgraph \"Order Service\"\n"
+            "        ServiceB{{Order Processing}}\n"
+            "    end\n"
+            "    ThirdParty[(3rd Party API)]\n"
+            "    ApiGateway -->|Routes to| ServiceA\n"
+            "    ApiGateway -->|Routes to| ServiceB\n"
+            "    ServiceB -->|Fetches Data| ThirdParty\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef apiStyle fill:#1a759f,stroke:#333,stroke-width:2px,color:#fff\n"
+            "classDef serviceStyle fill:#184e77,stroke:#333,stroke-width:2px,color:#fff\n"
+            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class ApiGateway apiStyle\n"
+            "class ServiceA,ServiceB serviceStyle\n"
+            "class ThirdParty externalStyle\n\n"
+            "**Database Schema**\n"
+            "Structural Template:\n"
+            "erDiagram\n"
+            "    USERS {\n"
+            "        int id PK\n"
+            "        string username\n"
+            "    }\n"
+            "    POSTS {\n"
+            "        int id PK\n"
+            "        int user_id FK\n"
+            "    }\n"
+            "    USERS ||--o{ POSTS : \"writes\"\n\n"
+            "**Internal Component Flow**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    subgraph \"Backend Logic Flow\"\n"
+            "        direction LR\n"
+            "        A_Request[Request]\n"
+            "        B_Controller{Controller}\n"
+            "        C_Service[Service Logic]\n"
+            "        D_Model[(Data Model)]\n"
+            "    end\n"
+            "    A_Request --> B_Controller\n"
+            "    B_Controller --> C_Service\n"
+            "    C_Service --> D_Model\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef entrypointStyle fill:#ef476f,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef controllerStyle fill:#f78c6b,stroke:#333,stroke-width:2px\n"
+            "classDef serviceStyle fill:#ffd166,stroke:#333,stroke-width:2px\n"
+            "classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class A_Request entrypointStyle\n"
+            "class B_Controller controllerStyle\n"
+            "class C_Service serviceStyle\n"
+            "class D_Model modelStyle\n\n"
+            "**CI/CD Pipeline**\n"
+            "Structural Template:\n"
+            "graph LR\n"
+            "    subgraph \"CI/CD Pipeline\"\n"
+            "        A(Code Commit) --> B{Build Server}\n"
+            "        B --> C(Run Tests)\n"
+            "        C -- On Success --> D[Deploy to Staging]\n"
+            "        D --> E((Production))\n"
+            "    end\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef vcsStyle fill:#fca311,stroke:#333,stroke-width:2px\n"
+            "classDef buildStyle fill:#14213d,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef testStyle fill:#5a189a,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef deployStyle fill:#008000,stroke:#333,stroke-width:2px,color:white\n"
+            "%% --- Apply Styles ---\n"
+            "class A vcsStyle\n"
+            "class B buildStyle\n"
+            "class C testStyle\n"
+            "class D,E deployStyle\n\n"
+            "**General System Architecture**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    subgraph \"Data Ingestion\"\n"
+            "        Input_Source([Input Source])\n"
+            "    end\n"
+            "    subgraph \"Core Processing\"\n"
+            "        Processing_Unit[/Processing Unit/]\n"
+            "        Data_Store[(Data Store)]\n"
+            "    end\n"
+            "    subgraph \"Data Consumption\"\n"
+            "        System_Consumer([System Consumer])\n"
+            "    end\n"
+            "    Input_Source --> Processing_Unit\n"
+            "    Processing_Unit <--> Data_Store\n"
+            "    Processing_Unit --> System_Consumer\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef sourceStyle fill:#8ecae6,stroke:#333,stroke-width:2px\n"
+            "classDef processStyle fill:#219ebc,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef dataStyle fill:#023047,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef consumerStyle fill:#ffb703,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class Input_Source sourceStyle\n"
+            "class Processing_Unit processStyle\n"
+            "class Data_Store dataStyle\n"
+            "class System_Consumer consumerStyle"
         )
         
         # Add chat history if provided
@@ -2026,7 +2308,24 @@ class CerebrasNativeAgent:
                         
                         if should_block:
                             warning_msg = f"Info: {function_name} has been called {call_count} times with same parameters. Skipping to avoid excessive repetition."
-                            result = warning_msg
+                            
+                            # Special handling for mermaid_generator repetition
+                            if function_name == "mermaid_generator":
+                                # Try to repair and process the diagram one more time
+                                logger.info("🔧 Final attempt to repair mermaid diagram after repetition...")
+                                repaired_args = self._repair_truncated_json(function_args)
+                                if repaired_args:
+                                    try:
+                                        arguments = json.loads(repaired_args)
+                                        arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                        result = await self.available_functions[function_name](**arguments)
+                                        logger.info("✅ Final repair attempt successful!")
+                                    except Exception as e:
+                                        result = f"❌ **Diagram Generation Issue**: Multiple attempts to generate the diagram encountered technical limitations. Architecture analysis completed successfully. Technical details: {str(e)}"
+                                else:
+                                    result = "❌ **Diagram Data Issue**: Could not process diagram parameters. Architecture analysis completed successfully."
+                            else:
+                                result = warning_msg
                         else:
                             # Normalize known aliases (e.g., 'functions.smart_search' -> 'smart_search')
                             normalized_name = function_name
@@ -2048,6 +2347,22 @@ class CerebrasNativeAgent:
                                 except json.JSONDecodeError as e:
                                     result = f"Error parsing {function_name} arguments: {str(e)}"
                                     logger.error(f"JSON decode error for {function_name}: {function_args}")
+                                    
+                                    # Special handling for truncated mermaid diagrams - repair the JSON
+                                    if function_name == "mermaid_generator" and ("Expecting ',' delimiter" in str(e) or "Unterminated string" in str(e)):
+                                        logger.info("🔧 Attempting to repair truncated mermaid JSON...")
+                                        repaired_args = self._repair_truncated_json(function_args)
+                                        if repaired_args:
+                                            try:
+                                                arguments = json.loads(repaired_args)
+                                                arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                                result = await self.available_functions[function_name](**arguments)
+                                                logger.info("✅ Successfully repaired and processed mermaid diagram")
+                                            except Exception as repair_error:
+                                                logger.error(f"❌ Repair attempt failed: {repair_error}")
+                                                result = f"Error: Could not repair diagram data - {str(repair_error)}"
+                                        else:
+                                            result = "Error: Could not repair truncated diagram data"
                                 except TypeError as e:
                                     result = f"Error executing {function_name}: {str(e)}"
                                     logger.error(f"Parameter error for {function_name}: {arguments} -> {str(e)}")

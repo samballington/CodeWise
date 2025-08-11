@@ -12,6 +12,16 @@ from indexer.file_discovery import FileDiscoveryEngine, FileInfo
 from indexer.ast_chunker import ASTChunker, CodeChunk
 from indexer.complexity import choose_chunk_size
 
+# BM25 integration - conditional import with graceful fallback
+try:
+    # Import BM25Index from local copy
+    from bm25_index import BM25Index
+    BM25_AVAILABLE = True
+    print("[indexer] BM25Index successfully imported", flush=True)
+except ImportError as e:
+    print(f"[indexer] Warning: BM25Index not available: {e}", flush=True)
+    BM25_AVAILABLE = False
+
 # Load local embedder once
 _local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -102,6 +112,79 @@ def embed_batch(texts: List[str], batch_size: int = 100):
         print(f"[indexer] No embeddings generated, returning zero array", flush=True)
         return np.zeros((len(texts), 384), dtype="float32")
 
+def build_bm25_index_from_chunks(texts: List[str], enhanced_meta: List[dict]) -> bool:
+    """
+    Build BM25 index from the same data used for vector embeddings
+    
+    Args:
+        texts: List of text chunks (same as used for embeddings)
+        enhanced_meta: List of metadata dictionaries for each chunk
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not BM25_AVAILABLE:
+        print("[indexer] BM25Index not available, skipping BM25 index building", flush=True)
+        return False
+    
+    if not texts or not enhanced_meta or len(texts) != len(enhanced_meta):
+        print("[indexer] Warning: Invalid data for BM25 index building", flush=True)
+        return False
+    
+    try:
+        print(f"[indexer] Building BM25 index from {len(texts)} documents", flush=True)
+        
+        # Create BM25 documents from enhanced metadata
+        bm25_documents = []
+        for i, (text, meta) in enumerate(zip(texts, enhanced_meta)):
+            doc = {
+                'id': i,
+                'text': text,
+                'file_path': meta.get('file_path', ''),
+                'relative_path': meta.get('relative_path', ''),
+                'project': meta.get('project', ''),
+                'chunk_type': meta.get('chunk_type', 'unknown'),
+                'function_name': meta.get('function_name'),
+                'class_name': meta.get('class_name'),
+                'file_type': meta.get('file_type', 'unknown'),
+                'metadata': {
+                    'start_line': meta.get('start_line', 0),
+                    'end_line': meta.get('end_line', 0),
+                    'imports': meta.get('imports', []),
+                    'parent_context': meta.get('parent_context'),
+                    'dependencies': meta.get('dependencies', []),
+                    'docstring': meta.get('docstring'),
+                    'decorators': meta.get('decorators', [])
+                }
+            }
+            bm25_documents.append(doc)
+        
+        # Build BM25 index
+        bm25_index = BM25Index()
+        bm25_index.add_documents(bm25_documents)
+        
+        # Get statistics before saving
+        stats = bm25_index.get_statistics()
+        
+        # Save to cache directory (same location as vector index)
+        bm25_file = CACHE_DIR / "bm25_index.json"
+        success = bm25_index.save_index(bm25_file)
+        
+        if success:
+            print(f"[indexer] BM25 index built successfully:", flush=True)
+            print(f"  - Documents: {stats['total_documents']}", flush=True)
+            print(f"  - Vocabulary: {stats['vocabulary_size']} unique terms", flush=True)
+            print(f"  - Average doc length: {stats['average_document_length']:.1f} terms", flush=True)
+            print(f"  - Saved to: {bm25_file}", flush=True)
+            return True
+        else:
+            print("[indexer] Failed to save BM25 index", flush=True)
+            return False
+            
+    except Exception as e:
+        print(f"[indexer] Error building BM25 index: {e}", flush=True)
+        return False
+
 def build_index(project: str | None = None):
     global _build_lock, _pending_rebuild
     if _build_lock:
@@ -110,9 +193,46 @@ def build_index(project: str | None = None):
         _pending_rebuild = True
         return
     _build_lock = True
-    print("[indexer] building vector index with AST chunking…", flush=True)
+    
+    # Determine build mode
+    if project is None:
+        print("[indexer] building FULL vector index with AST chunking…", flush=True)
+        build_mode = "full"
+    else:
+        print(f"[indexer] building INCREMENTAL vector index for project '{project}' with AST chunking…", flush=True)
+        build_mode = "incremental"
+    
     texts: List[str] = []
     enhanced_meta: List[dict] = []  # Enhanced metadata with chunk information
+    
+    # For incremental builds, load existing data first
+    existing_texts = []
+    existing_meta = []
+    if build_mode == "incremental" and INDEX_FILE.exists() and META_FILE.exists():
+        try:
+            print(f"[indexer] Loading existing index for incremental build...", flush=True)
+            with META_FILE.open("r", encoding="utf-8") as f:
+                existing_meta = json.load(f)
+            
+            # Remove existing chunks for this project to avoid duplicates
+            filtered_meta = []
+            removed_count = 0
+            for meta in existing_meta:
+                meta_project = meta.get("project", "")
+                if meta_project != project:
+                    filtered_meta.append(meta)
+                    existing_texts.append(meta.get("chunk_text", ""))
+                else:
+                    removed_count += 1
+            
+            existing_meta = filtered_meta
+            print(f"[indexer] Loaded {len(existing_meta)} existing chunks, removed {removed_count} chunks from project '{project}'", flush=True)
+            
+        except Exception as e:
+            print(f"[indexer] Warning: Could not load existing index for incremental build: {e}. Falling back to full rebuild.", flush=True)
+            build_mode = "full"
+            existing_texts = []
+            existing_meta = []
     
     # Initialize AST chunker
     ast_chunker = ASTChunker()
@@ -122,18 +242,16 @@ def build_index(project: str | None = None):
     if project and not root_dir.exists():
         print(f"[indexer] Requested project '{project}' not found – falling back to whole workspace", flush=True)
         root_dir = WORKSPACE
+        build_mode = "full"
     
     # Discover files within the requested scope
     if root_dir == WORKSPACE:
         discovered_files = discover_files()
     else:
-        # Temporarily override WORKSPACE for discovery
-        original_workspace = WORKSPACE
-        try:
-            globals()["WORKSPACE"] = root_dir
-            discovered_files = discover_files()
-        finally:
-            globals()["WORKSPACE"] = original_workspace
+        # Create scoped discovery engine for single project
+        from indexer.file_discovery import FileDiscoveryEngine
+        discovery_engine = FileDiscoveryEngine(root_dir)
+        discovered_files = discovery_engine.discover_files()
     
     total_chunks = 0
     processed_files = 0
@@ -205,7 +323,7 @@ def build_index(project: str | None = None):
                 except Exception:
                     full_rel_path = file_info.relative_path  # Fallback
 
-                # Derive project name (first path component)
+                # Derive project name (first path component) - fixed to use WORKSPACE consistently
                 project_name = full_rel_path.split("/", 1)[0].split("\\", 1)[0]
 
                 # Create enhanced metadata (now includes project)
@@ -267,13 +385,23 @@ def build_index(project: str | None = None):
                 enhanced_meta.append(chunk_meta)
                 total_chunks += 1
     
-    if not texts:
+    # Combine with existing data for incremental builds
+    if build_mode == "incremental" and existing_texts:
+        all_texts = existing_texts + texts
+        all_meta = existing_meta + enhanced_meta
+        print(f"[indexer] Incremental build: {len(existing_texts)} existing + {len(texts)} new = {len(all_texts)} total chunks", flush=True)
+    else:
+        all_texts = texts
+        all_meta = enhanced_meta
+        print(f"[indexer] Full build: {len(all_texts)} total chunks", flush=True)
+    
+    if not all_texts:
         print("[indexer] no text files found")
         return
         
     print(f"[indexer] processed {processed_files} files into {total_chunks} intelligent chunks", flush=True)
     
-    if not texts:
+    if not all_texts:
         print("[indexer] no text chunks to embed")
         return
     
@@ -291,8 +419,8 @@ def build_index(project: str | None = None):
                 checkpoint_data = json.load(f)
             
             # Verify checkpoint matches current data
-            if (checkpoint_data.get("total_chunks") == len(texts) and 
-                checkpoint_data.get("metadata_hash") == hash(str(enhanced_meta))):
+            if (checkpoint_data.get("total_chunks") == len(all_texts) and 
+                checkpoint_data.get("metadata_hash") == hash(str(all_meta))):
                 
                 start_batch = checkpoint_data.get("completed_batches", 0)
                 if start_batch > 0:
@@ -313,17 +441,17 @@ def build_index(project: str | None = None):
             checkpoint_file.unlink(missing_ok=True)
             progress_file.unlink(missing_ok=True)
     
-    print(f"[indexer] generating embeddings for {len(texts)} chunks with batch processing", flush=True)
+    print(f"[indexer] generating embeddings for {len(all_texts)} chunks with batch processing", flush=True)
     
     # Process embeddings with checkpointing
     batch_size = 100
-    total_batches = (len(texts) + batch_size - 1) // batch_size
+    total_batches = (len(all_texts) + batch_size - 1) // batch_size
     all_embeddings = existing_embeddings.copy()
     
     for batch_idx in range(start_batch, total_batches):
         start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(texts))
-        batch_texts = texts[start_idx:end_idx]
+        end_idx = min(start_idx + batch_size, len(all_texts))
+        batch_texts = all_texts[start_idx:end_idx]
         
         print(f"[indexer] Processing embedding batch {batch_idx + 1}/{total_batches} ({len(batch_texts)} chunks)", flush=True)
         
@@ -336,9 +464,9 @@ def build_index(project: str | None = None):
             
             # Save checkpoint after each batch
             checkpoint_data = {
-                "total_chunks": len(texts),
+                "total_chunks": len(all_texts),
                 "completed_batches": batch_idx + 1,
-                "metadata_hash": hash(str(enhanced_meta)),
+                "metadata_hash": hash(str(all_meta)),
                 "timestamp": time.time()
             }
             
@@ -378,32 +506,53 @@ def build_index(project: str | None = None):
     
     # Save enhanced metadata
     with META_FILE.open("w", encoding="utf-8") as f:
-        json.dump(enhanced_meta, f, indent=2)
+        json.dump(all_meta, f, indent=2)
     
     # Clean up checkpoint files on successful completion
     checkpoint_file.unlink(missing_ok=True)
     progress_file.unlink(missing_ok=True)
     
-    print(f"[indexer] index built with {len(texts)} chunks using AST-based chunking", flush=True)
+    print(f"[indexer] index built with {len(all_texts)} chunks using AST-based chunking", flush=True)
+    
+    # Build BM25 index from the same data (if available and data exists)
+    if all_texts and all_meta:
+        bm25_success = build_bm25_index_from_chunks(all_texts, all_meta)
+        if bm25_success:
+            print("[indexer] Successfully built both vector and BM25 indexes", flush=True)
+        else:
+            print("[indexer] Vector index built successfully, BM25 index failed (continuing)", flush=True)
+    else:
+        print("[indexer] No data available for BM25 index building", flush=True)
     
     # Log chunking statistics
     chunk_types = {}
     file_types = {}
-    for meta in enhanced_meta:
+    projects_indexed = set()
+    for meta in all_meta:
         chunk_type = meta.get("chunk_type", "unknown")
         file_type = meta.get("file_type", "unknown")
+        project_name = meta.get("project", "unknown")
         chunk_types[chunk_type] = chunk_types.get(chunk_type, 0) + 1
         file_types[file_type] = file_types.get(file_type, 0) + 1
+        projects_indexed.add(project_name)
     
     print(f"[indexer] Chunk types: {dict(chunk_types)}")
     print(f"[indexer] File types: {dict(file_types)}")
+    print(f"[indexer] Projects indexed: {sorted(projects_indexed)}")
+    
+    # Check if BM25 index exists
+    bm25_exists = (CACHE_DIR / "bm25_index.json").exists()
+    bm25_status = "✅ Built" if bm25_exists else "❌ Missing"
+    
     print(f"[indexer] Summary: {processed_files} processed, {failed_files} failed, {total_chunks} chunks created", flush=True)
+    print(f"[indexer] Indexes: Vector ✅ Built | BM25 {bm25_status}", flush=True)
 
-    # Record which top-level projects are indexed
-    projects = [p.name for p in Path(WORKSPACE).iterdir() if p.is_dir() and not p.name.startswith('.')]
+    # Record which projects are actually indexed (based on metadata, not directory listing)
     idx_file = CACHE_DIR / "indexed_projects.json"
     try:
-        idx_file.write_text(json.dumps(projects))
+        projects_list = sorted(list(projects_indexed))
+        idx_file.write_text(json.dumps(projects_list))
+        print(f"[indexer] Updated indexed_projects.json with {len(projects_list)} projects: {projects_list}")
     except Exception as e:
         print(f"[indexer] Warning: could not write indexed_projects.json: {e}")
     _build_lock = False
