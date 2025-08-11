@@ -235,8 +235,8 @@ class QueryIntentAnalyzer:
     
     def _determine_search_strategies(self, intent: QueryIntent, confidence: float, query: str) -> List[str]:
         """Determine optimal search strategies based on intent"""
-        strategies = []
-        
+        strategies: List[str] = []
+
         if intent == QueryIntent.ENTITY:
             strategies = ['entity_discovery', 'vector_search', 'bm25_search']
         elif intent == QueryIntent.FILE:
@@ -245,11 +245,18 @@ class QueryIntentAnalyzer:
             strategies = ['vector_search', 'structure_analysis', 'bm25_search']
         else:  # GENERAL
             strategies = ['vector_search', 'bm25_search']
-        
-        # Add hybrid search for high-confidence queries
-        if confidence > 0.7:
+
+        # Heuristic: if the query likely targets an exact filename/extension or uses quotes, prefer hybrid
+        q = query.lower()
+        has_exact_filename = bool(re.search(r"\b\w+\.(xml|properties|gradle|md|yml|yaml|json|toml|ini|cfg)\b", q))
+        has_quotes = ('"' in query) or ("'" in query)
+
+        if has_exact_filename or has_quotes or (intent == QueryIntent.FILE and confidence >= 0.6):
+            if 'hybrid_search' not in strategies:
+                strategies.insert(0, 'hybrid_search')
+        elif confidence > 0.7:
             strategies.insert(0, 'hybrid_search')
-        
+
         return strategies
 
 
@@ -579,17 +586,51 @@ class SmartSearchEngine:
         
         # Apply project filtering if mentioned_projects is provided
         if mentioned_projects:
-            project_filtered_results = []
+            # Ensure project context is set prior to filtering for consistent behavior
+            try:
+                context_manager = get_context_manager()
+                primary_project = mentioned_projects[0]
+                context_manager.set_project_context(primary_project, mentioned_projects)
+            except Exception as e:
+                logger.debug(f"Project context setup skipped due to error: {e}")
+
+            project_filtered_results: List[SmartSearchResult] = []
+            filtered_out_count = 0
+
             for result in final_results:
-                result_project = self._extract_project_from_path(result.file_path)
-                if result_project in mentioned_projects:
+                # Normalize file path to absolute workspace path for reliable context checks
+                file_path = result.file_path
+                if not file_path.startswith('/workspace/'):
+                    file_path = f"/workspace/{file_path.lstrip('/')}"
+
+                # Use centralized context manager for consistent scoping
+                in_context = True
+                try:
+                    in_context = get_context_manager().is_file_in_current_context(file_path)
+                except Exception:
+                    # Fallback: best-effort project extraction if context manager not available
+                    result_project = self._extract_project_from_path(file_path)
+                    in_context = result_project in set(mentioned_projects)
+
+                if in_context:
                     project_filtered_results.append(result)
-            
+                    logger.debug(f"✅ INCLUDED: {file_path}")
+                else:
+                    filtered_out_count += 1
+                    logger.debug(f"🚫 FILTERED OUT: {file_path}")
+
             if project_filtered_results:
-                logger.info(f"🎯 PROJECT FILTERING COMPLETE: {len(final_results)} -> {len(project_filtered_results)} results for projects {mentioned_projects}")
+                logger.info(
+                    f"🎯 PROJECT FILTERING COMPLETE: {len(final_results)} -> {len(project_filtered_results)} "
+                    f"results for projects {mentioned_projects} (excluded: {filtered_out_count})"
+                )
                 filtered_results = project_filtered_results
             else:
-                logger.warning(f"⚠️ PROJECT FILTERING: No results found for projects {mentioned_projects}, keeping all results")
+                # Keep results to avoid empty responses, but downgrade message severity
+                logger.debug(
+                    f"PROJECT FILTERING yielded 0 matches for projects {mentioned_projects}; "
+                    f"returning unfiltered results ({len(final_results)})"
+                )
                 filtered_results = final_results
         else:
             filtered_results = final_results
@@ -766,7 +807,7 @@ class SmartSearchEngine:
     async def _hybrid_search_strategy(self, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
         """Execute hybrid search strategy"""
         try:
-            search_results = self.hybrid_search.search(query, k=self.max_results)
+            search_results = await self.hybrid_search.search(query, k=self.max_results)
             return [
                 SmartSearchResult(
                     chunk_id=result.chunk_id,
@@ -841,10 +882,42 @@ class SmartSearchEngine:
             return []
     
     async def _bm25_search_strategy(self, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
-        """Execute BM25 search strategy"""
-        # This would use the BM25 index directly if needed
-        # For now, rely on hybrid search which includes BM25
-        return []
+        """Execute BM25 search strategy using HybridSearchEngine's BM25 index."""
+        try:
+            # Access BM25 index from hybrid engine
+            bm25 = getattr(self.hybrid_search, "bm25_index", None)
+            if bm25 is None:
+                return []
+
+            bm25_results = bm25.search(query, k=self.max_results)
+
+            # Normalize BM25 scores to 0-1 range for confidence
+            scores = [r.score for r in bm25_results] if bm25_results else []
+            max_score = max(scores) if scores else 1.0
+            min_score = min(scores) if scores else 0.0
+            denom = (max_score - min_score) or 1.0
+
+            results: List[SmartSearchResult] = []
+            for r in bm25_results:
+                norm = (r.score - min_score) / denom
+                results.append(
+                    SmartSearchResult(
+                        chunk_id=r.chunk_id,
+                        file_path=r.file_path,
+                        snippet=r.snippet,
+                        relevance_score=norm,
+                        query_intent=analysis['intent'],
+                        search_strategy=['bm25'],
+                        matched_terms=r.matched_terms,
+                        metadata={'search_type': 'bm25', 'raw_score': r.score},
+                        confidence=norm,
+                    )
+                )
+
+            return results
+        except Exception as e:
+            logger.error(f"BM25 search failed: {e}")
+            return []
     
     async def _file_search_strategy(self, query: str, analysis: Dict[str, Any]) -> List[SmartSearchResult]:
         """Execute file search strategy for file-specific queries"""

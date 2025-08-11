@@ -8,6 +8,7 @@ export interface Message {
   isError?: boolean
   isComplete?: boolean
   isProcessing?: boolean
+  structuredResponse?: any
   contextData?: {
     sources?: string[]
     chunksFound?: number

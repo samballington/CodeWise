@@ -468,7 +468,7 @@ class ContextDeliverySystem:
         self.default_min_relevance = 0.3
         self.default_max_results = 10
         
-    def prepare_context(self, query: str, max_tokens: int = None, 
+    async def prepare_context(self, query: str, max_tokens: int = None, 
                        min_relevance: float = None, max_results: int = None) -> ContextPackage:
         """
         Prepare optimized context for LLM consumption
@@ -492,7 +492,7 @@ class ContextDeliverySystem:
         
         try:
             # Perform hybrid search
-            search_results = self.hybrid_search.search(
+            search_results = await self.hybrid_search.search(
                 query, k=max_results, min_relevance=min_relevance * 0.8  # Lower threshold for search
             )
             

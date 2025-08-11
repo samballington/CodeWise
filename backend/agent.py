@@ -1047,7 +1047,7 @@ class CodeWiseAgent:
         if self.hybrid_search:
             try:
                 logger.info(f"Attempting hybrid search with threshold {base_threshold}")
-                search_results = self.hybrid_search.search(search_query, k=4, min_relevance=base_threshold)
+                search_results = await self.hybrid_search.search(search_query, k=4, min_relevance=base_threshold)
                 chunks = [(result.file_path, result.snippet) for result in search_results]
                 search_attempts.append(f"Hybrid search: {len(chunks)} results")
                 logger.info(f"Hybrid search successful: {len(chunks)} results found")
@@ -1086,7 +1086,7 @@ class CodeWiseAgent:
                 
                 try:
                     if self.hybrid_search:
-                        term_results = self.hybrid_search.search(term, k=2, min_relevance=term_threshold)
+                        term_results = await self.hybrid_search.search(term, k=2, min_relevance=term_threshold)
                         term_chunks = [(result.file_path, result.snippet) for result in term_results]
                     else:
                         term_chunks = get_vector_store().query(term, k=2, min_relevance=term_threshold)
@@ -1243,13 +1243,13 @@ class CodeWiseAgent:
         
         return "\n".join(context_parts)
 
-    def _search_code_with_summary(self, query: str) -> str:
+    async def _search_code_with_summary(self, query: str) -> str:
         """Search code and return both raw results and summary"""
         if self.hybrid_search is None:
             return f"Code search not available. Using fallback directory summary: {self._get_directory_fallback_summary(query)}"
         
         try:
-            results = self.hybrid_search.search(query, k=10)
+            results = await self.hybrid_search.search(query, k=10)
             if not results:
                 return f"No code snippets found for query: {query}. Using fallback directory summary: {self._get_directory_fallback_summary(query)}"
             
@@ -1471,11 +1471,8 @@ class CodeWiseAgent:
             Tool(
                 name="code_search",
                 description="Retrieve up to 10 relevant code snippets from the project for a natural language query. Use this for initial exploration and to find files related to your query. Always try multiple search terms if first search doesn't yield enough results.",
-                func=lambda x: self._search_code_with_summary(x),
-                coroutine=lambda x: asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self._search_code_with_summary(x),
-                ),
+                func=lambda x: self._run_async_safe(self._search_code_with_summary(x)),
+                coroutine=lambda x: self._search_code_with_summary(x),
             ),
             Tool(
                 name="file_glimpse",

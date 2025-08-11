@@ -26,8 +26,13 @@ from enhanced_project_structure import EnhancedProjectStructure
 from backend.smart_search import smart_search
 from backend.path_resolver import PathResolver
 from backend.response_formatter import ResponseFormatter, StandardizedResponse
+from backend.tools.mermaid_generator import create_mermaid_diagram
+from backend.json_prompt_schema import parse_json_prompt
+from backend.json_prompt_postprocess import improve_json_prompt_readability
+from backend.response_consolidator import ResponseConsolidator, ResponseSource
 from backend.discovery_pipeline import DiscoveryPipeline
 from backend.query_context_manager import QueryContextManager
+from backend.table_generator import TableGenerator, StructuredTable, FileReference
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +41,7 @@ class CerebrasNativeAgent:
     """Native Cerebras agent with proper tool calling support"""
     
     def __init__(self, api_key: str, mcp_server_url: str):
-        self.client = Cerebras(api_key=api_key)
+        self.client = Cerebras(api_key=api_key, timeout=30.0)  # 30 second timeout to prevent hanging
         self.mcp_server_url = mcp_server_url
         self.tools_schema = self._create_tools_schema()
         self.available_functions = self._create_function_mapping()
@@ -75,6 +80,76 @@ class CerebrasNativeAgent:
             'entities_found': []
         }
     
+    def _repair_truncated_json(self, truncated_json: str) -> str:
+        """Attempt to repair truncated JSON for mermaid diagrams"""
+        try:
+            # Remove any trailing incomplete text
+            json_str = truncated_json.strip()
+            
+            # Find the last complete object/array structure
+            bracket_count = 0
+            brace_count = 0
+            last_valid_pos = 0
+            in_string = False
+            escape_next = False
+            
+            for i, char in enumerate(json_str):
+                if escape_next:
+                    escape_next = False
+                    continue
+                
+                if char == '\\' and in_string:
+                    escape_next = True
+                    continue
+                
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                
+                if not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                    elif char == '[':
+                        bracket_count += 1
+                    elif char == ']':
+                        bracket_count -= 1
+                    
+                    # Check if we have a complete structure
+                    if brace_count == 0 and bracket_count == 0 and i > 0:
+                        last_valid_pos = i + 1
+            
+            # If we found a complete structure, use it
+            if last_valid_pos > 0:
+                repaired = json_str[:last_valid_pos]
+                logger.info(f"🔧 JSON repair: truncated from {len(json_str)} to {len(repaired)} chars")
+                return repaired
+            
+            # Otherwise, attempt to close unclosed structures
+            repaired = json_str
+            
+            # Close unclosed strings
+            if in_string:
+                repaired += '"'
+            
+            # Close unclosed arrays
+            while bracket_count > 0:
+                repaired += ']'
+                bracket_count -= 1
+            
+            # Close unclosed objects
+            while brace_count > 0:
+                repaired += '}'
+                brace_count -= 1
+            
+            logger.info(f"🔧 JSON repair: added {len(repaired) - len(json_str)} closing characters")
+            return repaired
+            
+        except Exception as e:
+            logger.error(f"❌ JSON repair failed: {e}")
+            return None
+
     async def _call_mcp_tool_wrapper(self, tool_name: str, params):
         """Wrapper method for MCP tool calls to match the expected signature"""
         if tool_name == "run_command":
@@ -411,16 +486,104 @@ class CerebrasNativeAgent:
                         "required": []
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "mermaid_generator",
+                    "description": "Generate professional Mermaid.js diagrams from structured data. Converts semantic diagram descriptions into syntactically correct, styled Mermaid code using predefined templates.",
+                    "parameters": {
+                        "type": "object", 
+                        "properties": {
+                            "diagram_type": {
+                                "type": "string",
+                                "enum": ["Full-Stack Application", "API / Microservice Interaction", "Database Schema", "Internal Component Flow", "CI/CD Pipeline", "General System Architecture"],
+                                "description": "The type of diagram template to use for styling and structure"
+                            },
+                            "nodes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string", "description": "Unique alphanumeric identifier"},
+                                        "label": {"type": "string", "description": "Display text (will be auto-escaped)"},
+                                        "shape": {"type": "string", "enum": ["square", "round-edge", "database", "rhombus", "circle", "hexagon"], "description": "Mermaid node shape"},
+                                        "group": {"type": "string", "description": "Optional subgraph name"}
+                                    },
+                                    "required": ["id", "label"]
+                                },
+                                "description": "List of all diagram nodes/components"
+                            },
+                            "edges": {
+                                "type": "array", 
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "from": {"type": "string", "description": "Source node ID"},
+                                        "to": {"type": "string", "description": "Target node ID"}, 
+                                        "label": {"type": "string", "description": "Optional edge label"}
+                                    },
+                                    "required": ["from", "to"]
+                                },
+                                "description": "List of connections between nodes"
+                            }
+                        },
+                        "required": ["diagram_type", "nodes", "edges"]
+                    }
+                }
             }
         ]
     
     def _create_function_mapping(self) -> Dict[str, callable]:
-        """Map function names to simplified 3-tool implementations"""
+        """Map function names to simplified 4-tool implementations"""
         return {
             "smart_search": self._smart_search_router,  # Context-aware router
             "examine_files": self._examine_files,
-            "analyze_relationships": self._analyze_relationships
+            "analyze_relationships": self._analyze_relationships,
+            "mermaid_generator": self._mermaid_generator_wrapper
         }
+    
+    async def _mermaid_generator_wrapper(self, diagram_type: str, nodes: List[Dict], edges: List[Dict]) -> str:
+        """Async wrapper for mermaid generator tool"""
+        try:
+            # Validate input
+            if not nodes:
+                return "❌ **Error**: No nodes provided for diagram generation"
+               
+            if not edges:
+                return "❌ **Error**: No edges provided for diagram generation"
+            
+            logger.info(f"🎨 Generating {diagram_type} diagram with {len(nodes)} nodes and {len(edges)} edges")
+            
+            # Call the tool
+            diagram_data = {
+                "diagram_type": diagram_type,
+                "nodes": nodes,
+                "edges": edges
+            }
+            
+            result = create_mermaid_diagram(diagram_data)
+            
+            # Format for structured response
+            response = f"✅ **Mermaid Diagram Generated Successfully**\n\n"
+            response += f"**📊 Diagram Details:**\n"
+            response += f"- **Type:** {diagram_type}\n"
+            response += f"- **Nodes:** {len(nodes)} components\n"
+            response += f"- **Connections:** {len(edges)} relationships\n"
+            response += f"- **Diagram Length:** {len(result)} characters\n\n"
+            response += "```mermaid\n"
+            response += result
+            response += "\n```"
+            
+            logger.info(f"🎨 Successfully generated Mermaid diagram ({len(result)} chars)")
+            return response
+            
+        except ValueError as ve:
+            logger.error(f"Mermaid validation error: {ve}")
+            return f"❌ **Mermaid Validation Error:** {str(ve)}\n\nPlease check your input data format and try again."
+        except Exception as e:
+            logger.error(f"Mermaid generator error: {e}")
+            return f"❌ **Mermaid Generation Failed:** {str(e)}\n\nThe diagram could not be generated. Please verify your input data."
     
     async def _smart_search_router(self, query: str, max_results: int = 10) -> str:
         """Route to context-aware or legacy smart search based on availability"""
@@ -497,44 +660,54 @@ class CerebrasNativeAgent:
                 
                 return f"❌ **No results found**{filter_msg} for query: '{query}'\n\n📊 **Search Analysis:**\n- Intent: {intent_for_fallback.title()}\n- Strategies: {', '.join(strategies_used)}\n- Results: 0 matches{fallback_msg}"
             
-            # Format results (same as legacy)
-            formatted_results = []
-            formatted_results.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} matches)")
-            formatted_results.append(f"📊 **Query Analysis:** Intent={query_analysis['intent'].value}, Confidence={query_analysis['confidence']:.2f}")
-            formatted_results.append(f"🎯 **Strategies Used:** {', '.join(strategies_used)}")
+            # Create structured response with both markdown and JSON table
+            markdown_summary = []
+            markdown_summary.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} matches)")
+            markdown_summary.append(f"📊 **Query Analysis:** Intent={query_analysis['intent'].value}, Confidence={query_analysis['confidence']:.2f}")
+            markdown_summary.append(f"🎯 **Strategies Used:** {', '.join(strategies_used)}")
             
             if auto_examine_files:
-                formatted_results.append(f"🔍 **Discovery Pipeline:** Found {len(auto_examine_files)} files for auto-examination")
-            
-            formatted_results.append("")
-            
-            for i, result in enumerate(results[:max_results], 1):
-                file_display = result.file_path.replace('/workspace/', '')
-                strategies_display = ', '.join(result.search_strategy) if hasattr(result, 'search_strategy') else 'hybrid'
-                
-                formatted_results.append(f"**{i}. {file_display}** (score: {result.relevance_score:.3f}, strategy: {strategies_display})")
-                
-                if hasattr(result, 'matched_terms') and result.matched_terms:
-                    terms_display = ', '.join(result.matched_terms[:3])
-                    if len(result.matched_terms) > 3:
-                        terms_display += f" (+{len(result.matched_terms)-3} more)"
-                    formatted_results.append(f"   📌 Matched: {terms_display}")
-                
-                # Format snippet with syntax highlighting
-                snippet = result.snippet[:200] + "..." if len(result.snippet) > 200 else result.snippet
-                file_ext = result.file_path.split('.')[-1] if '.' in result.file_path else 'txt'
-                highlighted_snippet = self._apply_syntax_highlighting(snippet, file_ext)
-                formatted_results.append(f"   ```{file_ext}\n   {highlighted_snippet}\n   ```")
-                formatted_results.append("")
+                markdown_summary.append(f"🔍 **Discovery Pipeline:** Found {len(auto_examine_files)} files for auto-examination")
             
             execution_time = search_result.get('execution_time', 0)
-            formatted_results.append(f"⚡ **Execution time:** {execution_time:.2f}s")
+            markdown_summary.append(f"⚡ **Execution time:** {execution_time:.2f}s")
             
             # Add auto-examine suggestion if files were found
             if auto_examine_files and len(auto_examine_files) > 0:
-                formatted_results.append(f"\n💡 **Auto-Examine Suggestion:** The discovery pipeline found {len(auto_examine_files)} related files. Consider examining them for deeper insights.")
+                markdown_summary.append(f"\n💡 **Auto-Examine Suggestion:** The discovery pipeline found {len(auto_examine_files)} related files. Consider examining them for deeper insights.")
             
-            result_text = "\n".join(formatted_results)
+            # Create structured table for search results
+            search_table = TableGenerator.create_search_results_table(
+                [
+                    {
+                        'file_path': result.file_path.replace('/workspace/', ''),
+                        'relevance_score': result.relevance_score,
+                        'snippet': result.snippet,
+                        'matched_terms': getattr(result, 'matched_terms', []),
+                        'search_strategy': getattr(result, 'search_strategy', ['hybrid'])
+                    } 
+                    for result in results[:max_results]
+                ],
+                title="Search Results"
+            )
+            
+            # Create file references for JSON
+            file_refs = [
+                FileReference(
+                    path=result.file_path.replace('/workspace/', ''),
+                    line_start=getattr(result, 'line_start', None),
+                    line_end=getattr(result, 'line_end', None)
+                )
+                for result in results[:max_results]
+            ]
+            
+            # Combine markdown and structured data
+            markdown_content = "\n".join(markdown_summary)
+            result_text = TableGenerator.wrap_response_with_structured_data(
+                markdown_content,
+                tables=[search_table],
+                references=file_refs
+            )
             logger.info(f"✅ CONTEXT-AWARE SMART SEARCH COMPLETE: {len(results)} results, {execution_time:.2f}s")
             return result_text
             
@@ -596,41 +769,30 @@ class CerebrasNativeAgent:
                 
                 return f"No results found for query '{query}'{filter_msg}.\n\nQuery Analysis:\n- Intent: {intent_for_fallback}\n- Confidence: {query_analysis['confidence']:.2f}\n- Strategies tried: {', '.join(strategies_used)}\n\n💡 TIP: Other tools can use smart fallbacks based on the detected intent."
             
-            # Format results with enhanced structure and relevance scoring
-            formatted_results = []
-            formatted_results.append(f"🧠 SMART SEARCH RESULTS ({len(results)} found)")
-            formatted_results.append(f"📊 Query Analysis:")
-            formatted_results.append(f"   • Intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
-            formatted_results.append(f"   • Strategies: {', '.join(strategies_used)}")
-            formatted_results.append(f"   • Execution Time: {search_result.get('execution_time', 0):.2f}s")
-            formatted_results.append("=" * 70)
+            # Create structured table for search results
+            search_table = TableGenerator.create_search_results_table([
+                {
+                    'file_path': result.file_path.replace('/workspace/', ''),
+                    'relevance_score': result.confidence,
+                    'snippet': result.snippet,
+                    'matched_terms': getattr(result, 'matched_terms', []),
+                    'search_strategy': result.search_strategy
+                } 
+                for result in results[:max_results]
+            ], title="Smart Search Results")
+            
+            # Build markdown response with metadata
+            markdown_parts = []
+            markdown_parts.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} found)")
+            markdown_parts.append(f"📊 **Query Analysis:**")
+            markdown_parts.append(f"   • Intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
+            markdown_parts.append(f"   • Strategies: {', '.join(strategies_used)}")
+            markdown_parts.append(f"   • Execution Time: {search_result.get('execution_time', 0):.2f}s")
+            markdown_parts.append("")
             
             # Store main files for potential relationship analysis
             main_files = []
-            for i, result in enumerate(results, 1):
-                # Calculate relevance tier
-                if result.confidence >= 0.8:
-                    relevance_tier = "🟢 HIGH"
-                elif result.confidence >= 0.6:
-                    relevance_tier = "🟡 MEDIUM" 
-                else:
-                    relevance_tier = "🔴 LOW"
-                
-                strategies_str = ', '.join(result.search_strategy)
-                formatted_results.append(f"\n📄 RESULT #{i}: {result.file_path}")
-                formatted_results.append(f"   🎯 Relevance: {relevance_tier} ({result.confidence:.3f})")
-                formatted_results.append(f"   🔍 Strategy: {strategies_str}")
-                if result.matched_terms:
-                    formatted_results.append(f"   🏷️  Matched Terms: {', '.join(result.matched_terms)}")
-                formatted_results.append(f"   📝 Code Snippet:")
-                # Indent snippet for better readability
-                snippet_lines = result.snippet.split('\n')
-                for line in snippet_lines[:10]:  # Limit to 10 lines
-                    formatted_results.append(f"      {line}")
-                if len(snippet_lines) > 10:
-                    formatted_results.append(f"      ... ({len(snippet_lines) - 10} more lines)")
-                formatted_results.append("   " + "─" * 60)
-                
+            for result in results:
                 # Collect high-confidence files as potential main files
                 if result.confidence > 0.7:
                     main_files.append(result.file_path)
@@ -639,10 +801,10 @@ class CerebrasNativeAgent:
             
             # Add project filter info if applicable
             if self.current_mentioned_projects:
-                formatted_results.append(f"\n[Filtered for projects: {', '.join(self.current_mentioned_projects)}]")
+                markdown_parts.append(f"[Filtered for projects: {', '.join(self.current_mentioned_projects)}]")
             
             # Add tool chaining hint
-            formatted_results.append(f"\n💡 DISCOVERED: {len(discovered_files)} files ready for examination")
+            markdown_parts.append(f"💡 **DISCOVERED:** {len(discovered_files)} files ready for examination")
             
             # NEW: Auto-examination integration for Task 5 Extension
             logger.info(f"🔍 AUTO-EXAMINATION DEBUG: auto_examine_files = {auto_examine_files}")
@@ -650,8 +812,9 @@ class CerebrasNativeAgent:
             
             if auto_examine_files and len(auto_examine_files) > 0:
                 logger.info(f"🔍 AUTO-EXAMINATION: CONDITION MET - Starting examination of {len(auto_examine_files)} files")
-                formatted_results.append(f"\n🔍 DISCOVERY PIPELINE: Found {len(auto_examine_files)} files for auto-examination")
-                formatted_results.append(f"   📁 Auto-examine files: {', '.join(auto_examine_files)}")
+                markdown_parts.append("")
+                markdown_parts.append(f"🔍 **DISCOVERY PIPELINE:** Found {len(auto_examine_files)} files for auto-examination")
+                markdown_parts.append(f"   📁 Auto-examine files: {', '.join(auto_examine_files)}")
                 
                 # Automatically examine the discovered files
                 try:
@@ -659,20 +822,23 @@ class CerebrasNativeAgent:
                     auto_exam_result = await self._examine_files(auto_examine_files, "summary")
                     
                     # Add the auto-examination results to the response
-                    formatted_results.append("\n" + "=" * 70)
-                    formatted_results.append("🔍 AUTO-EXAMINATION RESULTS:")
-                    formatted_results.append("=" * 70)
-                    formatted_results.append(auto_exam_result)
+                    markdown_parts.append("")
+                    markdown_parts.append("---")
+                    markdown_parts.append("🔍 **AUTO-EXAMINATION RESULTS:**")
+                    markdown_parts.append("---")
+                    markdown_parts.append(auto_exam_result)
                     
                     logger.info("✅ AUTO-EXAMINATION: Completed successfully")
                     
                 except Exception as auto_exam_error:
                     logger.error(f"❌ AUTO-EXAMINATION: Failed: {auto_exam_error}")
-                    formatted_results.append(f"\n⚠️ Auto-examination failed: {auto_exam_error}")
+                    markdown_parts.append(f"\n⚠️ Auto-examination failed: {auto_exam_error}")
             else:
                 logger.info(f"🔍 AUTO-EXAMINATION: CONDITION NOT MET - No files to examine")
             
-            return "\n".join(formatted_results)
+            # Use TableGenerator to wrap response with structured data
+            markdown_response = "\n".join(markdown_parts)
+            return TableGenerator.wrap_response_with_structured_data(markdown_response, [search_table])
             
         except Exception as e:
             logger.error(f"Smart search error: {e}")
@@ -1133,11 +1299,30 @@ class CerebrasNativeAgent:
         return suggestions
     
     def _validate_and_fix_parameters(self, function_name: str, arguments: dict) -> dict:
-        """Fix common parameter validation issues"""
+        """Fix common parameter validation issues and incorrect parameter names"""
         fixed_args = arguments.copy()
         
-        # Fix examine_files file_paths parameter (should be list)
+        # Fix examine_files parameter mapping and validation
         if function_name == "examine_files":
+            # CRITICAL FIX: Map incorrect parameter names to correct ones
+            if "path" in fixed_args and "file_paths" not in fixed_args:
+                # Convert single path to file_paths list
+                fixed_args["file_paths"] = [fixed_args["path"]]
+                del fixed_args["path"]
+                logger.info(f"🔧 PARAMETER FIX: Mapped 'path' to 'file_paths' for examine_files")
+            
+            if "paths" in fixed_args and "file_paths" not in fixed_args:
+                # Convert paths to file_paths
+                fixed_args["file_paths"] = fixed_args["paths"]
+                del fixed_args["paths"]
+                logger.info(f"🔧 PARAMETER FIX: Mapped 'paths' to 'file_paths' for examine_files")
+            
+            if "detail" in fixed_args and "detail_level" not in fixed_args:
+                # Map detail to detail_level
+                fixed_args["detail_level"] = fixed_args["detail"]
+                del fixed_args["detail"]
+                logger.info(f"🔧 PARAMETER FIX: Mapped 'detail' to 'detail_level' for examine_files")
+            
             if "file_paths" in fixed_args:
                 file_paths = fixed_args["file_paths"]
                 # Convert string to list if needed
@@ -1585,6 +1770,10 @@ class CerebrasNativeAgent:
         tool_results_for_formatting = []
         execution_start_time = asyncio.get_event_loop().time()
         
+        # RESPONSE CONSOLIDATION: Initialize consolidator to prevent message fragmentation
+        response_consolidator = ResponseConsolidator()
+        logger.info("🔧 CONSOLIDATOR: Initialized response consolidation system")
+        
         # Determine appropriate tool strategy based on query
         query_lower = user_query.lower()
         
@@ -1677,8 +1866,10 @@ class CerebrasNativeAgent:
                     "\n• Keep searching new areas until you're CONFIDENT nothing important remains"
                     "\n• MANDATORY: Examine multiple related files to understand complete context and relationships"
                     "\n• Bias towards gathering more information rather than asking the user for help"
-                    "\n\n🎯 EXCEPTIONAL RESPONSE STANDARDS:"
-                    "\n• COMPREHENSIVE ANALYSIS: Multi-layered technical analysis with specific code examples, file paths, and implementation details"
+                    "\n\n🎯 EXCEPTIONAL RESPONSE STANDARDS - COMPREHENSIVE BY DEFAULT:"
+                    "\n• ALWAYS PROVIDE COMPREHENSIVE ANALYSIS: Every response should be thorough, detailed, and complete - never give brief or surface-level answers"
+                    "\n• EXPLAIN EVERYTHING: Assume the user wants to understand the full context, background, and implications of every aspect"
+                    "\n• MULTI-LAYERED TECHNICAL ANALYSIS: Include specific code examples, file paths, implementation details, and architectural context"
                     "\n• ARCHITECTURAL DEPTH: Explain design patterns, architectural decisions, data flow, and system boundaries with concrete evidence"
                     "\n• CODE EVIDENCE: Always include relevant code snippets with proper syntax highlighting and detailed explanations"
                     "\n• TECHNICAL REASONING: Explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
@@ -1688,6 +1879,8 @@ class CerebrasNativeAgent:
                     "\n• MULTIPLE PERSPECTIVES: Analyze from developer, architect, security, performance, and maintainability viewpoints"
                     "\n• STRUCTURED RESPONSES: Organize with clear sections using markdown formatting for readability"
                     "\n• COMPLETE COVERAGE: Address all aspects of the query with thorough analysis and supporting evidence"
+                    "\n• DEFAULT TO VERBOSE: When in doubt, provide more detail rather than less - users can always ask for summaries if needed"
+                    "\n• ANTICIPATE FOLLOW-UPS: Address related questions and provide context that prevents the need for follow-up queries"
                     "\n"
                     "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
                     f"{tool_guidance}"
@@ -1724,9 +1917,25 @@ class CerebrasNativeAgent:
                     "\n• FILE REFERENCES: Include specific file paths and line numbers when referencing code"
                     "\n• TECHNICAL DEPTH: Explain complex concepts with examples, analogies, and step-by-step breakdowns"
                     "\n• VISUAL ORGANIZATION: Use bullet points, numbered lists, and formatting to improve readability"
+                    "\n• TABLE ORGANIZATION: Use tables strategically to organize comparison data, feature lists, dependencies, or structured information - but don't overuse them for simple concepts that are clearer as prose"
                     "\n• COMPLETENESS: Address all aspects of the query with thorough analysis and supporting evidence"
                     "\n• CONTEXT PROVISION: Always provide sufficient background and context for technical decisions"
                     "\n• ACTIONABLE OUTCOMES: End with specific, actionable recommendations or next steps"
+                    "\n\n📦 STRUCTURED OUTPUT (REQUIRED WHEN PRESENTING TABLES OR HIERARCHIES):"
+                    "\nWhen you present tabular data (e.g., dependency tables) or hierarchical trees (e.g., parent/child POMs), ALSO include a fenced JSON block conforming to this schema so the UI can render it natively:"
+                    "\n```json"
+                    "\n{"
+                    "\n  \"version\": \"codewise_structured_v1\","
+                    "\n  \"tables\": ["
+                    "\n    { \"title\": string, \"columns\": [string, ...], \"rows\": [[string|number|null, ...]], \"note\": string? }"
+                    "\n  ],"
+                    "\n  \"trees\": ["
+                    "\n    { \"title\": string, \"root\": { \"label\": string, \"children\": [ {\"label\": string, \"children\": [...] } ] } }"
+                    "\n  ],"
+                    "\n  \"references\": [ { \"path\": string, \"line_start\": number?, \"line_end\": number? } ]"
+                    "\n}"
+                    "\n```"
+                    "\nRules: The JSON must be valid and appear exactly once. Keep Markdown prose separate; do not render ASCII tables if JSON is provided."
                     "\n\n🎯 INVESTIGATION EXCELLENCE:"
                     "\n• Think like a senior software architect conducting a comprehensive code review"
                     "\n• Provide the level of detail expected in professional technical documentation"
@@ -1785,6 +1994,180 @@ class CerebrasNativeAgent:
             },
             {"role": "user", "content": user_query}
         ]
+
+        # Store JSON prompt instruction to apply AFTER tool calling phase
+        json_prompt_instruction = (
+            "You must respond with VALID JSON only (no markdown). Use this exact envelope: "
+            "{ \"response\": { \"metadata\": { \"query_type\": \"architecture|dependencies|database|general\", \"confidence\": 0.0 }, "
+            "\"sections\": [], \"follow_up_suggestions\": [] } }. "
+            "The output MUST begin with '{' as the first character and end with '}'. Do not prepend headings, prose, or code fences. "
+            "Sections must be typed using: paragraph, heading(level 1-6), table(columns, rows, note), list(style bullet|numbered), "
+            "code_block(language, content), callout(style info|warning|error|success), tree(root.label, root.children). "
+            "IMPORTANT: For diagrams, you MUST call the mermaid_generator tool - NEVER generate diagram content inline. "
+            "Do not include markdown in contents; use the section types. "
+            "\n\n**🧠 MERMAID DIAGRAM GENERATION - TOOL USAGE ONLY**\n"
+            "**CRITICAL: For ANY diagram generation, you MUST use the mermaid_generator tool. NEVER generate diagrams inline.**\n\n"
+            "**WHEN TO CREATE DIAGRAMS:**\n"
+            "Only generate diagrams when explicitly requested by the user OR when a visual representation would be significantly more helpful than text for explaining architecture, relationships, or complex flows.\n\n"
+            "**HOW TO CREATE DIAGRAMS:**\n"
+            "1. **ANALYZE THE REQUEST:** Determine diagram type needed (flowchart, graph, erDiagram, etc.)\n"
+            "2. **IDENTIFY COMPONENTS:** Extract nodes, relationships, and groupings from the information\n"
+            "3. **CALL THE TOOL:** Use mermaid_generator with diagram_type, nodes array, and edges array\n"
+            "4. **INCLUDE IN RESPONSE:** Extract the mermaid code from the tool result and add it as a diagram section: {\"type\": \"diagram\", \"format\": \"mermaid\", \"content\": \"<mermaid_code_here>\"}\n\n"
+            "**STEP 1: Generate the Structure (Unstyled)**\n"
+            "• Analyze & Classify: First, analyze the user's request to determine which scenario it best fits from the Template Library.\n"
+            "• Select Structural Template: You MUST select the corresponding Structural Template for that scenario. This is your required starting point. It contains only nodes and connections, with no styling.\n"
+            "• Modify the Structure: Adapt the structural template to match the user's request by renaming, adding, or removing nodes, and adding or changing connections. The output of this step should be a complete but unstyled Mermaid diagram.\n\n"
+            "**STEP 2: Apply the Styling**\n"
+            "• Get the Style Definitions: Find the Style Definitions that correspond to the template you chose in Step 1.\n"
+            "• Add Style Blocks: Copy the '%% --- Style Definitions ---' block to the top of the diagram and the '%% --- Apply Styles ---' block to the bottom.\n"
+            "• Intermediate Output: The result of this step is a single, complete Mermaid code block that is fully structured and styled.\n\n"
+            "**STEP 3: Verify the Final Output**\n"
+            "• Before providing the final output, you MUST verify that the generated Mermaid code strictly adheres to all rules listed in the 'Common Pitfalls & Syntax Rules' section. This is a mandatory final check to prevent errors.\n\n"
+            "**COMMON PITFALLS & SYNTAX RULES**\n"
+            "• Quotation Marks: To include a double quote (\") inside a node's label, you MUST use the HTML entity &quot;. Example: Node[\"A &quot;good&quot; label\"]\n"
+            "• Reserved Words: Words like 'graph', 'end', 'subgraph' are reserved. If you must use them in a label, enclose the label in quotes. Example: A --> B[\"end\"]\n"
+            "• Node IDs: A node's ID must be a single, unbroken string. Example: MyNode[\"This is the label\"]\n"
+            "• HTML Characters: To display characters like '<' or '>' in a label, use HTML entities &lt; and &gt; to avoid parsing errors.\n"
+            "• Closing Subgraphs: Every 'subgraph' MUST be closed with a corresponding 'end' keyword.\n\n"
+            "**TEMPLATE LIBRARY**\n\n"
+            "**Full-Stack Application**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    User([User])\n"
+            "    subgraph \"Primary Application\"\n"
+            "        direction LR\n"
+            "        WebApp[Frontend]\n"
+            "        Server[Backend API]\n"
+            "        Database[(Database)]\n"
+            "    end\n"
+            "    subgraph \"External Services\"\n"
+            "        PaymentGateway[(Payment Gateway)]\n"
+            "    end\n"
+            "    User --> WebApp\n"
+            "    WebApp --> Server\n"
+            "    Server --> Database\n"
+            "    Server -->|Processes Payment| PaymentGateway\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef userStyle fill:#99d98c,stroke:#333,stroke-width:2px\n"
+            "classDef frontendStyle fill:#76c893,stroke:#333,stroke-width:2px\n"
+            "classDef backendStyle fill:#52b69a,stroke:#333,stroke-width:2px\n"
+            "classDef dbStyle fill:#34a0a4,stroke:#333,stroke-width:2px\n"
+            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class User userStyle\n"
+            "class WebApp frontendStyle\n"
+            "class Server backendStyle\n"
+            "class Database dbStyle\n"
+            "class PaymentGateway externalStyle\n\n"
+            "**API / Microservice Interaction**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    ApiGateway[API Gateway]\n"
+            "    subgraph \"User Service\"\n"
+            "        ServiceA{{Authentication}}\n"
+            "    end\n"
+            "    subgraph \"Order Service\"\n"
+            "        ServiceB{{Order Processing}}\n"
+            "    end\n"
+            "    ThirdParty[(3rd Party API)]\n"
+            "    ApiGateway -->|Routes to| ServiceA\n"
+            "    ApiGateway -->|Routes to| ServiceB\n"
+            "    ServiceB -->|Fetches Data| ThirdParty\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef apiStyle fill:#1a759f,stroke:#333,stroke-width:2px,color:#fff\n"
+            "classDef serviceStyle fill:#184e77,stroke:#333,stroke-width:2px,color:#fff\n"
+            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class ApiGateway apiStyle\n"
+            "class ServiceA,ServiceB serviceStyle\n"
+            "class ThirdParty externalStyle\n\n"
+            "**Database Schema**\n"
+            "Structural Template:\n"
+            "erDiagram\n"
+            "    USERS {\n"
+            "        int id PK\n"
+            "        string username\n"
+            "    }\n"
+            "    POSTS {\n"
+            "        int id PK\n"
+            "        int user_id FK\n"
+            "    }\n"
+            "    USERS ||--o{ POSTS : \"writes\"\n\n"
+            "**Internal Component Flow**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    subgraph \"Backend Logic Flow\"\n"
+            "        direction LR\n"
+            "        A_Request[Request]\n"
+            "        B_Controller{Controller}\n"
+            "        C_Service[Service Logic]\n"
+            "        D_Model[(Data Model)]\n"
+            "    end\n"
+            "    A_Request --> B_Controller\n"
+            "    B_Controller --> C_Service\n"
+            "    C_Service --> D_Model\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef entrypointStyle fill:#ef476f,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef controllerStyle fill:#f78c6b,stroke:#333,stroke-width:2px\n"
+            "classDef serviceStyle fill:#ffd166,stroke:#333,stroke-width:2px\n"
+            "classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class A_Request entrypointStyle\n"
+            "class B_Controller controllerStyle\n"
+            "class C_Service serviceStyle\n"
+            "class D_Model modelStyle\n\n"
+            "**CI/CD Pipeline**\n"
+            "Structural Template:\n"
+            "graph LR\n"
+            "    subgraph \"CI/CD Pipeline\"\n"
+            "        A(Code Commit) --> B{Build Server}\n"
+            "        B --> C(Run Tests)\n"
+            "        C -- On Success --> D[Deploy to Staging]\n"
+            "        D --> E((Production))\n"
+            "    end\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef vcsStyle fill:#fca311,stroke:#333,stroke-width:2px\n"
+            "classDef buildStyle fill:#14213d,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef testStyle fill:#5a189a,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef deployStyle fill:#008000,stroke:#333,stroke-width:2px,color:white\n"
+            "%% --- Apply Styles ---\n"
+            "class A vcsStyle\n"
+            "class B buildStyle\n"
+            "class C testStyle\n"
+            "class D,E deployStyle\n\n"
+            "**General System Architecture**\n"
+            "Structural Template:\n"
+            "graph TD\n"
+            "    subgraph \"Data Ingestion\"\n"
+            "        Input_Source([Input Source])\n"
+            "    end\n"
+            "    subgraph \"Core Processing\"\n"
+            "        Processing_Unit[/Processing Unit/]\n"
+            "        Data_Store[(Data Store)]\n"
+            "    end\n"
+            "    subgraph \"Data Consumption\"\n"
+            "        System_Consumer([System Consumer])\n"
+            "    end\n"
+            "    Input_Source --> Processing_Unit\n"
+            "    Processing_Unit <--> Data_Store\n"
+            "    Processing_Unit --> System_Consumer\n\n"
+            "Style Definitions:\n"
+            "%% --- Style Definitions ---\n"
+            "classDef sourceStyle fill:#8ecae6,stroke:#333,stroke-width:2px\n"
+            "classDef processStyle fill:#219ebc,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef dataStyle fill:#023047,stroke:#333,stroke-width:2px,color:white\n"
+            "classDef consumerStyle fill:#ffb703,stroke:#333,stroke-width:2px\n"
+            "%% --- Apply Styles ---\n"
+            "class Input_Source sourceStyle\n"
+            "class Processing_Unit processStyle\n"
+            "class Data_Store dataStyle\n"
+            "class System_Consumer consumerStyle"
+        )
         
         # Add chat history if provided
         if chat_history:
@@ -1801,7 +2184,7 @@ class CerebrasNativeAgent:
         yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
         
         # Multi-turn tool calling loop with duplicate detection
-        max_iterations = 6  # Reduced to prevent infinite loops
+        max_iterations = 10  # Increased for more comprehensive responses
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made
@@ -1833,6 +2216,11 @@ class CerebrasNativeAgent:
                 else:
                     use_tools = None
                     logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
+                    # Add JSON format instruction when ready for final answer
+                    messages.append({
+                        "role": "system", 
+                        "content": f"You have completed your investigation. Now provide a COMPREHENSIVE, DETAILED final analysis. This should be thorough and extensive - include multiple sections, detailed explanations, code examples, architectural insights, and actionable recommendations. DO NOT provide brief responses. Use this format: {json_prompt_instruction}"
+                    })
                 
                 # RATE LIMITING: Enforce 1.1s delay to prevent 429 errors  
                 await self._enforce_rate_limit()
@@ -1848,7 +2236,9 @@ class CerebrasNativeAgent:
                 # Make API call to Cerebras
                 api_params = {
                     "model": "gpt-oss-120b",
-                    "messages": messages
+                    "messages": messages,
+                    "max_tokens": 8000,  # Allow longer responses for comprehensive analysis
+                    "temperature": 0.3   # Slightly more creative but still focused
                 }
                 if use_tools is not None:
                     api_params["tools"] = use_tools
@@ -1918,29 +2308,70 @@ class CerebrasNativeAgent:
                         
                         if should_block:
                             warning_msg = f"Info: {function_name} has been called {call_count} times with same parameters. Skipping to avoid excessive repetition."
-                            result = warning_msg
-                        elif function_name in self.available_functions:
-                            try:
-                                # Parse arguments and call function
-                                arguments = json.loads(function_args)
-                                
-                                # Fix common parameter validation issues
-                                arguments = self._validate_and_fix_parameters(function_name, arguments)
-                                
-                                logger.info(f"🔧 PARSED ARGS: {arguments}")
-                                result = await self.available_functions[function_name](**arguments)
-                                
-                            except json.JSONDecodeError as e:
-                                result = f"Error parsing {function_name} arguments: {str(e)}"
-                                logger.error(f"JSON decode error for {function_name}: {function_args}")
-                            except TypeError as e:
-                                result = f"Error executing {function_name}: {str(e)}"
-                                logger.error(f"Parameter error for {function_name}: {arguments} -> {str(e)}")
-                            except Exception as e:
-                                result = f"Error executing {function_name}: {str(e)}"
-                                logger.error(f"General error for {function_name}: {str(e)}")
+                            
+                            # Special handling for mermaid_generator repetition
+                            if function_name == "mermaid_generator":
+                                # Try to repair and process the diagram one more time
+                                logger.info("🔧 Final attempt to repair mermaid diagram after repetition...")
+                                repaired_args = self._repair_truncated_json(function_args)
+                                if repaired_args:
+                                    try:
+                                        arguments = json.loads(repaired_args)
+                                        arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                        result = await self.available_functions[function_name](**arguments)
+                                        logger.info("✅ Final repair attempt successful!")
+                                    except Exception as e:
+                                        result = f"❌ **Diagram Generation Issue**: Multiple attempts to generate the diagram encountered technical limitations. Architecture analysis completed successfully. Technical details: {str(e)}"
+                                else:
+                                    result = "❌ **Diagram Data Issue**: Could not process diagram parameters. Architecture analysis completed successfully."
+                            else:
+                                result = warning_msg
                         else:
-                            result = f"Unknown function: {function_name}"
+                            # Normalize known aliases (e.g., 'functions.smart_search' -> 'smart_search')
+                            normalized_name = function_name
+                            if function_name.startswith("functions."):
+                                normalized_name = function_name.split(".", 1)[1]
+
+                            if normalized_name in self.available_functions:
+                                function_name = normalized_name
+                                try:
+                                    # Parse arguments and call function
+                                    arguments = json.loads(function_args)
+                                    
+                                    # Fix common parameter validation issues
+                                    arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                    
+                                    logger.info(f"🔧 PARSED ARGS: {arguments}")
+                                    result = await self.available_functions[function_name](**arguments)
+                                    
+                                except json.JSONDecodeError as e:
+                                    result = f"Error parsing {function_name} arguments: {str(e)}"
+                                    logger.error(f"JSON decode error for {function_name}: {function_args}")
+                                    
+                                    # Special handling for truncated mermaid diagrams - repair the JSON
+                                    if function_name == "mermaid_generator" and ("Expecting ',' delimiter" in str(e) or "Unterminated string" in str(e)):
+                                        logger.info("🔧 Attempting to repair truncated mermaid JSON...")
+                                        repaired_args = self._repair_truncated_json(function_args)
+                                        if repaired_args:
+                                            try:
+                                                arguments = json.loads(repaired_args)
+                                                arguments = self._validate_and_fix_parameters(function_name, arguments)
+                                                result = await self.available_functions[function_name](**arguments)
+                                                logger.info("✅ Successfully repaired and processed mermaid diagram")
+                                            except Exception as repair_error:
+                                                logger.error(f"❌ Repair attempt failed: {repair_error}")
+                                                result = f"Error: Could not repair diagram data - {str(repair_error)}"
+                                        else:
+                                            result = "Error: Could not repair truncated diagram data"
+                                except TypeError as e:
+                                    result = f"Error executing {function_name}: {str(e)}"
+                                    logger.error(f"Parameter error for {function_name}: {arguments} -> {str(e)}")
+                                except Exception as e:
+                                    result = f"Error executing {function_name}: {str(e)}"
+                                    logger.error(f"General error for {function_name}: {str(e)}")
+                            else:
+                                # Suppress noisy unknown-tool messages in synthesis; provide silent no-op
+                                result = ""
                         
                         # PHASE 1: Negative Result Fallback System - COLLECT instead of adding immediately
                         if self._detect_negative_result(result, function_name) and tool_call_count < 5:
@@ -1951,7 +2382,10 @@ class CerebrasNativeAgent:
                             })
                         
                         # Log tool output (truncated for readability)
-                        result_preview = result[:300] + "..." if len(result) > 300 else result
+                        # Avoid logging empty no-op outputs
+                        result_preview = (result[:300] + "...") if (isinstance(result, str) and len(result) > 300) else result
+                        if result_preview == "":
+                            result_preview = "(no output)"
                         logger.info(f"🔧 TOOL RESULT ({len(result)} chars): {result_preview}")
                         
                         # Task 5: Collect tool results for response formatting
@@ -1964,9 +2398,10 @@ class CerebrasNativeAgent:
                             'results': []  # Could extract structured results if available
                         })
                         
+                        # Avoid emitting empty no-op tool outputs to the UI
                         yield {
                             "type": "tool_end",
-                            "output": result
+                            "output": result if result != "" else ""
                         }
                         
                         # Add tool result to messages
@@ -1985,13 +2420,50 @@ class CerebrasNativeAgent:
                     if tool_call_count >= 4:
                         messages.append({
                             "role": "system",
-                            "content": "You have made several tool calls. If you have found sufficient information, provide a comprehensive final answer. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently."
+                            "content": f"You have made several tool calls and gathered substantial information. If you have found sufficient information, provide a COMPREHENSIVE, DETAILED final analysis with multiple sections, extensive explanations, code examples, and actionable insights. DO NOT provide brief responses - be thorough and extensive. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently.\n\nWhen providing your final answer, use this format: {json_prompt_instruction}"
                         })
                 
                 else:
                     # No tool calls - we have the final response
                     final_content = choice.content or "Task completed"
                     logger.info(f"✅ FINAL RESPONSE ({len(final_content)} chars): {final_content[:500]}...")
+                    
+                    # CRITICAL FIX: Check max iterations BEFORE processing response
+                    if iteration >= max_iterations:
+                        logger.warning(f"🔄 MAX ITERATIONS REACHED: {iteration}/{max_iterations} - Forcing final response")
+                        
+                        execution_time = asyncio.get_event_loop().time() - execution_start_time
+                        execution_metadata = {
+                            'total_time': execution_time,
+                            'iterations': iteration,
+                            'tool_calls': tool_call_count,
+                            'max_iterations_reached': True
+                        }
+                        
+                        try:
+                            formatted_response = self.response_formatter.format_response(
+                                raw_response=final_content,
+                                tool_results=tool_results_for_formatting,
+                                query=user_query,
+                                execution_metadata=execution_metadata
+                            )
+                            response_consolidator.add_response_data(
+                                raw_output=final_content,
+                                source=ResponseSource.MAX_ITERATIONS,
+                                formatted_response=formatted_response.to_dict(),
+                                execution_metadata=execution_metadata,
+                                max_iterations_reached=True
+                            )
+                        except Exception as e:
+                            logger.error(f"Response formatting failed in max iterations: {e}")
+                            response_consolidator.add_response_data(
+                                raw_output=final_content,
+                                source=ResponseSource.MAX_ITERATIONS,
+                                execution_metadata=execution_metadata,
+                                max_iterations_reached=True,
+                                error=f"Max iterations formatting failed: {e}"
+                            )
+                        break
                     
                     # PHASE 2: Incomplete Response Detection
                     if self._detect_incomplete_response(final_content) and tool_call_count < 5:
@@ -2021,7 +2493,8 @@ class CerebrasNativeAgent:
                             f"Please provide a comprehensive analysis of the original query based on the information you gathered:\n\n"
                             f"**ORIGINAL QUERY:** {user_query}\n\n"
                             f"**INFORMATION YOU GATHERED:**\n{tool_summary}\n\n"
-                            f"Now provide a detailed, comprehensive response that actually uses this information to answer the user's query."
+                            f"Now provide a detailed, comprehensive response that actually uses this information to answer the user's query.\n\n"
+                            f"RESPONSE FORMAT: {json_prompt_instruction}"
                         )
                         
                         messages.append({
@@ -2034,90 +2507,154 @@ class CerebrasNativeAgent:
                         logger.info("🚫 SYNTHESIS MODE ACTIVATED: No more tools allowed to prevent message pairing issues")
                         continue  # Skip termination, continue to synthesis stage
                     
-                    # Task 5: Apply standardized response formatting
+                    # RESPONSE CONSOLIDATION: Collect all response data instead of yielding multiple final_result messages
                     execution_time = asyncio.get_event_loop().time() - execution_start_time
                     execution_metadata = {
                         'total_time': execution_time,
                         'iterations': iteration,
-                        'tool_calls': tool_call_count
+                        'tool_calls': tool_call_count,
+                        'synthesis_triggered': synthesis_mode
                     }
                     
+                    # CRITICAL FIX: Single pipeline selection based on response type
                     try:
-                        formatted_response = self.response_formatter.format_response(
-                            raw_response=final_content,
-                            tool_results=tool_results_for_formatting,
-                            query=user_query,
-                            execution_metadata=execution_metadata
-                        )
-                        
-                        # Yield both the original format for compatibility and enhanced format
-                        yield {
-                            "type": "final_result",
-                            "output": final_content,
-                            "formatted_response": formatted_response.to_dict()
-                        }
+                        structured = parse_json_prompt(final_content)
+                        if structured is not None:
+                            # JSON Pipeline ONLY - for structured responses
+                            logger.info("📊 AGENT: Detected structured JSON response - using JSON pipeline")
+                            
+                            try:
+                                improved = improve_json_prompt_readability(structured.model_dump())
+                                response_consolidator.add_response_data(
+                                    raw_output=final_content,
+                                    source=ResponseSource.STRUCTURED,
+                                    structured_response=improved,
+                                    execution_metadata=execution_metadata,
+                                    synthesis_triggered=synthesis_mode
+                                )
+                                logger.info("✅ AGENT: Successfully processed structured response")
+                            except Exception as e:
+                                logger.error(f"💥 AGENT: Structured response processing failed: {e}")
+                                # Fallback to raw response
+                                response_consolidator.add_response_data(
+                                    raw_output=final_content,
+                                    source=ResponseSource.RAW,
+                                    execution_metadata=execution_metadata,
+                                    synthesis_triggered=synthesis_mode,
+                                    error=f"Structured processing failed: {e}"
+                                )
+                        else:
+                            # Markdown Pipeline ONLY - for non-structured responses
+                            logger.info("📊 AGENT: Detected markdown response - using markdown pipeline")
+                            
+                            try:
+                                formatted_response = self.response_formatter.format_response(
+                                    raw_response=final_content,
+                                    tool_results=tool_results_for_formatting,
+                                    query=user_query,
+                                    execution_metadata=execution_metadata
+                                )
+                                response_consolidator.add_response_data(
+                                    raw_output=final_content,
+                                    source=ResponseSource.FORMATTED,
+                                    formatted_response=formatted_response.to_dict(),
+                                    execution_metadata=execution_metadata,
+                                    synthesis_triggered=synthesis_mode
+                                )
+                                logger.info("✅ AGENT: Successfully processed formatted response")
+                            except Exception as e:
+                                logger.error(f"💥 AGENT: Response formatting failed: {e}")
+                                # Fallback to raw response
+                                response_consolidator.add_response_data(
+                                    raw_output=final_content,
+                                    source=ResponseSource.RAW,
+                                    execution_metadata=execution_metadata,
+                                    synthesis_triggered=synthesis_mode,
+                                    error=f"Formatting failed: {e}"
+                                )
                     except Exception as e:
-                        logger.error(f"Response formatting failed: {e}")
-                        # Fallback to original response
-                        yield {
-                            "type": "final_result",
-                            "output": final_content
-                        }
+                        logger.error(f"Structured response parsing failed: {e}")
+                        response_consolidator.add_response_data(
+                            raw_output=final_content,
+                            source=ResponseSource.RAW,
+                            execution_metadata=execution_metadata,
+                            synthesis_triggered=synthesis_mode,
+                            error=f"Structured parsing failed: {e}"
+                        )
                     break
                     
             except Exception as e:
-                yield {
-                    "type": "error", 
-                    "message": f"Cerebras API error: {str(e)}"
-                }
+                # RESPONSE CONSOLIDATION: Add API error to consolidator instead of yielding directly
+                response_consolidator.add_error(f"Cerebras API error: {str(e)}", ResponseSource.RAW)
                 break
         
-        if iteration >= max_iterations:
-            # Force a final call without tools to get an answer
+        # RESPONSE CONSOLIDATION: Single yield point - consolidate all response data and yield once
+        if response_consolidator.has_data():
+            primary_source = response_consolidator.get_primary_source()
+            logger.info(f"🔧 CONSOLIDATOR: Consolidating {len(response_consolidator.response_data)} data sources into single final_result")
+            logger.info(f"🎯 CONSOLIDATOR: Primary source will be: {primary_source.value if primary_source else 'unknown'}")
+            
             try:
-                # RATE LIMITING: Enforce delay before final API call  
-                await self._enforce_rate_limit()
-                
-                response = self.client.chat.completions.create(
-                    model="gpt-oss-120b",
-                    messages=messages + [{
-                        "role": "system", 
-                        "content": "Please provide a final answer based on the information you've gathered. No more tool calls are available."
-                    }],
-                    tools=None
+                consolidated_response = await response_consolidator.consolidate(
+                    original_query=user_query,
+                    llm_provider=self  # Pass self as LLM provider for regeneration
                 )
-                final_content = response.choices[0].message.content or "Unable to provide a complete response due to tool call limits."
                 
-                # Task 5: Apply formatting even for max iterations case
-                execution_time = asyncio.get_event_loop().time() - execution_start_time
-                execution_metadata = {
-                    'total_time': execution_time,
-                    'iterations': iteration,
-                    'tool_calls': tool_call_count,
-                    'max_iterations_reached': True
-                }
+                # Enhanced logging for debugging
+                metadata = consolidated_response.get('consolidation_metadata', {})
+                logger.info(f"✅ CONSOLIDATOR: Successfully consolidated response")
+                logger.info(f"   - Primary source: {metadata.get('primary_source', 'unknown')}")
+                logger.info(f"   - Total sources: {metadata.get('total_sources', 0)}")
+                logger.info(f"   - Sources used: {metadata.get('sources_used', [])}")
+                logger.info(f"   - Synthesis triggered: {metadata.get('synthesis_triggered', False)}")
+                logger.info(f"   - Max iterations: {metadata.get('max_iterations_reached', False)}")
+                logger.info(f"   - Output length: {len(consolidated_response.get('output', ''))}")
+                logger.info(f"   - Has structured: {'structured_response' in consolidated_response}")
+                logger.info(f"   - Has formatted: {'formatted_response' in consolidated_response}")
                 
-                try:
-                    formatted_response = self.response_formatter.format_response(
-                        raw_response=final_content,
-                        tool_results=tool_results_for_formatting,
-                        query=user_query,
-                        execution_metadata=execution_metadata
-                    )
-                    
-                    yield {
-                        "type": "final_result",
-                        "output": final_content,
-                        "formatted_response": formatted_response.to_dict()
-                    }
-                except Exception as e:
-                    logger.error(f"Response formatting failed in max iterations: {e}")
-                    yield {
-                        "type": "final_result",
-                        "output": final_content
-                    }
-            except Exception:
+                # CRITICAL DEBUG: Log the full actual response being yielded
+                logger.info("🔍 FULL CONSOLIDATED RESPONSE BEING YIELDED:")
+                logger.info("=" * 80)
+                logger.info(f"RESPONSE TYPE: {consolidated_response.get('type', 'MISSING')}")
+                logger.info(f"OUTPUT CONTENT ({len(consolidated_response.get('output', ''))} chars):")
+                logger.info(f"'{consolidated_response.get('output', 'MISSING_OUTPUT')}'")
+                
+                if 'structured_response' in consolidated_response:
+                    logger.info("STRUCTURED_RESPONSE PRESENT:")
+                    logger.info(str(consolidated_response['structured_response'])[:500] + "..." if len(str(consolidated_response['structured_response'])) > 500 else str(consolidated_response['structured_response']))
+                
+                if 'formatted_response' in consolidated_response:
+                    logger.info("FORMATTED_RESPONSE PRESENT:")
+                    logger.info(str(consolidated_response['formatted_response'])[:500] + "..." if len(str(consolidated_response['formatted_response'])) > 500 else str(consolidated_response['formatted_response']))
+                
+                logger.info("CONSOLIDATION_METADATA:")
+                logger.info(str(metadata))
+                logger.info("=" * 80)
+                
+                if metadata.get('errors_encountered', 0) > 0:
+                    logger.warning(f"⚠️ CONSOLIDATOR: Response contains {metadata['errors_encountered']} errors")
+                
+                yield consolidated_response
+                
+            except Exception as e:
+                logger.error(f"💥 CONSOLIDATOR: Consolidation failed: {e}")
                 yield {
-                    "type": "final_result",
-                    "output": "Maximum iterations reached. The response may be incomplete."
-                } 
+                    "type": "final_result", 
+                    "output": f"Error during response consolidation: {e}",
+                    "consolidation_metadata": {
+                        "primary_source": "consolidation_error",
+                        "total_sources": len(response_consolidator.response_data),
+                        "error": f"Consolidation failed: {e}"
+                    }
+                }
+        else:
+            logger.error("💥 CONSOLIDATOR: No response data collected during entire request processing")
+            yield {
+                "type": "final_result",
+                "output": "Error: No response data was collected during processing. This may indicate a serious issue with the agent logic.",
+                "consolidation_metadata": {
+                    "primary_source": "no_data_error",
+                    "total_sources": 0,
+                    "error": "No response data collected"
+                }
+            } 

@@ -1,0 +1,13 @@
+{
+  "name": "codewise-backend-mermaid",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Mermaid validation for CodeWise backend",
+  "main": "mermaid_validator.js",
+  "dependencies": {
+    "mermaid": "^10.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

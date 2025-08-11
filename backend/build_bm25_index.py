@@ -20,6 +20,7 @@ def build_bm25_from_vector_store():
     try:
         # Get vector store instance
         vector_store = get_vector_store()
+        vector_store.force_refresh()  # Ensure we have the latest index from disk
         
         if not vector_store.meta:
             logger.error("No metadata found in vector store")
