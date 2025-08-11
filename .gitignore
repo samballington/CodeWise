@@ -51,11 +51,6 @@ workspace/
 workspace/*
 !workspace/.gitkeep
 
-# Kiro IDE files - NEVER commit these
-.kiro/
-.kiro/**
-.kiro/specs/**
-
 # Claude/AI assistant files - NEVER commit these  
 .claude/
 backend/.claude/
@@ -64,45 +59,9 @@ backend/.claude/
 # Internal documentation and specs - NEVER commit these
 *.md
 **/*.md
-memory.md 
-TODO.txt
-feature.md
-scratchpad.md
-GITHUB_OAUTH.md
-BRANCH_CONTEXT.md
-CURRENTFEATURES.md
-TASK5_IMPLEMENTATION_SUMMARY.md
-PERFORMANCE_*.md
-FINAL_*.md
-COMPILATION.md
-DISCOVERY_*.md
-SYSTEM_*.md
-SMART_*.md
-PART1_*.md
-*.spec.md
-*.kiro
-**/*.kiro
-*.claude
-**/*.claude
-docs/**
-specs/**
+!README.md
 
 # Test files (not needed for running app)
 backend/test_*.py
 indexer/test_*.py
 **/test_*.py
-
-# Development notes and context files
-*.context.md
-*.notes.txt
-*.dev.md
-*.local.md
-planning/**
-planning.md
-requirements.md
-design.md
-tasks.md
-**/requirements.md
-**/design.md
-**/tasks.md
-docs/plans/

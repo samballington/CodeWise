@@ -1471,7 +1471,7 @@ class CodeWiseAgent:
             Tool(
                 name="code_search",
                 description="Retrieve up to 10 relevant code snippets from the project for a natural language query. Use this for initial exploration and to find files related to your query. Always try multiple search terms if first search doesn't yield enough results.",
-                func=lambda x: asyncio.create_task(self._search_code_with_summary(x)),
+                func=lambda x: self._run_async_safe(self._search_code_with_summary(x)),
                 coroutine=lambda x: self._search_code_with_summary(x),
             ),
             Tool(
