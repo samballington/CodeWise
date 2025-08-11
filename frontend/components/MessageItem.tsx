@@ -524,8 +524,7 @@ export default function MessageItem({ message }: MessageItemProps) {
                       })
                       return (
                         <div key={idx} className="my-2">
-                          {section.title && <div className="font-medium mb-1">{section.title}</div>}
-                          <Mermaid code={diagramCode} />
+                          <Mermaid code={diagramCode} title={section.title} />
                         </div>
                       )
                     case 'callout':
