@@ -29,12 +29,13 @@ RUN npm install
 # Environment variables
 ENV WORKSPACE_DIR=/workspace
 ENV OPENAI_API_KEY=""
+ENV CEREBRAS_API_KEY=""
 ENV PYTHONPATH=/app:/app/backend
 
 # Set working directory to backend for uvicorn
 WORKDIR /app/backend
 
 # Start the FastAPI server directly
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--ws-ping-timeout", "300", "--timeout-keep-alive", "300", "--timeout-graceful-shutdown", "300"]
 
 EXPOSE 8000 

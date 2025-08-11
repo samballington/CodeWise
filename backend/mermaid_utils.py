@@ -56,7 +56,7 @@ class MermaidValidator:
     def __init__(self):
         self.max_length = 10000
         self.max_correction_attempts = 3
-        self.validation_timeout = 10  # seconds
+        self.validation_timeout = 30  # seconds
         
         # Common syntax corrections that can be applied before validation
         self.quick_fixes = [
@@ -87,9 +87,9 @@ class MermaidValidator:
             MermaidDiagramType.JOURNEY: re.compile(r'^\s*journey', re.IGNORECASE | re.MULTILINE),
         }
         
-        # Create validator script content for Node.js execution
+        # Create validator script content for Node.js execution  
         self.validator_script = '''
-const mermaid = require('mermaid');
+import mermaid from 'file:///app/backend/node_modules/mermaid/dist/mermaid.core.mjs';
 
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
@@ -99,10 +99,10 @@ process.stdin.on('data', function(chunk) {
     input += chunk;
 });
 
-process.stdin.on('end', function() {
+process.stdin.on('end', async function() {
     try {
         const code = input.trim();
-        if (!code) {
+        if (code.length === 0) {
             console.log(JSON.stringify({valid: false, error: "Empty input"}));
             return;
         }
@@ -111,7 +111,7 @@ process.stdin.on('end', function() {
         mermaid.initialize({startOnLoad: false, securityLevel: 'strict'});
         
         // Try to parse the diagram
-        const result = mermaid.parse(code);
+        const result = await mermaid.parse(code);
         console.log(JSON.stringify({valid: true, parsed: result}));
     } catch (error) {
         console.log(JSON.stringify({valid: false, error: error.message}));
@@ -226,15 +226,16 @@ process.stdin.on('end', function() {
         """
         try:
             # Try to validate with actual Mermaid parser via Node.js
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as script_file:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.mjs', delete=False) as script_file:
                 script_file.write(self.validator_script)
                 script_file.flush()
                 
-                # Run Node.js validation
+                # Run Node.js validation with correct working directory
                 result = subprocess.run(
                     ['node', script_file.name],
                     input=code,
                     text=True,
+                    cwd='/app/backend',
                     capture_output=True,
                     timeout=self.validation_timeout
                 )

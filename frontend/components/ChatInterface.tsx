@@ -7,13 +7,13 @@ import { useProjectStore } from '../lib/projectStore'
 import MessageList from './MessageList'
 import MessageInput from './MessageInput'
 import { ContextPopup } from './ContextPopup'
-import { ChevronDown, Folder, FolderOpen } from 'lucide-react'
+import { ChevronDown, Folder, FolderOpen, Trash2 } from 'lucide-react'
 
 export default function ChatInterface() {
   const { sendMessage } = useWebSocket()
   const { messages } = useChatStore()
   const { isDarkMode } = useThemeStore()
-  const { projects, fetchProjects } = useProjectStore()
+  const { projects, fetchProjects, deleteProject } = useProjectStore()
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [showProjects, setShowProjects] = useState(false)
   const projectsDropdownRef = useRef<HTMLDivElement>(null)
@@ -72,6 +72,14 @@ export default function ChatInterface() {
     sendMessage(messageWithContext)
   }
 
+  // Handle project deletion
+  const handleDeleteProject = async (projectName: string, event: React.MouseEvent) => {
+    event.stopPropagation() // Prevent dropdown from closing
+    if (confirm(`Are you sure you want to delete the project "${projectName}"? This will remove all indexed data for this project.`)) {
+      await deleteProject(projectName)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full w-full max-w-none mx-0 relative chat-page-padding">
       {/* Context Popup - positioned absolutely for overlay effect */}
@@ -104,7 +112,7 @@ export default function ChatInterface() {
                   {projects.map((project, index) => (
                     <div
                       key={project.name}
-                      className={`flex items-center gap-2 px-3 py-2 rounded text-sm ${
+                      className={`flex items-center gap-2 px-3 py-2 rounded text-sm group ${
                         isDarkMode 
                           ? 'text-text-primary hover:bg-slate-600' 
                           : 'text-gray-700 hover:bg-gray-100'
@@ -113,9 +121,18 @@ export default function ChatInterface() {
                       <div className={`w-2 h-2 rounded-full ${
                         project.is_workspace_root ? 'bg-orange-500' : 'bg-blue-500'
                       }`} />
-                      <span className="font-medium truncate">
+                      <span className="font-medium truncate flex-1">
                         {project.is_workspace_root ? 'workspace' : project.name}
                       </span>
+                      <button
+                        onClick={(e) => handleDeleteProject(project.name, e)}
+                        className={`opacity-0 group-hover:opacity-100 p-1 rounded transition-all hover:bg-red-500 hover:text-white ${
+                          isDarkMode ? 'text-gray-400 hover:bg-red-500' : 'text-gray-500 hover:bg-red-500'
+                        }`}
+                        title="Delete project index"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
                     </div>
                   ))}
                 </div>

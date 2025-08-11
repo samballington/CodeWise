@@ -251,8 +251,9 @@ class ResponseConsolidator:
                     
                 elif section_type == 'diagram':
                     diagram_format = section.get('format', 'unknown')
-                    readable_parts.append(f"[{diagram_format.upper()} Diagram]")
-                    # Don't include the diagram code in readable output
+                    diagram_content = section.get('content', '')
+                    readable_parts.append(f"```{diagram_format.lower()}\n{diagram_content}\n```")
+                    # Include the diagram code as markdown code block for rendering
                     
                 elif section_type == 'code':
                     language = section.get('language', '')
@@ -339,8 +340,12 @@ class ResponseConsolidator:
             if structured_data:
                 self.logger.info("📊 CONSOLIDATOR: Using structured response data directly")
                 
+                # Generate readable output from structured data
+                readable_output = self._generate_readable_output(structured_data.get('response', {}).get('sections', []))
+                
                 final_response = {
                     "type": "final_result",
+                    "output": readable_output,
                     "structured_response": structured_data,
                     "consolidation_metadata": {
                         "primary_source": primary_data.source.value,

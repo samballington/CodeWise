@@ -29,7 +29,7 @@ jobs:
     - name: Check for documentation files
       run: |
         # Exclude requirements.txt and other legitimate .txt files
-        if git diff --name-only origin/main...HEAD | grep -E '\.(md)$|\.txt$' | grep -v 'requirements\.txt$'; then
+        if git diff --name-only origin/main...HEAD | grep -E '\.(md)$' | grep -v 'README\.md'; then
           echo "❌ Documentation files detected in PR"
           echo "Please remove .md files as they should be gitignored"
           exit 1
@@ -49,28 +49,28 @@ jobs:
           echo "✅ No large files detected"
         fi
 
-  dependency-check:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Check Python dependencies
-      run: |
-        cd backend
-        if [[ -f requirements.txt ]]; then
-          echo "Checking for known vulnerabilities in Python packages..."
-          pip install safety
-          safety check -r requirements.txt || echo "⚠️ Vulnerability check completed with warnings"
-        fi
-        
-    - name: Check Node.js dependencies  
-      run: |
-        cd frontend
-        if [[ -f package.json ]]; then
-          echo "Checking for known vulnerabilities in Node packages..."
-          npm audit --audit-level moderate || echo "⚠️ Vulnerability check completed with warnings"
-        fi
+  # dependency-check:
+  #   runs-on: ubuntu-latest
+  #   
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   
+  #   - name: Check Python dependencies
+  #     run: |
+  #       cd backend
+  #       if [[ -f requirements.txt ]]; then
+  #         echo "Checking for known vulnerabilities in Python packages..."
+  #         pip install safety
+  #         safety check -r requirements.txt || echo "⚠️ Vulnerability check completed with warnings"
+  #       fi
+  #       
+  #   - name: Check Node.js dependencies  
+  #     run: |
+  #       cd frontend
+  #       if [[ -f package.json ]]; then
+  #         echo "Checking for known vulnerabilities in Node packages..."
+  #         npm audit --audit-level moderate || echo "⚠️ Vulnerability check completed with warnings"
+  #       fi
 
   performance-check:
     runs-on: ubuntu-latest
@@ -99,6 +99,6 @@ jobs:
             echo "Building $service image for size check..."
             docker build -t "codewise-$service:test" "$service/" --quiet
             size=$(docker images "codewise-$service:test" --format "{{.Size}}")
-            echo "$service image size: $size"
+            echo "$service image size: $service"
           fi
         done

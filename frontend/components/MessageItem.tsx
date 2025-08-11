@@ -348,6 +348,18 @@ export default function MessageItem({ message }: MessageItemProps) {
                       components={{
                         code({ className, children, ...props }: any) {
                           const match = /language-(\w+)/.exec(className || '')
+                          const language = match?.[1] || ''
+                          
+                          // Handle mermaid code blocks
+                          if (language === 'mermaid') {
+                            console.log('🎨 ReactMarkdown rendering mermaid code:', children)
+                            return (
+                              <div className="my-2">
+                                <Mermaid code={String(children).replace(/\n$/, '')} />
+                              </div>
+                            )
+                          }
+                          
                           return match ? (
                             <div className="relative">
                               <SyntaxHighlighter
@@ -480,6 +492,15 @@ export default function MessageItem({ message }: MessageItemProps) {
                         </div>
                       )
                     case 'code_block':
+                      // Special handling for mermaid code blocks
+                      if (section.language === 'mermaid') {
+                        console.log('🎨 Converting mermaid code_block to diagram:', section.content)
+                        return (
+                          <div key={idx} className="my-2">
+                            <Mermaid code={section.content || ''} />
+                          </div>
+                        )
+                      }
                       return (
                         <div key={idx} className="relative">
                           <SyntaxHighlighter style={vscDarkPlus} language={section.language || 'text'} PreTag="div" customStyle={{ margin: '0.5rem 0', borderRadius: '8px', fontSize: '0.875rem' }}>
@@ -555,7 +576,19 @@ export default function MessageItem({ message }: MessageItemProps) {
                 <ReactMarkdown
                   components={{
                     code({ className, children, ...props }: any) {
-                      const match = /language-(\\w+)/.exec(className || '')
+                      const match = /language-(\w+)/.exec(className || '')
+                      const language = match?.[1] || ''
+                      
+                      // Handle mermaid code blocks
+                      if (language === 'mermaid') {
+                        console.log('🎨 Legacy ReactMarkdown rendering mermaid code:', children)
+                        return (
+                          <div className="my-2">
+                            <Mermaid code={String(children).replace(/\n$/, '')} />
+                          </div>
+                        )
+                      }
+                      
                       return match ? (
                         <div className="relative">
                           <SyntaxHighlighter
@@ -596,6 +629,18 @@ export default function MessageItem({ message }: MessageItemProps) {
                   components={{
                     code({ className, children, ...props }: any) {
                       const match = /language-(\w+)/.exec(className || '')
+                      const language = match?.[1] || ''
+                      
+                      // Handle mermaid code blocks
+                      if (language === 'mermaid') {
+                        console.log('🎨 Normal ReactMarkdown rendering mermaid code:', children)
+                        return (
+                          <div className="my-2">
+                            <Mermaid code={String(children).replace(/\n$/, '')} />
+                          </div>
+                        )
+                      }
+                      
                       return match ? (
                         <div className="relative">
                           <SyntaxHighlighter

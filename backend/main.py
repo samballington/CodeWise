@@ -121,11 +121,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 if mentioned_projects:
                     print(f"[PROJECT SCOPE] User specified projects: {mentioned_projects}")
                 
-                # Send acknowledgment
-                await websocket.send_json({
-                    "type": "acknowledgment",
-                    "message": "Processing your request..."
-                })
+                # Send acknowledgment (with connection check)
+                try:
+                    if websocket.client_state.name == 'CONNECTED':
+                        await websocket.send_json({
+                            "type": "acknowledgment",
+                            "message": "Processing your request..."
+                        })
+                except Exception as ack_error:
+                    logger.warning(f"Failed to send acknowledgment to WebSocket {connection_id}: {ack_error}")
+                    continue  # Skip processing if we can't acknowledge
                 
                 # Add user message to memory
                 chat_memory.add_message("user", user_query)
@@ -154,8 +159,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             context = update.get("context", "")
                             print(f"[CONTEXT DEBUG] Context preview: {context[:500]}...")
                     
-                    # Forward all updates to the frontend
-                    await websocket.send_json(update)
+                    # Forward all updates to the frontend (with connection check)
+                    try:
+                        if websocket.client_state.name == 'CONNECTED':
+                            await websocket.send_json(update)
+                        else:
+                            logger.warning(f"Skipping message to disconnected WebSocket {connection_id}")
+                            break
+                    except Exception as send_error:
+                        logger.warning(f"Failed to send update to WebSocket {connection_id}: {send_error}")
+                        break
 
                     # If we reach final result, add assistant reply to memory
                     if update.get("type") == "final_result":
@@ -184,20 +197,34 @@ async def websocket_endpoint(websocket: WebSocket):
                         
                         chat_memory.add_message("assistant", final_output)
                 
-                # Send completion message
-                await websocket.send_json({
-                    "type": "completion",
-                    "message": "Task completed"
-                })
+                # Send completion message (with connection check)
+                try:
+                    if websocket.client_state.name == 'CONNECTED':
+                        await websocket.send_json({
+                            "type": "completion",
+                            "message": "Task completed"
+                        })
+                except Exception as completion_error:
+                    logger.warning(f"Failed to send completion message to WebSocket {connection_id}: {completion_error}")
                 
     except WebSocketDisconnect:
-        del active_connections[connection_id]
+        logger.info(f"WebSocket {connection_id} disconnected normally")
+        if connection_id in active_connections:
+            del active_connections[connection_id]
     except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Error: {str(e)}"
-        })
-        del active_connections[connection_id]
+        logger.error(f"WebSocket {connection_id} error: {str(e)}")
+        # Only try to send error message if WebSocket is still open
+        try:
+            if websocket.client_state.name == 'CONNECTED':
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Error: {str(e)}"
+                })
+        except Exception as send_error:
+            logger.warning(f"Could not send error message to closed WebSocket {connection_id}: {send_error}")
+        finally:
+            if connection_id in active_connections:
+                del active_connections[connection_id]
 
 # API Provider endpoints removed - OpenAI functionality disabled
 
