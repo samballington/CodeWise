@@ -51,6 +51,9 @@ class BM25Index:
         self.average_document_length: float = 0.0
         self.vocabulary: Set[str] = set()
         
+        # Inverted index: term -> set of document IDs containing the term
+        self.inverted: Dict[str, Set[int]] = defaultdict(set)
+        
         # Statistics
         self.total_documents = 0
         
@@ -100,6 +103,8 @@ class BM25Index:
         unique_terms = set(terms)
         for term in unique_terms:
             self.document_frequencies[term] += 1
+            # Add document to inverted index for this term
+            self.inverted[term].add(doc_id)
         
         # Store document length and update vocabulary
         self.document_lengths.append(len(terms))
@@ -167,9 +172,22 @@ class BM25Index:
         
         logger.debug(f"BM25 search for terms: {query_terms}")
         
-        # Calculate BM25 scores for all documents (optionally pre-filter by project)
+        # Use inverted index to get candidate documents (union of docs containing any query term)
+        candidate_docs = set()
+        for term in query_terms:
+            if term in self.inverted:
+                candidate_docs.update(self.inverted[term])
+        
+        # Fallback to full scan if no candidates found (shouldn't happen with valid terms)
+        if not candidate_docs:
+            logger.debug("No candidates found in inverted index, falling back to full scan")
+            candidate_docs = set(range(len(self.documents)))
+        
+        logger.debug(f"BM25 candidate filtering: {len(candidate_docs)} candidates from {len(self.documents)} total docs")
+        
+        # Calculate BM25 scores for candidate documents only (major speedup!)
         scores = []
-        for doc_id in range(len(self.documents)):
+        for doc_id in candidate_docs:
             score = self._calculate_bm25_score(doc_id, query_terms)
             if score >= min_score:
                 matched_terms = self._get_matched_terms(doc_id, query_terms)
@@ -290,12 +308,18 @@ class BM25Index:
     def save_index(self, file_path: Path) -> bool:
         """Save the BM25 index to disk"""
         try:
+            # Convert inverted index sets to lists for JSON serialization
+            inverted_serializable = {
+                term: list(doc_ids) for term, doc_ids in self.inverted.items()
+            }
+            
             index_data = {
                 'documents': self.documents,
                 'term_frequencies': self.term_frequencies,
                 'document_frequencies': dict(self.document_frequencies),
                 'document_lengths': self.document_lengths,
                 'vocabulary': list(self.vocabulary),
+                'inverted': inverted_serializable,
                 'total_documents': self.total_documents,
                 'average_document_length': self.average_document_length,
                 'parameters': {'k1': self.k1, 'b': self.b}
@@ -325,6 +349,19 @@ class BM25Index:
             self.total_documents = index_data['total_documents']
             self.average_document_length = index_data['average_document_length']
             
+            # Load inverted index, converting lists back to sets
+            inverted_data = index_data.get('inverted', {})
+            self.inverted = defaultdict(set)
+            for term, doc_ids in inverted_data.items():
+                self.inverted[term] = set(doc_ids)
+            
+            # If no inverted index in saved data, rebuild it from term_frequencies
+            if not inverted_data and self.term_frequencies:
+                logger.info("Rebuilding inverted index from existing term frequencies")
+                for doc_id, term_freqs in enumerate(self.term_frequencies):
+                    for term in term_freqs.keys():
+                        self.inverted[term].add(doc_id)
+            
             # Load parameters
             params = index_data.get('parameters', {})
             self.k1 = params.get('k1', 1.5)
@@ -344,5 +381,6 @@ class BM25Index:
         self.document_frequencies.clear()
         self.document_lengths.clear()
         self.vocabulary.clear()
+        self.inverted.clear()
         self.total_documents = 0
         self.average_document_length = 0.0

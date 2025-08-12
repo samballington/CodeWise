@@ -197,17 +197,25 @@ class ResultFusion:
         
         return sorted_results
     
-    def _normalize_vector_results(self, results: List[Tuple[str, str]]) -> List[Tuple[str, str, float]]:
-        """Normalize vector search results (assuming they come pre-scored)"""
+    def _normalize_vector_results(self, results: List[Tuple]) -> List[Tuple[str, str, float]]:
+        """Normalize vector search results - handle both legacy and score-enabled formats"""
         if not results:
             return []
         
-        # For now, assign decreasing scores based on order (vector store should provide scores)
         normalized = []
-        for i, (file_path, snippet) in enumerate(results):
-            # Simulate score based on position (higher is better)
-            score = max(0.1, 1.0 - (i * 0.2))
-            normalized.append((file_path, snippet, score))
+        
+        # Check if results include real similarity scores (new format: (path, snippet, score))
+        if results and len(results[0]) == 3:
+            # New format with real scores - use them directly
+            for file_path, snippet, score in results:
+                # Scores from vector store are already normalized relevance scores (0-1)
+                normalized.append((file_path, snippet, float(score)))
+        else:
+            # Legacy format without scores - fall back to positional scoring
+            for i, (file_path, snippet) in enumerate(results):
+                # Simulate score based on position (higher is better)
+                score = max(0.1, 1.0 - (i * 0.2))
+                normalized.append((file_path, snippet, score))
         
         return normalized
     
@@ -372,13 +380,18 @@ class HybridSearchEngine:
         # Create async tasks for parallel execution
         async def vector_search_task():
             try:
+                import os
+                # Enable score return if feature flag is set
+                return_scores = os.getenv("CODEWISE_VECTOR_RETURN_SCORES", "false").lower() == "true"
+                
                 results = await asyncio.to_thread(
                     self.vector_store.query,
                     query,
                     k=self.max_results,
                     allowed_projects=allowed_projects,
+                    return_scores=return_scores
                 )
-                logger.debug(f"Vector search returned {len(results)} results")
+                logger.debug(f"Vector search returned {len(results)} results (scores enabled: {return_scores})")
                 return results
             except Exception as e:
                 logger.error(f"Vector search failed: {e}")

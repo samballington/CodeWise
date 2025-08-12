@@ -1067,74 +1067,120 @@ class CodeWiseAgent:
         # Determine initial relevance threshold based on query complexity
         base_threshold = 0.25 if query_intent['complexity_score'] > 0.5 else 0.3
         
-        # Use hybrid search if available, otherwise fallback to vector search
-        if self.hybrid_search:
-            try:
-                logger.info(f"⏱️  SEARCH START: Hybrid search with threshold {base_threshold}")
-                start_time = time.time()
-                search_results = await self.hybrid_search.search(search_query, k=4, min_relevance=base_threshold)
-                chunks = [(result.file_path, result.snippet) for result in search_results]
-                duration = time.time() - start_time
-                search_attempts.append(f"Hybrid search: {len(chunks)} results")
-                logger.info(f"✅ SEARCH END: Hybrid search ({duration:.3f}s) - {len(chunks)} results")
-            except Exception as e:
-                logger.error(f"Hybrid search failed: {e}")
-                logger.info(f"⏱️  SEARCH START: Vector search fallback with threshold {base_threshold}")
-                start_time = time.time()
-                chunks = get_vector_store().query(search_query, k=4, min_relevance=base_threshold)
-                duration = time.time() - start_time
-                search_attempts.append(f"Vector search (fallback): {len(chunks)} results")
-                logger.info(f"✅ SEARCH END: Vector fallback ({duration:.3f}s) - {len(chunks)} results")
-        else:
-            logger.info(f"⏱️  SEARCH START: Vector search with threshold {base_threshold}")
-            start_time = time.time()
-            chunks = get_vector_store().query(search_query, k=4, min_relevance=base_threshold)
-            duration = time.time() - start_time
-            search_attempts.append(f"Vector search: {len(chunks)} results")
-            logger.info(f"✅ SEARCH END: Vector search ({duration:.3f}s) - {len(chunks)} results")
+        # OPTIMIZED: Single-batch context search (replaces N+1 hybrid calls)
+        # Combine main query + key terms into single vector + BM25 batch operation
+        prioritized_terms = [term for term in key_terms[:4] if term.lower() != query.lower() and len(term) > 2]
         
-        # Apply project filtering to main search results
-        chunks = filter_by_projects(chunks)
+        logger.info(f"⏱️  SEARCH START: Single-batch context search (1 vector + 1 BM25) with threshold {base_threshold}")
+        logger.info(f"   Main query: '{search_query}'")
+        logger.info(f"   Key terms: {prioritized_terms}")
+        
+        start_time = time.time()
+        all_chunks = []
+        
+        try:
+            if self.hybrid_search:
+                # Perform one vector search on main query
+                logger.debug("Executing vector search component...")
+                vector_search_start = time.time()
+                vector_results = await asyncio.to_thread(
+                    get_vector_store().query,
+                    search_query,
+                    k=8,  # Get more candidates for better fusion
+                    min_relevance=base_threshold * 0.8,  # Slightly lower threshold for vector
+                    allowed_projects=mentioned_projects,
+                    return_scores=True  # Get real scores for better fusion
+                )
+                vector_duration = time.time() - vector_search_start
+                logger.debug(f"Vector search completed in {vector_duration:.3f}s: {len(vector_results)} results")
+                
+                # Perform one BM25 search with combined terms
+                combined_query = f"{search_query} {' '.join(prioritized_terms)}"
+                logger.debug(f"Executing BM25 search component for: '{combined_query}'")
+                bm25_search_start = time.time()
+                bm25_results = await asyncio.to_thread(
+                    self.hybrid_search.bm25_index.search,
+                    combined_query,
+                    k=12,  # Get more BM25 candidates 
+                    min_score=base_threshold * 0.6,  # Lower threshold for BM25
+                    allowed_projects=mentioned_projects
+                )
+                bm25_duration = time.time() - bm25_search_start
+                logger.debug(f"BM25 search completed in {bm25_duration:.3f}s: {len(bm25_results)} results")
+                
+                # Manually fuse results using the fusion logic
+                logger.debug("Fusing vector and BM25 results...")
+                fusion_start = time.time()
+                from backend.hybrid_search import ResultFusion
+                
+                fusion = ResultFusion()
+                query_analysis = self.hybrid_search.query_processor.analyze_query(search_query)
+                
+                # Convert vector results to expected format
+                if vector_results and len(vector_results[0]) == 3:
+                    # Already has scores (path, snippet, score)
+                    vector_for_fusion = vector_results
+                else:
+                    # Legacy format (path, snippet) - add position-based scores
+                    vector_for_fusion = [(path, snippet, 1.0 - i*0.1) for i, (path, snippet) in enumerate(vector_results)]
+                
+                # Fuse the results
+                fused_results = fusion.fuse_results(vector_for_fusion, bm25_results, query_analysis)
+                
+                # Convert to expected format and apply threshold
+                for result in fused_results:
+                    if result.relevance_score >= base_threshold:
+                        all_chunks.append((result.file_path, result.snippet))
+                
+                fusion_duration = time.time() - fusion_start
+                logger.debug(f"Fusion completed in {fusion_duration:.3f}s: {len(all_chunks)} final results")
+                
+                search_attempts.append(f"Single-batch search: {len(all_chunks)} results (vector: {len(vector_results)}, BM25: {len(bm25_results)})")
+                
+            else:
+                # Fallback: single vector search with main query + terms
+                fallback_query = f"{search_query} {' '.join(prioritized_terms)}"
+                logger.debug(f"Fallback vector search for: '{fallback_query}'")
+                vector_results = get_vector_store().query(
+                    fallback_query, 
+                    k=10, 
+                    min_relevance=base_threshold,
+                    allowed_projects=mentioned_projects
+                )
+                all_chunks = vector_results
+                search_attempts.append(f"Vector search (combined query): {len(all_chunks)} results")
+                
+        except Exception as e:
+            logger.error(f"Single-batch search failed: {e}")
+            # Final fallback to original approach for this query only
+            logger.info("Falling back to individual searches due to single-batch failure")
+            chunks = get_vector_store().query(search_query, k=4, min_relevance=base_threshold, allowed_projects=mentioned_projects)
+            all_chunks = chunks
+            search_attempts.append(f"Fallback individual search: {len(all_chunks)} results")
+        
+        duration = time.time() - start_time
+        logger.info(f"✅ SEARCH END: Single-batch context search ({duration:.3f}s) - {len(all_chunks)} total results")
+        
+        # Apply project filtering to combined results
+        chunks = filter_by_projects(all_chunks)
         
         if chunks:
-            logger.info(f"Found {len(chunks)} chunks for main query (after project filtering)")
+            logger.info(f"Found {len(chunks)} chunks total (after project filtering)")
             all_context.extend(chunks)
-            context_sources.append(f"Main query: {len(chunks)} relevant chunks")
-        
-        # Enhanced key term search with prioritization
-        prioritized_terms = key_terms[:4]  # Increased from 3 to 4
-        for i, term in enumerate(prioritized_terms):
-            if term.lower() != query.lower() and len(term) > 2:  # Avoid duplicate and short terms
+            context_sources.append(f"Single-batch search: {len(chunks)} relevant chunks")
+            
+            # Log key term coverage for debugging
+            for term in prioritized_terms:
+                term_matches = sum(1 for _, snippet in chunks if term.lower() in snippet.lower())
+                if term_matches > 0:
+                    context_sources.append(f"Term '{term}': {term_matches} matches found")
+                    
+                # Send callback for each term (for UI feedback)
                 await callback_queue.put({
                     "type": "context_search", 
                     "source": "key term analysis",
                     "query": term
                 })
-                
-                # Use lower threshold for key terms to find more context
-                term_threshold = base_threshold * 0.7
-                
-                try:
-                    if self.hybrid_search:
-                        term_results = await self.hybrid_search.search(term, k=2, min_relevance=term_threshold)
-                        term_chunks = [(result.file_path, result.snippet) for result in term_results]
-                    else:
-                        term_chunks = get_vector_store().query(term, k=2, min_relevance=term_threshold)
-                    
-                    # Apply project filtering to term search results
-                    term_chunks = filter_by_projects(term_chunks)
-                    
-                    if term_chunks:
-                        logger.info(f"Found {len(term_chunks)} chunks for term: {term} (after project filtering)")
-                        all_context.extend(term_chunks)
-                        context_sources.append(f"Term '{term}': {len(term_chunks)} chunks")
-                        search_attempts.append(f"Term '{term}': {len(term_chunks)} results")
-                    else:
-                        search_attempts.append(f"Term '{term}': 0 results")
-                        
-                except Exception as e:
-                    logger.error(f"Search failed for term '{term}': {e}")
-                    search_attempts.append(f"Term '{term}': failed")
         
         # Remove duplicates while preserving order and relevance
         seen_contexts = set()
