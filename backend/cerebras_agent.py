@@ -332,23 +332,24 @@ class CerebrasNativeAgent:
         if tool_call_count == 0:
             return False  # No tools called, response is expected to be brief
         
-        # Check for clearly inadequate responses
-        inadequate_patterns = [
-            "task completed",
-            "done",
-            "completed", 
-            "finished"
-        ]
-        
+        # More conservative inadequate response detection
         response_lower = response_text.lower().strip()
         
-        # Short response with tools called is likely inadequate
-        if len(response_text.strip()) < 50 and tool_call_count > 0:
-            return True
+        # Only trigger for very short responses that are clearly inadequate
+        if len(response_text.strip()) < 30 and tool_call_count > 2:
+            # Check if it's just a generic completion message
+            inadequate_patterns = [
+                "task completed",
+                "done",
+                "completed", 
+                "finished"
+            ]
+            if any(pattern in response_lower for pattern in inadequate_patterns):
+                return True
             
-        # Check for generic completion messages
-        if any(pattern in response_lower for pattern in inadequate_patterns):
-            return True
+        # Don't trigger synthesis for Mermaid generation or intermediate responses
+        if "mermaid" in response_lower or "diagram" in response_lower:
+            return False
             
         return False
     
@@ -2187,7 +2188,10 @@ class CerebrasNativeAgent:
         yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
         
         # Multi-turn tool calling loop with duplicate detection
-        max_iterations = 7  # Optimized for faster processing while maintaining quality
+        # Dynamic iteration limit based on query complexity
+        query_lower = query.lower()
+        needs_diagrams = any(keyword in query_lower for keyword in ['mermaid', 'diagram', 'architecture', 'chart', 'visualization', 'flowchart'])
+        max_iterations = 12 if needs_diagrams else 7  # Allow more iterations for complex visual queries
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made

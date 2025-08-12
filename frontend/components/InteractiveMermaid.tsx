@@ -477,8 +477,8 @@ export default function InteractiveMermaid({ code, className, title }: Interacti
     )
   }
 
-  const containerHeight = bounds.complexity === 'complex' ? '500px' : 
-                         bounds.complexity === 'medium' ? '400px' : '300px'
+  const containerHeight = bounds.complexity === 'complex' ? '575px' : 
+                         bounds.complexity === 'medium' ? '460px' : '345px'
 
   return (
     <>
