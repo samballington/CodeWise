@@ -25,6 +25,35 @@ class ResponseSanitizer:
     def __init__(self):
         self.logger = logging.getLogger(f"{__name__}.ResponseSanitizer")
     
+    def validate_and_fix_mermaid_content(self, text: str) -> str:
+        """
+        Validate and fix Mermaid content to prevent invalid diagrams from reaching UI.
+        
+        Removes placeholder text like '[MERMAID Diagram]' and validates syntax.
+        """
+        if not text:
+            return text
+            
+        # Remove dangerous placeholder patterns that break UI
+        mermaid_placeholders = [
+            r'\[MERMAID\s+Diagram\]',
+            r'\[Mermaid\s+Diagram\]', 
+            r'\[mermaid\s+diagram\]',
+            r'\[MERMAID\]',
+            r'\[Diagram\]',
+            r'```mermaid\s*\[.*?diagram.*?\]\s*```',
+            r'## High‑Level Component Diagram\s*\[MERMAID Diagram\]'
+        ]
+        
+        original_text = text
+        for pattern in mermaid_placeholders:
+            text = re.sub(pattern, '<!-- Mermaid diagram generation failed - placeholder removed -->', text, flags=re.IGNORECASE)
+        
+        if text != original_text:
+            self.logger.warning("🚫 MERMAID SANITIZER: Removed placeholder text to prevent UI corruption")
+            
+        return text
+    
     def extract_json_from_text(self, text: str) -> Optional[str]:
         """
         Extract JSON object from text that may contain conversational content.
@@ -225,7 +254,8 @@ class ResponseSanitizer:
         Main sanitization function that processes raw LLM response.
         
         Process:
-        1. Extract JSON from potentially mixed content
+        1. Validate and fix Mermaid content
+        2. Extract JSON from potentially mixed content
         2. Validate JSON structure
         3. Generate readable text summary
         4. Return sanitized results
@@ -242,6 +272,9 @@ class ResponseSanitizer:
         self.logger.info(f"🧼 SANITIZER: Processing LLM response ({len(raw_response)} chars)")
         
         try:
+            # Step 0: Validate and fix Mermaid content to prevent UI corruption
+            raw_response = self.validate_and_fix_mermaid_content(raw_response)
+            
             # Step 1: Extract JSON from text
             json_string = self.extract_json_from_text(raw_response)
             if not json_string:
