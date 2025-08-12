@@ -47,9 +47,9 @@ class CerebrasNativeAgent:
         self.available_functions = self._create_function_mapping()
         self.current_mentioned_projects = None  # Store current project context
         
-        # Rate limiting: Enforced as 1 request per second (not just 30/minute window)  
-        # Use 1.1s for safety buffer
-        self.min_request_interval = 1.1
+        # Rate limiting: Optimized for better performance
+        # Reduced from 1.1s to 0.5s for faster processing
+        self.min_request_interval = 0.5
         self.last_request_time = 0
         
         # Initialize enhanced project structure analyzer
@@ -2184,7 +2184,7 @@ class CerebrasNativeAgent:
         yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
         
         # Multi-turn tool calling loop with duplicate detection
-        max_iterations = 10  # Increased for more comprehensive responses
+        max_iterations = 7  # Optimized for faster processing while maintaining quality
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made

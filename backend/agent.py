@@ -1169,7 +1169,34 @@ class CodeWiseAgent:
             all_context.extend(chunks)
             context_sources.append(f"Single-batch search: {len(chunks)} relevant chunks")
             
-            # Log key term coverage for debugging
+            # OPTIMIZATION: Early termination if we have sufficient high-quality context
+            if len(chunks) >= 3:
+                high_quality_chunks = [chunk for chunk in chunks[:5]]  # Check top 5
+                if len(high_quality_chunks) >= 3:
+                    logger.info(f"⚡ EARLY TERMINATION: Found {len(high_quality_chunks)} high-quality chunks, skipping additional searches")
+                    # Still do minimal key term logging for completeness
+                    for term in prioritized_terms[:2]:  # Only log first 2 terms
+                        await callback_queue.put({
+                            "type": "context_search", 
+                            "source": "key term analysis",
+                            "query": term
+                        })
+                    # Skip to context building
+                    unique_context = list(dict.fromkeys(all_context))  # Remove duplicates
+                    context_summary = self._build_context_summary(unique_context, query)
+                    
+                    await callback_queue.put({
+                        "type": "context_gathering_complete",
+                        "sources": context_sources,
+                        "chunks_found": len(unique_context),
+                        "files_analyzed": len(set(path for path, _ in unique_context))
+                    })
+                    
+                    logger.info(f"⚡ EARLY COMPLETE: {len(unique_context)} chunks from "
+                               f"{len(set(path for path, _ in unique_context))} files")
+                    return context_summary
+            
+            # Log key term coverage for debugging (normal path)
             for term in prioritized_terms:
                 term_matches = sum(1 for _, snippet in chunks if term.lower() in snippet.lower())
                 if term_matches > 0:
