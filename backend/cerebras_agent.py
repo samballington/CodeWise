@@ -2189,7 +2189,7 @@ class CerebrasNativeAgent:
         
         # Multi-turn tool calling loop with duplicate detection
         # Dynamic iteration limit based on query complexity
-        query_lower = query.lower()
+        query_lower = user_query.lower()
         needs_diagrams = any(keyword in query_lower for keyword in ['mermaid', 'diagram', 'architecture', 'chart', 'visualization', 'flowchart'])
         max_iterations = 12 if needs_diagrams else 7  # Allow more iterations for complex visual queries
         iteration = 0
