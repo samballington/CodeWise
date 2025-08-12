@@ -20,7 +20,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - CEREBRAS_API_KEY=csk-6kyr6y49rjrk8xkk8xc3yrdkfx9cyr6d33v9rt9ft269cjct
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
       - DEFAULT_PROVIDER_MODEL=${DEFAULT_PROVIDER_MODEL}
       - PRIMARY_PROVIDER=cerebras
       - MCP_SERVER_URL=http://mcp_server:8001

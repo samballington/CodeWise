@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import openai
 from typing import AsyncGenerator, Dict, Any, List, Tuple
 from langchain.agents import AgentExecutor, create_openai_tools_agent
@@ -307,6 +308,9 @@ class MCPToolWrapper:
     
     async def call_mcp_tool(self, tool_name: str, params: Dict[str, Any]) -> str:
         """Call an MCP server tool"""
+        start_time = time.time()
+        logger.info(f"⏱️  TOOL START: {tool_name}")
+        
         try:
             response = await self.client.post(
                 f"{self.mcp_server_url}/tools/{tool_name}",
@@ -314,8 +318,13 @@ class MCPToolWrapper:
             )
             response.raise_for_status()
             result = response.json()
+            
+            duration = time.time() - start_time
+            logger.info(f"✅ TOOL END: {tool_name} ({duration:.3f}s)")
             return result.get("result", "Tool executed successfully")
         except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"❌ TOOL FAILED: {tool_name} ({duration:.3f}s) - {str(e)}")
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
     async def read_file(self, file_path: str) -> str:
@@ -971,13 +980,24 @@ class CodeWiseAgent:
     
     async def auto_search_context(self, query: str, callback_queue: asyncio.Queue, chat_history=None, mentioned_projects: List[str] = None) -> str:
         """Enhanced automatic context search with improved fallback strategies"""
-        logger.info(f"Starting enhanced auto-context search for query: {query}")
+        context_start_time = time.time()
+        logger.info(f"⏱️  CONTEXT START: Auto-context search for query: {query}")
         
         # Send context gathering notification
         await callback_queue.put({
             "type": "context_gathering_start",
             "message": "Analyzing query and gathering relevant context..."
         })
+        
+        result = await self._execute_context_search(query, callback_queue, chat_history, mentioned_projects)
+        
+        context_duration = time.time() - context_start_time
+        logger.info(f"✅ CONTEXT END: Auto-context complete ({context_duration:.3f}s)")
+        
+        return result
+
+    async def _execute_context_search(self, query: str, callback_queue: asyncio.Queue, chat_history=None, mentioned_projects: List[str] = None) -> str:
+        """Internal method to execute context search with performance tracking"""
         
         # Log project scope if mentioned projects are provided
         if mentioned_projects:
@@ -996,8 +1016,12 @@ class CodeWiseAgent:
                     previous_queries.append(message.content)
         
         # Analyze query intent and extract key terms with context history
+        logger.info("⏱️  ANALYSIS START: Query intent and key terms")
+        analysis_start = time.time()
         query_intent = self.context_extractor.analyze_query_intent(query)
         key_terms = self.context_extractor.extract_key_terms(query, context_history=previous_queries)
+        analysis_duration = time.time() - analysis_start
+        logger.info(f"✅ ANALYSIS END: Query analysis ({analysis_duration:.3f}s)")
         
         logger.info(f"Query analysis: type={query_intent['query_type']}, "
                    f"projects={query_intent['project_hints']}, "
@@ -1046,22 +1070,28 @@ class CodeWiseAgent:
         # Use hybrid search if available, otherwise fallback to vector search
         if self.hybrid_search:
             try:
-                logger.info(f"Attempting hybrid search with threshold {base_threshold}")
+                logger.info(f"⏱️  SEARCH START: Hybrid search with threshold {base_threshold}")
+                start_time = time.time()
                 search_results = await self.hybrid_search.search(search_query, k=4, min_relevance=base_threshold)
                 chunks = [(result.file_path, result.snippet) for result in search_results]
+                duration = time.time() - start_time
                 search_attempts.append(f"Hybrid search: {len(chunks)} results")
-                logger.info(f"Hybrid search successful: {len(chunks)} results found")
+                logger.info(f"✅ SEARCH END: Hybrid search ({duration:.3f}s) - {len(chunks)} results")
             except Exception as e:
                 logger.error(f"Hybrid search failed: {e}")
-                logger.info(f"Falling back to vector search with threshold {base_threshold}")
+                logger.info(f"⏱️  SEARCH START: Vector search fallback with threshold {base_threshold}")
+                start_time = time.time()
                 chunks = get_vector_store().query(search_query, k=4, min_relevance=base_threshold)
+                duration = time.time() - start_time
                 search_attempts.append(f"Vector search (fallback): {len(chunks)} results")
-                logger.info(f"Vector search fallback: {len(chunks)} results found")
+                logger.info(f"✅ SEARCH END: Vector fallback ({duration:.3f}s) - {len(chunks)} results")
         else:
-            logger.info(f"Using vector search with threshold {base_threshold}")
+            logger.info(f"⏱️  SEARCH START: Vector search with threshold {base_threshold}")
+            start_time = time.time()
             chunks = get_vector_store().query(search_query, k=4, min_relevance=base_threshold)
+            duration = time.time() - start_time
             search_attempts.append(f"Vector search: {len(chunks)} results")
-            logger.info(f"Vector search: {len(chunks)} results found")
+            logger.info(f"✅ SEARCH END: Vector search ({duration:.3f}s) - {len(chunks)} results")
         
         # Apply project filtering to main search results
         chunks = filter_by_projects(chunks)
@@ -1702,10 +1732,14 @@ User Query: {user_query}"""
                     if chat_history is not None:
                         kwargs["chat_history"] = chat_history
                     
+                    logger.info("⏱️  LLM START: Agent execution")
+                    llm_start_time = time.time()
                     result = await self.agent.ainvoke(
                         kwargs,
                         callbacks=[callback_handler]
                     )
+                    llm_duration = time.time() - llm_start_time
+                    logger.info(f"✅ LLM END: Agent execution ({llm_duration:.3f}s)")
                     # Cost estimation based on token usage
                     usage = None
                     if isinstance(result, dict):
