@@ -47,9 +47,9 @@ class CerebrasNativeAgent:
         self.available_functions = self._create_function_mapping()
         self.current_mentioned_projects = None  # Store current project context
         
-        # Rate limiting: Enforced as 1 request per second (not just 30/minute window)  
-        # Use 1.1s for safety buffer
-        self.min_request_interval = 1.1
+        # Rate limiting: Optimized for better performance
+        # Reduced from 1.1s to 0.5s for faster processing
+        self.min_request_interval = 0.5
         self.last_request_time = 0
         
         # Initialize enhanced project structure analyzer
@@ -332,23 +332,24 @@ class CerebrasNativeAgent:
         if tool_call_count == 0:
             return False  # No tools called, response is expected to be brief
         
-        # Check for clearly inadequate responses
-        inadequate_patterns = [
-            "task completed",
-            "done",
-            "completed", 
-            "finished"
-        ]
-        
+        # More conservative inadequate response detection
         response_lower = response_text.lower().strip()
         
-        # Short response with tools called is likely inadequate
-        if len(response_text.strip()) < 50 and tool_call_count > 0:
-            return True
+        # Only trigger for very short responses that are clearly inadequate
+        if len(response_text.strip()) < 30 and tool_call_count > 2:
+            # Check if it's just a generic completion message
+            inadequate_patterns = [
+                "task completed",
+                "done",
+                "completed", 
+                "finished"
+            ]
+            if any(pattern in response_lower for pattern in inadequate_patterns):
+                return True
             
-        # Check for generic completion messages
-        if any(pattern in response_lower for pattern in inadequate_patterns):
-            return True
+        # Don't trigger synthesis for Mermaid generation or intermediate responses
+        if "mermaid" in response_lower or "diagram" in response_lower:
+            return False
             
         return False
     
@@ -1866,20 +1867,16 @@ class CerebrasNativeAgent:
                     "\n• Keep searching new areas until you're CONFIDENT nothing important remains"
                     "\n• MANDATORY: Examine multiple related files to understand complete context and relationships"
                     "\n• Bias towards gathering more information rather than asking the user for help"
-                    "\n\n🎯 EXCEPTIONAL RESPONSE STANDARDS - COMPREHENSIVE BY DEFAULT:"
-                    "\n• ALWAYS PROVIDE COMPREHENSIVE ANALYSIS: Every response should be thorough, detailed, and complete - never give brief or surface-level answers"
-                    "\n• EXPLAIN EVERYTHING: Assume the user wants to understand the full context, background, and implications of every aspect"
-                    "\n• MULTI-LAYERED TECHNICAL ANALYSIS: Include specific code examples, file paths, implementation details, and architectural context"
-                    "\n• ARCHITECTURAL DEPTH: Explain design patterns, architectural decisions, data flow, and system boundaries with concrete evidence"
-                    "\n• CODE EVIDENCE: Always include relevant code snippets with proper syntax highlighting and detailed explanations"
-                    "\n• TECHNICAL REASONING: Explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
-                    "\n• IMPLEMENTATION DETAILS: Cover error handling, edge cases, performance considerations, and security implications"
-                    "\n• DEPENDENCY ANALYSIS: Map relationships between components, external dependencies, and system interactions"
+                    "\n\n🎯 SMART RESPONSE STRATEGY - MATCH DEPTH TO QUERY TYPE:"
+                    "\n• ADAPTIVE DETAIL LEVEL: Match response depth to query complexity and user need - brief for simple questions, comprehensive for complex analysis"
+                    "\n• STRATEGIC CODE EXAMPLES: Include code snippets only when they directly illustrate or support your explanation"
+                    "\n• CLARITY OVER VOLUME: Prioritize clear, actionable insights over exhaustive detail"
+                    "\n• CONTEXT-AWARE VERBOSITY: Provide just enough detail to fully answer the question without overwhelming"
+                    "\n• TECHNICAL REASONING: Always explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
+                    "\n• IMPLEMENTATION FOCUS: Cover relevant error handling, edge cases, performance considerations, and security implications"
+                    "\n• DEPENDENCY ANALYSIS: Map relationships between components, external dependencies, and system interactions when relevant"
                     "\n• ACTIONABLE INSIGHTS: Provide specific recommendations for improvements, optimizations, and best practices"
-                    "\n• MULTIPLE PERSPECTIVES: Analyze from developer, architect, security, performance, and maintainability viewpoints"
                     "\n• STRUCTURED RESPONSES: Organize with clear sections using markdown formatting for readability"
-                    "\n• COMPLETE COVERAGE: Address all aspects of the query with thorough analysis and supporting evidence"
-                    "\n• DEFAULT TO VERBOSE: When in doubt, provide more detail rather than less - users can always ask for summaries if needed"
                     "\n• ANTICIPATE FOLLOW-UPS: Address related questions and provide context that prevents the need for follow-up queries"
                     "\n"
                     "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
@@ -1897,6 +1894,13 @@ class CerebrasNativeAgent:
                     "\n   • Implementation patterns and design decisions"
                     "\n   • Performance, security, and maintainability considerations"
                     "\n   • Concrete recommendations and actionable next steps"
+                    "\n\n📝 RESPONSE EXAMPLES BY QUERY TYPE:"
+                    "\n• SIMPLE QUESTION: 'How do I run tests?' → 'Run `npm test` in the root directory. Found test scripts in package.json and Jest configuration in jest.config.js.'"
+                    "\n• QUICK LOOKUP: 'What's the API endpoint for user auth?' → '`POST /api/auth/login` in src/routes/auth.js:15. Requires username/password, returns JWT token.'"
+                    "\n• CODE LOCATION: 'Where is password validation?' → 'Password validation is in src/utils/validation.js:42-58 using bcrypt with minimum 8 characters and complexity requirements.'"
+                    "\n• ARCHITECTURAL QUERY: 'Explain the authentication system' → '[Comprehensive analysis with]: Overview, components (middleware, routes, models), data flow diagram, security measures, code examples from key files'"
+                    "\n• DEBUGGING REQUEST: 'Why are login requests failing?' → '[Focused investigation]: Error analysis, relevant error handling code, configuration issues, step-by-step debugging approach'"
+                    "\n• FEATURE EXPLORATION: 'How does the shopping cart work?' → '[Detailed walkthrough]: State management, persistence, user interactions, related components, API integration with targeted code examples'"
                     "\n\n🔧 TOOL USAGE OPTIMIZATION:"
                     "\n• SMART_SEARCH: Your primary exploration tool - use multiple queries with different angles"
                     "\n  - Start broad ('authentication system') then narrow ('JWT token validation')"
@@ -2184,7 +2188,10 @@ class CerebrasNativeAgent:
         yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
         
         # Multi-turn tool calling loop with duplicate detection
-        max_iterations = 10  # Increased for more comprehensive responses
+        # Dynamic iteration limit based on query complexity
+        query_lower = user_query.lower()
+        needs_diagrams = any(keyword in query_lower for keyword in ['mermaid', 'diagram', 'architecture', 'chart', 'visualization', 'flowchart'])
+        max_iterations = 12 if needs_diagrams else 7  # Allow more iterations for complex visual queries
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made

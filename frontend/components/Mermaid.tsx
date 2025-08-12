@@ -2,10 +2,13 @@
 
 import React, { useEffect, useId, useState } from 'react'
 import { AlertCircle, CheckCircle } from 'lucide-react'
+import InteractiveMermaid from './InteractiveMermaid'
 
 interface MermaidProps {
   code: string
   className?: string
+  interactive?: boolean
+  title?: string
 }
 
 interface MermaidState {
@@ -15,7 +18,11 @@ interface MermaidState {
   correctionAttempted: boolean
 }
 
-export default function Mermaid({ code, className }: MermaidProps) {
+export default function Mermaid({ code, className, interactive = true, title }: MermaidProps) {
+  // Use interactive version by default
+  if (interactive) {
+    return <InteractiveMermaid code={code} className={className} title={title} />
+  }
   const [state, setState] = useState<MermaidState>({
     svg: '',
     error: '',

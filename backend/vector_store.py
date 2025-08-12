@@ -41,7 +41,7 @@ class VectorStore:
         else:
             # If index not present, fallback to empty index (indexer builds asynchronously)
             logger.warning("No vector index found, creating empty index")
-            self.index = faiss.IndexFlatL2(768)
+            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
 
     # --------------------------- internal helpers ---------------------------
     def _chunk_text(self, text: str) -> List[str]:
@@ -129,7 +129,7 @@ class VectorStore:
 
         if not texts:
             logger.warning("No text content found for indexing - creating empty index")
-            self.index = faiss.IndexFlatL2(768)
+            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
             return
 
         logger.info(f"Generating embeddings for {len(texts)} text chunks")
@@ -188,7 +188,7 @@ class VectorStore:
             current_mtime = self.index_path.stat().st_mtime
         except FileNotFoundError:
             logger.warning("Index file not found; using empty index")
-            self.index = faiss.IndexFlatL2(768)
+            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
             self.meta = []
             self._index_mtime = None
             return
@@ -242,12 +242,29 @@ class VectorStore:
         k: int = 3,
         min_relevance: float = 0.3,
         allowed_projects: Optional[List[str]] = None,
-    ) -> List[Tuple[str, str]]:
+        return_scores: bool = None,
+    ) -> List[Tuple[str, str]] | List[Tuple[str, str, float]]:
         """Query the vector store with enhanced relevance scoring and adaptive filtering.
 
         If allowed_projects is provided, only return results whose file paths belong to those
         projects. This restriction is applied BEFORE scoring/logging to avoid cross-project noise.
+        
+        Args:
+            query: Search query string
+            k: Maximum number of results to return
+            min_relevance: Minimum relevance score threshold
+            allowed_projects: Optional list of project names to filter results
+            return_scores: If True, return (path, snippet, score) tuples. If None, uses 
+                          CODEWISE_VECTOR_RETURN_SCORES environment variable. Defaults to False.
+        
+        Returns:
+            List of (path, snippet) tuples if return_scores=False, or
+            List of (path, snippet, score) tuples if return_scores=True
         """
+        # Determine whether to return scores based on parameter or environment variable
+        if return_scores is None:
+            return_scores = os.getenv("CODEWISE_VECTOR_RETURN_SCORES", "false").lower() == "true"
+        
         # Ensure we are using the latest index built by the indexer
         self._refresh_if_updated()
 
@@ -318,8 +335,11 @@ class VectorStore:
                 else:
                     current_threshold = adaptive_threshold
             
-            # Return top k results
-            final_results = [(path, snippet) for _, path, snippet in scored_results[:k]]
+            # Return top k results with or without scores based on feature flag
+            if return_scores:
+                final_results = [(path, snippet, score) for score, path, snippet in scored_results[:k]]
+            else:
+                final_results = [(path, snippet) for _, path, snippet in scored_results[:k]]
             
             logger.debug(f"Vector search returned {len(final_results)} results from {len(all_scored_results)} candidates "
                        f"(threshold: {current_threshold:.3f})")
@@ -379,7 +399,7 @@ class VectorStore:
         
         if not new_meta:
             # No embeddings left, create empty index
-            self.index = faiss.IndexFlatL2(768)
+            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
             self.meta = []
         else:
             # Rebuild index with remaining embeddings
@@ -397,7 +417,7 @@ class VectorStore:
                     new_index.add(embeddings_array)
                     self.index = new_index
                 else:
-                    self.index = faiss.IndexFlatL2(768)
+                    self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
                 
                 self.meta = new_meta
             except Exception:
@@ -425,7 +445,7 @@ class VectorStore:
 
     def clear_all_embeddings(self):
         """Clear all embeddings and rebuild empty index."""
-        self.index = faiss.IndexFlatL2(768)
+        self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
         self.meta = []
         
         # Save empty state

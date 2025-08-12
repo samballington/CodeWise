@@ -16,6 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from github_auth import router as github_oauth_router
 from routers.projects import router as projects_router
 from api_providers import get_provider_manager
+import time
 import logging
 
 # Load environment variables
@@ -86,6 +87,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # Process the message
             if message.get("type") == "user_message":
+                # Start timing this request
+                request_start_time = time.time()
+                logger.info("⏱️  REQUEST START: Processing user message")
+                
                 user_query = message.get("content", "")
                 mentioned_projects = message.get("mentionedProjects", [])
                 
@@ -196,6 +201,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.info("="*80)
                         
                         chat_memory.add_message("assistant", final_output)
+                
+                # End timing and log total request time
+                total_request_time = time.time() - request_start_time
+                logger.info(f"✅ REQUEST END: Total processing time ({total_request_time:.3f}s)")
                 
                 # Send completion message (with connection check)
                 try:

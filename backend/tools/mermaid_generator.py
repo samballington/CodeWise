@@ -23,7 +23,10 @@ TEMPLATE_CONFIG = {
             "classDef frontendStyle fill:#76c893,stroke:#333,stroke-width:2px", 
             "classDef backendStyle fill:#52b69a,stroke:#333,stroke-width:2px",
             "classDef dbStyle fill:#34a0a4,stroke:#333,stroke-width:2px",
-            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px"
+            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px",
+            "classDef successStyle fill:#28a745,stroke:#155724,stroke-width:3px,color:white",
+            "classDef warningStyle fill:#ffc107,stroke:#856404,stroke-width:3px,color:#212529",
+            "classDef errorStyle fill:#dc3545,stroke:#721c24,stroke-width:3px,color:white"
         ],
         "style_mappings": {
             # Generic mappings based on keywords and shapes
@@ -46,7 +49,31 @@ TEMPLATE_CONFIG = {
             "payment": "externalStyle",
             "service": "externalStyle",
             "stripe": "externalStyle",
-            "sendgrid": "externalStyle"
+            "sendgrid": "externalStyle",
+            # Status-based mappings (highest priority)
+            "success": "successStyle",
+            "successful": "successStyle",
+            "healthy": "successStyle",
+            "running": "successStyle",
+            "active": "successStyle",
+            "online": "successStyle",
+            "ok": "successStyle",
+            "completed": "successStyle",
+            "warning": "warningStyle",
+            "caution": "warningStyle",
+            "pending": "warningStyle",
+            "loading": "warningStyle",
+            "busy": "warningStyle",
+            "maintenance": "warningStyle",
+            "degraded": "warningStyle",
+            "error": "errorStyle",
+            "failed": "errorStyle",
+            "critical": "errorStyle",
+            "down": "errorStyle",
+            "offline": "errorStyle",
+            "crashed": "errorStyle",
+            "blocked": "errorStyle",
+            "invalid": "errorStyle"
         },
         "shape_mappings": {
             "database": "dbStyle",
@@ -98,7 +125,10 @@ TEMPLATE_CONFIG = {
             "classDef entrypointStyle fill:#ef476f,stroke:#333,stroke-width:2px,color:white",
             "classDef controllerStyle fill:#f78c6b,stroke:#333,stroke-width:2px",
             "classDef serviceStyle fill:#ffd166,stroke:#333,stroke-width:2px", 
-            "classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px"
+            "classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px",
+            "classDef successStyle fill:#28a745,stroke:#155724,stroke-width:3px,color:white",
+            "classDef warningStyle fill:#ffc107,stroke:#856404,stroke-width:3px,color:#212529",
+            "classDef errorStyle fill:#dc3545,stroke:#721c24,stroke-width:3px,color:white"
         ],
         "style_mappings": {
             "request": "entrypointStyle",
@@ -112,7 +142,31 @@ TEMPLATE_CONFIG = {
             "model": "modelStyle",
             "data": "modelStyle",
             "database": "modelStyle",
-            "users": "modelStyle"
+            "users": "modelStyle",
+            # Status-based mappings (highest priority)
+            "success": "successStyle",
+            "successful": "successStyle",
+            "healthy": "successStyle",
+            "running": "successStyle",
+            "active": "successStyle",
+            "online": "successStyle",
+            "ok": "successStyle",
+            "completed": "successStyle",
+            "warning": "warningStyle",
+            "caution": "warningStyle",
+            "pending": "warningStyle",
+            "loading": "warningStyle",
+            "busy": "warningStyle",
+            "maintenance": "warningStyle",
+            "degraded": "warningStyle",
+            "error": "errorStyle",
+            "failed": "errorStyle",
+            "critical": "errorStyle",
+            "down": "errorStyle",
+            "offline": "errorStyle",
+            "crashed": "errorStyle",
+            "blocked": "errorStyle",
+            "invalid": "errorStyle"
         },
         "shape_mappings": {
             "rhombus": "controllerStyle",
@@ -370,51 +424,207 @@ def _generate_graph_diagram(nodes: List[Dict], edges: List[Dict], config: Dict) 
     
     return "\n".join(lines)
 
+def _add_node_icon(label: str, node_id: str = "", shape: str = "") -> str:
+    """
+    Add appropriate text-based icons to node labels based on content and context.
+    Maps node types to visual icons for better semantic representation.
+    """
+    if not label:
+        return label
+    
+    # Convert to lowercase for keyword matching
+    text_content = f"{label} {node_id}".lower()
+    
+    # Define icon mappings based on node functionality/type
+    icon_mappings = [
+        # Security/Authentication icons
+        (["auth", "login", "security", "permission", "token", "certificate", "ssl", "oauth"], "🔒"),
+        
+        # Database/Storage icons  
+        (["database", "db", "storage", "cache", "redis", "mongodb", "postgresql", "mysql", "data"], "💾"),
+        
+        # Web/API icons
+        (["api", "gateway", "endpoint", "web", "http", "rest", "graphql", "service", "server"], "🌐"),
+        
+        # Analytics/Data processing icons
+        (["analytics", "reporting", "metrics", "dashboard", "chart", "graph", "statistics", "data"], "📊"),
+        
+        # User/People icons
+        (["user", "admin", "customer", "client", "person", "account", "profile"], "👤"),
+        
+        # Processing/Compute icons
+        (["process", "processor", "compute", "calculation", "algorithm", "engine", "worker"], "⚙️"),
+        
+        # Event/Notification icons
+        (["event", "notification", "alert", "message", "queue", "publish", "subscribe", "trigger"], "📢"),
+        
+        # External/Third-party icons
+        (["external", "third-party", "payment", "stripe", "aws", "gcp", "azure", "cdn"], "🔗")
+    ]
+    
+    # Find the first matching icon category
+    for keywords, icon in icon_mappings:
+        if any(keyword in text_content for keyword in keywords):
+            # Only add icon if not already present
+            if not any(existing_icon in label for existing_icon in ['🔒', '💾', '🌐', '📊', '👤', '⚙️', '📢', '🔗']):
+                return f"{icon} {label}"
+            break
+    
+    return label
+
 def _generate_node_definition(node: Dict) -> str:
-    """Generate Mermaid node definition with proper shape syntax"""
+    """Generate Mermaid node definition with proper shape syntax and icon integration"""
     node_id = _sanitize_id(node.get("id", ""))
     if not node_id:
         return ""
         
-    label = _escape_label(node.get("label", node_id))
+    original_label = node.get("label", node_id)
     shape = node.get("shape", "square")
+    
+    # Add appropriate icon to the label
+    enhanced_label = _add_node_icon(original_label, node_id, shape)
+    escaped_label = _escape_label(enhanced_label)
     
     # Map shapes to Mermaid syntax (following merprompt.md specifications)
     shape_syntax = {
-        "square": f"{node_id}[\"{label}\"]",
-        "round-edge": f"{node_id}([{label}])",
-        "database": f"{node_id}[({label})]", 
-        "rhombus": f"{node_id}{{{label}}}",
-        "circle": f"{node_id}(({label}))",
-        "hexagon": f"{node_id}{{{{  {label}  }}}}"
+        "square": f"{node_id}[\"{escaped_label}\"]",
+        "round-edge": f"{node_id}([{escaped_label}])",
+        "database": f"{node_id}[({escaped_label})]", 
+        "rhombus": f"{node_id}{{{escaped_label}}}",
+        "circle": f"{node_id}(({escaped_label}))",
+        "hexagon": f"{node_id}{{{{  {escaped_label}  }}}}"
     }
     
-    result = shape_syntax.get(shape, f"{node_id}[\"{label}\"]")
+    result = shape_syntax.get(shape, f"{node_id}[\"{escaped_label}\"]")
     logger.debug(f"Generated node: {result}")
     return result
 
+def _determine_arrow_type(edge: Dict) -> str:
+    """
+    Determine appropriate arrow type based on relationship context.
+    Maps relationship keywords to semantic arrow styles.
+    """
+    label = edge.get("label", "").lower()
+    
+    # Data flow arrows (thick) - for data transfer, flow, sending
+    data_flow_keywords = ["data flow", "sends", "transfers", "flows", "pushes", "streams", "pipes"]
+    if any(keyword in label for keyword in data_flow_keywords):
+        return "==>"
+    
+    # Optional/conditional arrows (dotted) - for optional, conditional, fallback
+    optional_keywords = ["optional", "conditional", "fallback", "backup", "maybe", "if needed", "when available"]
+    if any(keyword in label for keyword in optional_keywords):
+        return "--.->"
+    
+    # Bidirectional arrows - for communication, sync, exchange
+    bidirectional_keywords = ["communicates", "syncs", "exchanges", "handshake", "negotiates", "two-way"]
+    if any(keyword in label for keyword in bidirectional_keywords):
+        return "<-->"
+    
+    # Blocked/error arrows - for error, failure, blocked paths
+    blocked_keywords = ["error", "fails", "blocks", "denies", "rejects", "aborts", "crashes"]
+    if any(keyword in label for keyword in blocked_keywords):
+        return "--x"
+    
+    # Default to basic arrow
+    return "-->"
+
+def _enhance_edge_label(label: str) -> str:
+    """
+    Enhance edge labels with more descriptive text and visual indicators (emojis).
+    Replaces generic labels with specific ones and adds contextual emojis.
+    """
+    if not label:
+        return label
+    
+    enhanced_label = label.lower()
+    
+    # Replace generic labels with more specific ones
+    label_replacements = {
+        "connects to": "communicates with",
+        "connects": "communicates with", 
+        "uses": "depends on",
+        "calls": "invokes",
+        "sends to": "transmits to",
+        "gets from": "retrieves from",
+        "updates": "modifies",
+        "creates": "generates",
+        "deletes": "removes"
+    }
+    
+    # Apply label replacements
+    for generic, specific in label_replacements.items():
+        if generic in enhanced_label:
+            enhanced_label = enhanced_label.replace(generic, specific)
+    
+    # Add visual indicators (emojis) based on relationship context
+    emoji_mappings = [
+        # Data flow indicators
+        (["data flow", "sends", "transfers", "flows", "pushes", "streams", "pipes", "transmits"], "📊"),
+        
+        # Authentication/security indicators  
+        (["auth", "authenticate", "login", "verify", "secure", "permission", "authorize"], "🔒"),
+        
+        # Event/notification indicators
+        (["event", "notify", "alert", "trigger", "signal", "emit", "broadcast", "publish"], "⚡"),
+        
+        # API/communication indicators
+        (["api", "request", "response", "communicates", "invokes", "call"], "🔗"),
+        
+        # Database/storage indicators
+        (["database", "store", "save", "persist", "retrieve", "query", "fetch"], "💾"),
+        
+        # Processing indicators
+        (["process", "compute", "calculate", "analyze", "transform", "generate"], "⚙️"),
+        
+        # Error/failure indicators
+        (["error", "fail", "exception", "crash", "abort", "reject"], "❌"),
+        
+        # Success/completion indicators  
+        (["success", "complete", "finish", "done", "confirm", "validate"], "✅"),
+    ]
+    
+    # Find the first matching emoji category
+    for keywords, emoji in emoji_mappings:
+        if any(keyword in enhanced_label for keyword in keywords):
+            enhanced_label = f"{emoji} {enhanced_label}"
+            break
+    
+    # Restore original capitalization pattern
+    if label.istitle() or (label and label[0].isupper()):
+        enhanced_label = enhanced_label.title()
+    elif label.isupper():
+        enhanced_label = enhanced_label.upper()
+    
+    return enhanced_label
+
 def _generate_edge_definition(edge: Dict) -> str:
-    """Generate Mermaid edge definition with optional labels"""
+    """Generate Mermaid edge definition with enhanced arrow types and richer labels"""
     from_id = _sanitize_id(edge.get("from", ""))
     to_id = _sanitize_id(edge.get("to", ""))
     
     if not from_id or not to_id:
         return ""
     
+    # Determine appropriate arrow type based on context
+    arrow_type = _determine_arrow_type(edge)
+    
     label = edge.get("label")
     if label:
-        escaped_label = _escape_label(label)
-        result = f"{from_id} -->|{escaped_label}| {to_id}"
+        # Enhance the label with better descriptors and emojis
+        enhanced_label = _enhance_edge_label(label)
+        escaped_label = _escape_label(enhanced_label)
+        result = f"{from_id} {arrow_type}|{escaped_label}| {to_id}"
     else:
-        result = f"{from_id} --> {to_id}"
+        result = f"{from_id} {arrow_type} {to_id}"
     
-    logger.debug(f"Generated edge: {result}")
+    logger.debug(f"Generated edge: {result} (arrow type: {arrow_type})")
     return result
 
 def _determine_node_style(node: Dict, config: Dict) -> Optional[str]:
     """
     Determine appropriate style for a node based on keywords and shape.
-    Uses intelligent matching against the template's style mappings.
+    Uses intelligent matching with priority: shape > status keywords > generic keywords.
     """
     node_id = node.get("id", "").lower()
     label = node.get("label", "").lower() 
@@ -424,9 +634,21 @@ def _determine_node_style(node: Dict, config: Dict) -> Optional[str]:
     if shape in config["shape_mappings"]:
         return config["shape_mappings"][shape]
     
-    # Check keyword mappings (search in both id and label)
+    # Define status keywords with highest priority
+    status_keywords = {
+        "success", "successful", "healthy", "running", "active", "online", "ok", "completed",
+        "warning", "caution", "pending", "loading", "busy", "maintenance", "degraded",
+        "error", "failed", "critical", "down", "offline", "crashed", "blocked", "invalid"
+    }
+    
+    # Check status keywords first (second highest priority)
     for keyword, style in config["style_mappings"].items():
-        if keyword in node_id or keyword in label:
+        if keyword in status_keywords and (keyword in node_id or keyword in label):
+            return style
+    
+    # Check other keyword mappings (search in both id and label)
+    for keyword, style in config["style_mappings"].items():
+        if keyword not in status_keywords and (keyword in node_id or keyword in label):
             return style
     
     # Default to first available style if no match found
