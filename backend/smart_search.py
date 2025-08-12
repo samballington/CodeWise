@@ -862,8 +862,14 @@ class SmartSearchEngine:
             vector_results = vector_store.query(query, k=self.max_results)
             
             results = []
-            for i, (file_path, snippet) in enumerate(vector_results):
-                score = max(0.1, 1.0 - (i * 0.1))  # Decreasing scores
+            for i, result in enumerate(vector_results):
+                # Handle both 2-tuple (path, snippet) and 3-tuple (path, snippet, score) formats
+                if len(result) == 3:
+                    file_path, snippet, vector_score = result
+                    score = float(vector_score)  # Use actual score from vector store
+                else:
+                    file_path, snippet = result
+                    score = max(0.1, 1.0 - (i * 0.1))  # Fallback decreasing scores
                 results.append(SmartSearchResult(
                     chunk_id=i,
                     file_path=file_path,

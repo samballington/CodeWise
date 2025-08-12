@@ -1878,12 +1878,6 @@ class CerebrasNativeAgent:
                     "\n• ACTIONABLE INSIGHTS: Provide specific recommendations for improvements, optimizations, and best practices"
                     "\n• STRUCTURED RESPONSES: Organize with clear sections using markdown formatting for readability"
                     "\n• ANTICIPATE FOLLOW-UPS: Address related questions and provide context that prevents the need for follow-up queries"
-                    "\n\n🚫 MANDATORY MINIMUM REQUIREMENTS FOR ARCHITECTURE/DIAGRAM QUERIES:"
-                    "\n• NEVER provide brief responses like 'Task completed' for architecture analysis - this violates your core directive"
-                    "\n• MINIMUM TOOL USAGE: You MUST use at least 5 tool calls for architecture queries (smart_search, examine_files, analyze_relationships minimum)"
-                    "\n• COMPREHENSIVE ANALYSIS REQUIRED: Architecture queries MUST receive multi-section detailed analysis with code examples"
-                    "\n• FORBIDDEN SHORTCUTS: You cannot skip analysis steps or provide incomplete architectural overviews"
-                    "\n• MINIMUM LENGTH: Architecture responses must be substantial (minimum 2000+ characters) with proper structure and depth"
                     "\n"
                     "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
                     f"{tool_guidance}"
@@ -2223,37 +2217,16 @@ class CerebrasNativeAgent:
                 elif tool_call_count == 0:
                     use_tools = self.tools_schema  # Always allow tools initially
                     logger.info(f"🔧 TOOLS ENABLED: Initial iteration (tool_count={tool_call_count})")
+                elif tool_call_count < 6 and investigation_score < 8:  # More permissive threshold
+                    use_tools = self.tools_schema
+                    logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f})")
                 else:
-                    # MINIMUM TOOL REQUIREMENTS: Force comprehensive investigation for complex queries
-                    min_tools_required = 5 if needs_diagrams else 3  # Architecture queries need more investigation
-                    max_tool_limit = 8 if needs_diagrams else 6      # Higher limits for complex queries
-                    
-                    if tool_call_count < min_tools_required:
-                        use_tools = self.tools_schema
-                        logger.info(f"🔧 TOOLS ENABLED: Minimum required tools not met (tool_count={tool_call_count}, min_required={min_tools_required})")
-                    elif tool_call_count < max_tool_limit and investigation_score < 8:
-                        use_tools = self.tools_schema
-                        logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f})")
-                    else:
-                        use_tools = None
-                        logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
+                    use_tools = None
+                    logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
                     # Add JSON format instruction when ready for final answer
-                    comprehensive_instruction = (
-                        f"You have completed your investigation with {tool_call_count} tool calls. "
-                        f"{'THIS IS AN ARCHITECTURE QUERY - YOU MUST PROVIDE EXTENSIVE ANALYSIS.' if needs_diagrams else ''} "
-                        "Now provide a COMPREHENSIVE, DETAILED final analysis. "
-                        "MANDATORY REQUIREMENTS: "
-                        "- MINIMUM 2000+ characters of detailed analysis "
-                        "- Multiple sections with clear headings "
-                        "- Specific code examples with explanations "
-                        "- Architectural insights and component relationships "
-                        "- Actionable recommendations and next steps "
-                        "DO NOT provide brief responses like 'Task completed' - this violates your core directive. "
-                        f"Use this format: {json_prompt_instruction}"
-                    )
                     messages.append({
                         "role": "system", 
-                        "content": comprehensive_instruction
+                        "content": f"You have completed your investigation. Now provide a COMPREHENSIVE, DETAILED final analysis. This should be thorough and extensive - include multiple sections, detailed explanations, code examples, architectural insights, and actionable recommendations. DO NOT provide brief responses. Use this format: {json_prompt_instruction}"
                     })
                 
                 # RATE LIMITING: Enforce 1.1s delay to prevent 429 errors  

@@ -55,22 +55,35 @@ class FileDiscoveryEngine:
     def __init__(self, workspace_path: Path):
         self.workspace_path = workspace_path
         self.valid_extensions = {
-            # Code files
-            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", 
+            # Code files - Modern Languages
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".swift", ".go", ".rs", ".dart",
+            ".scala", ".clj", ".cljs", ".rb", ".php", ".lua", ".r", ".jl",
+            # Code files - Systems Programming  
+            ".c", ".cpp", ".h", ".hpp", ".cc", ".cxx", ".c++", ".h++", ".hh", ".hxx",
+            ".m", ".mm", ".asm", ".s", ".S",
+            # Code files - Functional/Academic
+            ".hs", ".lhs", ".ml", ".mli", ".fs", ".fsi", ".fsx", ".elm", ".ex", ".exs",
+            ".erl", ".hrl", ".nim", ".cr", ".d", ".zig", ".v",
+            # Web Frameworks
+            ".vue", ".svelte", ".jsp", ".asp", ".aspx", ".erb", ".haml", ".slim",
+            # Mobile/iOS Development
+            ".plist", ".storyboard", ".entitlements", ".xcconfig", ".xcworkspace",
             # Documentation
-            ".md", ".txt", ".rst", ".adoc",
+            ".md", ".txt", ".rst", ".adoc", ".tex", ".org",
             # Data/Config files
-            ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+            ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".pom",
             # Web files
-            ".html", ".htm", ".css", ".scss", ".sass", ".less",
+            ".html", ".htm", ".css", ".scss", ".sass", ".less", ".stylus",
             # Lock/dependency files
-            ".lock", ".frozen",
+            ".lock", ".frozen", ".resolved",
             # Environment/config files
-            ".env", ".config", ".properties",
+            ".env", ".config", ".properties", ".gitignore", ".gitattributes",
             # Build files
-            ".gradle", ".maven", ".sbt",
+            ".gradle", ".maven", ".sbt", ".dockerfile", ".containerfile", ".cmake", 
+            ".meson", ".ninja", ".bazel", ".bzl", ".buck", ".pants", ".nix", ".rake",
             # Other text formats
-            ".xml", ".csv", ".sql", ".sh", ".bat", ".ps1"
+            ".xml", ".csv", ".sql", ".sh", ".bat", ".ps1", ".fish", ".zsh", ".bash",
+            ".makefile", ".mk", ".am", ".in", ".m4", ".spec", ".desktop"
         }
         
         # Files to include even without extensions (by name patterns)
