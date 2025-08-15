@@ -34,6 +34,7 @@ from backend.discovery_pipeline import DiscoveryPipeline
 from backend.query_context_manager import QueryContextManager
 from backend.table_generator import TableGenerator, StructuredTable, FileReference
 
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -565,6 +566,13 @@ class CerebrasNativeAgent:
             
             result = create_mermaid_diagram(diagram_data)
             
+            # DEBUG: Log raw mermaid output from generator (Step 6 diagnosis)
+            logger.info(f"🔍 MERMAID DEBUG STEP 6 - Raw generator output: {result[:200]}...")
+            if '--&gt;' in result or '--&amp;gt;' in result or '--@gt' in result:
+                logger.error(f"🚨 CORRUPTION DETECTED IN GENERATOR OUTPUT: {result}")
+            
+            # Removed automatic HTML entity arrow replacement - using diagnosis to find root cause
+            
             # Format for structured response
             response = f"✅ **Mermaid Diagram Generated Successfully**\n\n"
             response += f"**📊 Diagram Details:**\n"
@@ -575,6 +583,11 @@ class CerebrasNativeAgent:
             response += "```mermaid\n"
             response += result
             response += "\n```"
+            
+            # DEBUG: Log final tool response before sending to LLM (Step 7 diagnosis)
+            logger.info(f"🔍 MERMAID DEBUG STEP 7 - Tool response to LLM: {response[:300]}...")
+            if '--&gt;' in response or '--&amp;gt;' in response or '--@gt' in response:
+                logger.error(f"🚨 CORRUPTION DETECTED IN TOOL RESPONSE: {response}")
             
             logger.info(f"🎨 Successfully generated Mermaid diagram ({len(result)} chars)")
             return response
@@ -1696,7 +1709,7 @@ class CerebrasNativeAgent:
         except Exception as e:
             return f"   Error analyzing impact: {e}"
     
-    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None, selected_model: str = "gpt-oss-120b") -> AsyncGenerator[Dict[str, Any], None]:
         """Process a user request using native Cerebras tool calling with query context management"""
         
         # Use query context manager to prevent multiple discovery runs (THE KEY ARCHITECTURAL FIX)
@@ -1717,7 +1730,8 @@ class CerebrasNativeAgent:
                 user_query, 
                 query_context, 
                 chat_history, 
-                mentioned_projects
+                mentioned_projects,
+                selected_model
             ):
                 yield result
     
@@ -1726,7 +1740,8 @@ class CerebrasNativeAgent:
         user_query: str, 
         query_context, 
         chat_history=None, 
-        mentioned_projects: List[str] = None
+        mentioned_projects: List[str] = None,
+        selected_model: str = "gpt-oss-120b"
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Internal processing method with query context"""
         
@@ -1805,6 +1820,7 @@ class CerebrasNativeAgent:
         is_entity_query = any(word in query_lower for word in ['entity', 'entities', 'database', 'table', 'model', 'schema'])
         is_search_query = any(word in query_lower for word in ['find', 'search', 'locate', 'show me', 'explain', 'how'])
         is_file_query = any(word in query_lower for word in ['file', 'read', 'content', 'source'])
+        is_architecture_query = any(keyword in query_lower for keyword in ['architecture', 'design', 'overview', 'structure', 'data flow', 'component', 'system layout', 'how does', 'explain the'])
         
         # Build system prompt with simplified 3-tool guidance
         tool_guidance = (
@@ -1867,11 +1883,11 @@ class CerebrasNativeAgent:
                     "\n• Keep searching new areas until you're CONFIDENT nothing important remains"
                     "\n• MANDATORY: Examine multiple related files to understand complete context and relationships"
                     "\n• Bias towards gathering more information rather than asking the user for help"
-                    "\n\n🎯 SMART RESPONSE STRATEGY - MATCH DEPTH TO QUERY TYPE:"
-                    "\n• ADAPTIVE DETAIL LEVEL: Match response depth to query complexity and user need - brief for simple questions, comprehensive for complex analysis"
-                    "\n• STRATEGIC CODE EXAMPLES: Include code snippets only when they directly illustrate or support your explanation"
-                    "\n• CLARITY OVER VOLUME: Prioritize clear, actionable insights over exhaustive detail"
-                    "\n• CONTEXT-AWARE VERBOSITY: Provide just enough detail to fully answer the question without overwhelming"
+                    "\n\n🎯 COMPREHENSIVE RESPONSE STRATEGY:"
+                    "\n• PRIMARY GOAL: Your main objective is to resolve the user's query completely and thoroughly"
+                    "\n• THOROUGH ANALYSIS: Provide comprehensive analysis using all available tools to gather complete information"
+                    "\n• RICH INSIGHTS: Ensure responses are rich with actionable insights and specific code examples where relevant"
+                    "\n• FOCUSED CONCISENESS: Eliminate conversational filler and redundant information while maintaining substance and depth"
                     "\n• TECHNICAL REASONING: Always explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
                     "\n• IMPLEMENTATION FOCUS: Cover relevant error handling, edge cases, performance considerations, and security implications"
                     "\n• DEPENDENCY ANALYSIS: Map relationships between components, external dependencies, and system interactions when relevant"
@@ -1925,21 +1941,30 @@ class CerebrasNativeAgent:
                     "\n• COMPLETENESS: Address all aspects of the query with thorough analysis and supporting evidence"
                     "\n• CONTEXT PROVISION: Always provide sufficient background and context for technical decisions"
                     "\n• ACTIONABLE OUTCOMES: End with specific, actionable recommendations or next steps"
-                    "\n\n📦 STRUCTURED OUTPUT (REQUIRED WHEN PRESENTING TABLES OR HIERARCHIES):"
-                    "\nWhen you present tabular data (e.g., dependency tables) or hierarchical trees (e.g., parent/child POMs), ALSO include a fenced JSON block conforming to this schema so the UI can render it natively:"
-                    "\n```json"
-                    "\n{"
-                    "\n  \"version\": \"codewise_structured_v1\","
-                    "\n  \"tables\": ["
-                    "\n    { \"title\": string, \"columns\": [string, ...], \"rows\": [[string|number|null, ...]], \"note\": string? }"
-                    "\n  ],"
-                    "\n  \"trees\": ["
-                    "\n    { \"title\": string, \"root\": { \"label\": string, \"children\": [ {\"label\": string, \"children\": [...] } ] } }"
-                    "\n  ],"
-                    "\n  \"references\": [ { \"path\": string, \"line_start\": number?, \"line_end\": number? } ]"
-                    "\n}"
+                    "\n\n🚫 CRITICAL FORMATTING RESTRICTIONS - PURE MARKDOWN ONLY:"
+                    "\n• MARKDOWN ONLY: Output ONLY pure, valid markdown - no JSON, no object literals, no mixed formats"
+                    "\n• NO OBJECT SYNTAX: Never use {'type': 'paragraph'} or {\"key\": \"value\"} or any programming object notation"
+                    "\n• NO JSON FRAGMENTS: Never include JSON arrays, objects, or syntax like \"sections\": [ or }, in your response"
+                    "\n• CLEAN SEPARATIONS: Use proper markdown syntax: ## for headers, | tables |, ``` for code, --- for breaks"
+                    "\n• MERMAID STANDARD: ALWAYS use the mermaid_generator tool for diagrams - NEVER generate inline Mermaid code"
+                    "\n• VALIDATE OUTPUT: Ensure your response is valid markdown that could be rendered directly by any markdown parser"
+                    "\n• IF UNSURE: Use plain text rather than risk corrupting with programming syntax"
+                    "\n\n📋 MARKDOWN TABLE GUIDELINES:"
+                    "\nWhen presenting tabular data, use clean markdown table syntax:"
+                    "\n```markdown"
+                    "\n| Component | Location | Purpose |"
+                    "\n|-----------|----------|---------|"
+                    "\n| Service | src/services/ | Business logic |"
                     "\n```"
-                    "\nRules: The JSON must be valid and appear exactly once. Keep Markdown prose separate; do not render ASCII tables if JSON is provided."
+                    "\nFor complex hierarchies, use nested markdown lists:"
+                    "\n```markdown"
+                    "\n## Component Hierarchy"
+                    "\n- Parent Component"
+                    "\n  - Child Component A"
+                    "\n    - Subcomponent 1"
+                    "\n    - Subcomponent 2"
+                    "\n  - Child Component B"
+                    "\n```"
                     "\n\n🎯 INVESTIGATION EXCELLENCE:"
                     "\n• Think like a senior software architect conducting a comprehensive code review"
                     "\n• Provide the level of detail expected in professional technical documentation"
@@ -1999,25 +2024,26 @@ class CerebrasNativeAgent:
             {"role": "user", "content": user_query}
         ]
 
-        # Store JSON prompt instruction to apply AFTER tool calling phase
-        json_prompt_instruction = (
-            "You must respond with VALID JSON only (no markdown). Use this exact envelope: "
-            "{ \"response\": { \"metadata\": { \"query_type\": \"architecture|dependencies|database|general\", \"confidence\": 0.0 }, "
-            "\"sections\": [], \"follow_up_suggestions\": [] } }. "
-            "The output MUST begin with '{' as the first character and end with '}'. Do not prepend headings, prose, or code fences. "
-            "Sections must be typed using: paragraph, heading(level 1-6), table(columns, rows, note), list(style bullet|numbered), "
-            "code_block(language, content), callout(style info|warning|error|success), tree(root.label, root.children). "
-            "IMPORTANT: For diagrams, you MUST call the mermaid_generator tool - NEVER generate diagram content inline. "
-            "Do not include markdown in contents; use the section types. "
+        # Store PURE MARKDOWN instruction to apply AFTER tool calling phase
+        markdown_format_instruction = (
+            "You must respond with PURE MARKDOWN ONLY. NO JSON structures, NO object literals, NO mixed content. "
+            "Use standard markdown syntax: headers (##), bullet lists (-), numbered lists (1.), code blocks (```), tables, and paragraphs. "
+            "CRITICAL: The output MUST be clean, well-formatted markdown text. Start with a clear heading and structure your response logically. "
+            "NEVER use JSON format. NEVER use object syntax like {'type': 'paragraph', 'content': '...'}. "
+            "For code examples, use standard markdown code blocks with language tags. "
+            "IMPORTANT: For diagrams, you MUST call the mermaid_generator tool and include the result as: ```mermaid\\n[diagram_content]\\n``` "
+            "Write your response as natural markdown documentation that would be rendered beautifully on GitHub. "
             "\n\n**🧠 MERMAID DIAGRAM GENERATION - TOOL USAGE ONLY**\n"
-            "**CRITICAL: For ANY diagram generation, you MUST use the mermaid_generator tool. NEVER generate diagrams inline.**\n\n"
+            "**CRITICAL: For ANY diagram generation, you MUST use the mermaid_generator tool. NEVER generate diagrams inline.**\n"
+            "**STRICT RULE: After calling mermaid_generator, you MUST extract and copy the EXACT Mermaid code from the tool result (everything between ```mermaid and ```). Do NOT generate any Mermaid syntax yourself. Use ONLY the tool's output.**\n"
+            "**FORBIDDEN: Do NOT write your own ```mermaid blocks. Only use the tool-generated code.**\n\n"
             "**WHEN TO CREATE DIAGRAMS:**\n"
             "Only generate diagrams when explicitly requested by the user OR when a visual representation would be significantly more helpful than text for explaining architecture, relationships, or complex flows.\n\n"
             "**HOW TO CREATE DIAGRAMS:**\n"
             "1. **ANALYZE THE REQUEST:** Determine diagram type needed (flowchart, graph, erDiagram, etc.)\n"
             "2. **IDENTIFY COMPONENTS:** Extract nodes, relationships, and groupings from the information\n"
             "3. **CALL THE TOOL:** Use mermaid_generator with diagram_type, nodes array, and edges array\n"
-            "4. **INCLUDE IN RESPONSE:** Extract the mermaid code from the tool result and add it as a diagram section: {\"type\": \"diagram\", \"format\": \"mermaid\", \"content\": \"<mermaid_code_here>\"}\n\n"
+            "4. **INCLUDE IN RESPONSE:** Copy EXACTLY the mermaid code from the tool result (between the ```mermaid and ``` markers) and include it as-is in your response. Do NOT generate your own Mermaid syntax.\n\n"
             "**STEP 1: Generate the Structure (Unstyled)**\n"
             "• Analyze & Classify: First, analyze the user's request to determine which scenario it best fits from the Template Library.\n"
             "• Select Structural Template: You MUST select the corresponding Structural Template for that scenario. This is your required starting point. It contains only nodes and connections, with no styling.\n"
@@ -2029,10 +2055,10 @@ class CerebrasNativeAgent:
             "**STEP 3: Verify the Final Output**\n"
             "• Before providing the final output, you MUST verify that the generated Mermaid code strictly adheres to all rules listed in the 'Common Pitfalls & Syntax Rules' section. This is a mandatory final check to prevent errors.\n\n"
             "**COMMON PITFALLS & SYNTAX RULES**\n"
-            "• Quotation Marks: To include a double quote (\") inside a node's label, you MUST use the HTML entity &quot;. Example: Node[\"A &quot;good&quot; label\"]\n"
+            "• Quotation Marks: To include a double quote (\") inside a node's label, escape it with backslash. Example: Node[\"A \\\"good\\\" label\"]\n"
             "• Reserved Words: Words like 'graph', 'end', 'subgraph' are reserved. If you must use them in a label, enclose the label in quotes. Example: A --> B[\"end\"]\n"
             "• Node IDs: A node's ID must be a single, unbroken string. Example: MyNode[\"This is the label\"]\n"
-            "• HTML Characters: To display characters like '<' or '>' in a label, use HTML entities &lt; and &gt; to avoid parsing errors.\n"
+            "• Special Characters: Use standard arrow syntax '-->' for connections. NEVER use --&gt; (HTML entities). For labels with special characters, quote them. Example: A --> B[\"API < 2.0\"]\n"
             "• Closing Subgraphs: Every 'subgraph' MUST be closed with a corresponding 'end' keyword.\n\n"
             "**TEMPLATE LIBRARY**\n\n"
             "**Full-Stack Application**\n"
@@ -2185,13 +2211,37 @@ class CerebrasNativeAgent:
             # Insert history before current user message
             messages = [messages[0]] + history_messages + [messages[1]]
         
+        # CONTEXTUAL PROMPT INJECTION: Add specific requirements for architecture queries
+        if is_architecture_query:
+            messages.append({
+                "role": "system",
+                "content": """**MANDATORY: COMPREHENSIVE ARCHITECTURE ANALYSIS PROTOCOL**
+
+🚨 SYSTEM REQUIREMENT: You are conducting a mandatory architecture analysis. This is NOT optional.
+
+**STRICT REQUIREMENTS - FAILURE TO COMPLY IS UNACCEPTABLE:**
+
+1. **MINIMUM TOOL USAGE:** You MUST use AT LEAST 3 different tools before providing any final response
+2. **MANDATORY SECTIONS:** Your response MUST include ALL of these sections:
+   - **System Overview:** High-level summary of codebase purpose and structure
+   - **Core Components:** Main components/modules/services with file names and code snippets
+   - **Relationships & Data Flow:** Component interactions and data flow through system
+   - **Key Patterns:** Design patterns and technologies used
+3. **INVESTIGATION DEPTH:** You MUST examine multiple files, not just search results
+4. **NO SHORTCUTS:** "Task completed" or brief responses are STRICTLY FORBIDDEN
+
+**ENFORCEMENT:** Any attempt to provide a minimal response will be rejected. Continue investigating until you have comprehensive coverage of all required sections.
+
+**TOOL USAGE MANDATE:** You must call smart_search, examine_files, AND analyze_relationships before attempting a final response."""
+            })
+        
         yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
         
         # Multi-turn tool calling loop with duplicate detection
         # Dynamic iteration limit based on query complexity
         query_lower = user_query.lower()
         needs_diagrams = any(keyword in query_lower for keyword in ['mermaid', 'diagram', 'architecture', 'chart', 'visualization', 'flowchart'])
-        max_iterations = 12 if needs_diagrams else 7  # Allow more iterations for complex visual queries
+        max_iterations = 8 if needs_diagrams else 6  # Optimized to reduce rate limiting while maintaining quality
         iteration = 0
         recent_tool_calls = []  # Track recent tool calls to avoid repetition
         tool_call_count = 0  # Track total tool calls made
@@ -2210,6 +2260,12 @@ class CerebrasNativeAgent:
                 has_examined_files = bool(self.tool_context.get('examined_files'))
                 has_relationships = any('analyze_relationships' in call for call in recent_tool_calls)
                 
+                # Check if user explicitly requested diagrams
+                user_wants_diagram = any(
+                    keyword in user_query.lower() 
+                    for keyword in ['diagram', 'chart', 'visual', 'mermaid', 'graph', 'flow', 'architecture diagram']
+                )
+                
                 # CRITICAL FIX: Prevent tools during synthesis stage to avoid message pairing issues
                 if synthesis_mode:
                     use_tools = None  # NO TOOLS during synthesis - prevents message structure corruption
@@ -2217,16 +2273,27 @@ class CerebrasNativeAgent:
                 elif tool_call_count == 0:
                     use_tools = self.tools_schema  # Always allow tools initially
                     logger.info(f"🔧 TOOLS ENABLED: Initial iteration (tool_count={tool_call_count})")
-                elif tool_call_count < 6 and investigation_score < 8:  # More permissive threshold
+                elif tool_call_count < 6:
+                    # DYNAMIC THRESHOLD: Set higher threshold for architecture queries
+                    investigation_threshold = 12 if is_architecture_query else 8
+                    
+                    if investigation_score < investigation_threshold:
+                        use_tools = self.tools_schema
+                        logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f}, threshold={investigation_threshold})")
+                    else:
+                        use_tools = None
+                        logger.info(f"🚫 TOOLS DISABLED: Investigation threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f}, threshold={investigation_threshold})")
+                elif user_wants_diagram and tool_call_count < 10:
+                    # SPECIAL CASE: Allow all tools when user wants diagrams (don't be too restrictive)
                     use_tools = self.tools_schema
-                    logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f})")
+                    logger.info(f"🎨 DIAGRAM TOOLS ENABLED: User requested diagram, allowing all tools (tool_count={tool_call_count})")
                 else:
                     use_tools = None
                     logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
-                    # Add JSON format instruction when ready for final answer
+                    # Add markdown format instruction when ready for final answer
                     messages.append({
                         "role": "system", 
-                        "content": f"You have completed your investigation. Now provide a COMPREHENSIVE, DETAILED final analysis. This should be thorough and extensive - include multiple sections, detailed explanations, code examples, architectural insights, and actionable recommendations. DO NOT provide brief responses. Use this format: {json_prompt_instruction}"
+                        "content": f"You have completed your investigation. Now provide a COMPREHENSIVE, DETAILED final analysis. This should be thorough and extensive - include multiple sections, detailed explanations, code examples, architectural insights, and actionable recommendations. DO NOT provide brief responses. Use this format: {markdown_format_instruction}"
                     })
                 
                 # RATE LIMITING: Enforce 1.1s delay to prevent 429 errors  
@@ -2242,14 +2309,14 @@ class CerebrasNativeAgent:
                 
                 # Make API call to Cerebras
                 api_params = {
-                    "model": "gpt-oss-120b",
+                    "model": selected_model,
                     "messages": messages,
                     "max_tokens": 8000,  # Allow longer responses for comprehensive analysis
                     "temperature": 0.3   # Slightly more creative but still focused
                 }
                 if use_tools is not None:
                     api_params["tools"] = use_tools
-                logger.info(f"🔍 API PARAMS: tools_provided={use_tools is not None}, synthesis_mode={synthesis_mode}")
+                logger.info(f"🔍 API PARAMS: model={selected_model}, tools_provided={use_tools is not None}, synthesis_mode={synthesis_mode}")
                 
                 response = self.client.chat.completions.create(**api_params)
                 # parallel_tool_calls parameter removed - not supported by GPT-OSS-120B
@@ -2427,13 +2494,35 @@ class CerebrasNativeAgent:
                     if tool_call_count >= 4:
                         messages.append({
                             "role": "system",
-                            "content": f"You have made several tool calls and gathered substantial information. If you have found sufficient information, provide a COMPREHENSIVE, DETAILED final analysis with multiple sections, extensive explanations, code examples, and actionable insights. DO NOT provide brief responses - be thorough and extensive. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently.\n\nWhen providing your final answer, use this format: {json_prompt_instruction}"
+                            "content": f"You have made several tool calls and gathered substantial information. If you have found sufficient information, provide a COMPREHENSIVE, DETAILED final analysis with multiple sections, extensive explanations, code examples, and actionable insights. DO NOT provide brief responses - be thorough and extensive. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently.\n\nWhen providing your final answer, use this format: {markdown_format_instruction}"
                         })
                 
                 else:
                     # No tool calls - we have the final response
                     final_content = choice.content or "Task completed"
                     logger.info(f"✅ FINAL RESPONSE ({len(final_content)} chars): {final_content[:500]}...")
+                    
+                    # FORCED TOOL CONTINUATION: Override model stopping for architecture queries
+                    if is_architecture_query and tool_call_count < 3:
+                        logger.warning(f"🚫 ARCHITECTURE OVERRIDE: AI attempted to stop after {tool_call_count} tools. Forcing continuation.")
+                        messages.append({
+                            "role": "assistant", 
+                            "content": final_content
+                        })
+                        messages.append({
+                            "role": "system",
+                            "content": f"""**RESPONSE REJECTED - INSUFFICIENT INVESTIGATION**
+
+You attempted to provide a final response after only {tool_call_count} tool calls. This violates the architecture analysis protocol.
+
+**REQUIRED ACTIONS:**
+- You MUST use at least 3 different tools (smart_search, examine_files, analyze_relationships)
+- Current tools used: {tool_call_count}/3 minimum required
+- Continue investigating immediately - do not provide another final response until requirements are met
+
+**NEXT STEP:** Call examine_files to analyze the discovered files in detail."""
+                        })
+                        continue  # Force another iteration
                     
                     # CRITICAL FIX: Check max iterations BEFORE processing response
                     if iteration >= max_iterations:
@@ -2501,7 +2590,7 @@ class CerebrasNativeAgent:
                             f"**ORIGINAL QUERY:** {user_query}\n\n"
                             f"**INFORMATION YOU GATHERED:**\n{tool_summary}\n\n"
                             f"Now provide a detailed, comprehensive response that actually uses this information to answer the user's query.\n\n"
-                            f"RESPONSE FORMAT: {json_prompt_instruction}"
+                            f"RESPONSE FORMAT: {markdown_format_instruction}"
                         )
                         
                         messages.append({
@@ -2511,7 +2600,9 @@ class CerebrasNativeAgent:
                         
                         # CRITICAL FIX: Enter synthesis mode to prevent additional tool calls
                         synthesis_mode = True
-                        logger.info("🚫 SYNTHESIS MODE ACTIVATED: No more tools allowed to prevent message pairing issues")
+                        # Give synthesis mode extra iterations to complete
+                        max_iterations = min(max_iterations + 2, 12)  # Add 2 more iterations for synthesis
+                        logger.info(f"🚫 SYNTHESIS MODE ACTIVATED: No more tools allowed, extended max_iterations to {max_iterations}")
                         continue  # Skip termination, continue to synthesis stage
                     
                     # RESPONSE CONSOLIDATION: Collect all response data instead of yielding multiple final_result messages
@@ -2523,64 +2614,34 @@ class CerebrasNativeAgent:
                         'synthesis_triggered': synthesis_mode
                     }
                     
-                    # CRITICAL FIX: Single pipeline selection based on response type
+                    # UNIFIED PIPELINE: Always use unified response processing
                     try:
-                        structured = parse_json_prompt(final_content)
-                        if structured is not None:
-                            # JSON Pipeline ONLY - for structured responses
-                            logger.info("📊 AGENT: Detected structured JSON response - using JSON pipeline")
-                            
-                            try:
-                                improved = improve_json_prompt_readability(structured.model_dump())
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.STRUCTURED,
-                                    structured_response=improved,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode
-                                )
-                                logger.info("✅ AGENT: Successfully processed structured response")
-                            except Exception as e:
-                                logger.error(f"💥 AGENT: Structured response processing failed: {e}")
-                                # Fallback to raw response
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.RAW,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode,
-                                    error=f"Structured processing failed: {e}"
-                                )
-                        else:
-                            # Markdown Pipeline ONLY - for non-structured responses
-                            logger.info("📊 AGENT: Detected markdown response - using markdown pipeline")
-                            
-                            try:
-                                formatted_response = self.response_formatter.format_response(
-                                    raw_response=final_content,
-                                    tool_results=tool_results_for_formatting,
-                                    query=user_query,
-                                    execution_metadata=execution_metadata
-                                )
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.FORMATTED,
-                                    formatted_response=formatted_response.to_dict(),
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode
-                                )
-                                logger.info("✅ AGENT: Successfully processed formatted response")
-                            except Exception as e:
-                                logger.error(f"💥 AGENT: Response formatting failed: {e}")
-                                # Fallback to raw response
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.RAW,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode,
-                                    error=f"Formatting failed: {e}"
-                                )
+                        from unified_response_pipeline import get_unified_pipeline
+                        
+                        unified_pipeline = get_unified_pipeline()
+                        unified_response = unified_pipeline.process_response(
+                            raw_response=final_content,
+                            tool_results=tool_results_for_formatting,
+                            query=user_query,
+                            execution_metadata=execution_metadata
+                        )
+                        
+                        logger.info(f"🔄 AGENT: Unified pipeline success, pipeline={unified_response.processing_info.pipeline_used.value}")
+                        
+                        # Always use unified format - consistent output regardless of AI response format
+                        response_consolidator.add_response_data(
+                            raw_output=unified_response.content,
+                            source=ResponseSource.UNIFIED,
+                            formatted_response=unified_response.to_dict(),
+                            execution_metadata=execution_metadata,
+                            synthesis_triggered=synthesis_mode
+                        )
+                        
+                        logger.info("✅ AGENT: Successfully processed unified response")
+                        
                     except Exception as e:
-                        logger.error(f"Structured response parsing failed: {e}")
+                        logger.error(f"💥 UNIFIED PIPELINE FAILED: {e}")
+                        # Emergency fallback to prevent complete failure
                         response_consolidator.add_response_data(
                             raw_output=final_content,
                             source=ResponseSource.RAW,
@@ -2594,6 +2655,123 @@ class CerebrasNativeAgent:
                 # RESPONSE CONSOLIDATION: Add API error to consolidator instead of yielding directly
                 response_consolidator.add_error(f"Cerebras API error: {str(e)}", ResponseSource.RAW)
                 break
+        
+        # POST-LOOP MAX ITERATIONS HANDLER: Handle case where loop exits due to max iterations without adequate response
+        # Check for both no data AND inadequate responses like "Task completed"
+        has_inadequate_response = False
+        if response_consolidator.has_data():
+            primary_source = response_consolidator.get_primary_source()
+            if primary_source == ResponseSource.MAX_ITERATIONS:
+                # Check if the response is inadequate
+                for data in response_consolidator.response_data:
+                    if data.source == ResponseSource.MAX_ITERATIONS:
+                        content = data.raw_output.strip().lower()
+                        if content in ['task completed', 'task completed.', 'task completed...'] or len(content) < 50:
+                            has_inadequate_response = True
+                            logger.warning(f"🔄 INADEQUATE MAX ITERATIONS RESPONSE: '{data.raw_output[:50]}...' - Will trigger synthesis")
+                            break
+        
+        if iteration >= max_iterations and (not response_consolidator.has_data() or has_inadequate_response):
+            logger.warning(f"🔄 MAX ITERATIONS POST-PROCESSING: Making final synthesis call (iteration {iteration}/{max_iterations})")
+            
+            # Only clear data if this is the first inadequate response (avoid overriding better attempts)
+            synthesis_already_attempted = any(data.synthesis_triggered for data in response_consolidator.response_data)
+            
+            if has_inadequate_response and not synthesis_already_attempted:
+                logger.info("🧹 CLEARING INADEQUATE RESPONSE DATA: First synthesis attempt")
+                response_consolidator.response_data.clear()
+            elif synthesis_already_attempted:
+                logger.info("🔄 SYNTHESIS ALREADY ATTEMPTED: Keeping existing synthesis attempts, will only retry if empty")
+                if response_consolidator.has_data():
+                    logger.info("📦 KEEPING EXISTING SYNTHESIS DATA: Not performing redundant post-loop synthesis")
+                    return  # Don't do post-loop synthesis if we already have synthesis data
+            
+            try:
+                # Compile tool results for better synthesis prompt
+                tool_summary = self._compile_tool_results_summary(tool_results_for_formatting)
+                
+                # Use the same detailed synthesis prompt as main loop
+                synthesis_prompt = (
+                    f"You completed your investigation using multiple tools but reached max iterations. "
+                    f"Please provide a comprehensive final analysis of the original query based on all the information you gathered:\n\n"
+                    f"**ORIGINAL QUERY:** {user_query}\n\n"
+                    f"**INFORMATION YOU GATHERED:**\n{tool_summary}\n\n"
+                    f"Now provide a detailed, comprehensive response that synthesizes this information to answer the user's query thoroughly.\n\n"
+                    f"RESPONSE FORMAT: {markdown_format_instruction}"
+                )
+                
+                # Prepare messages for synthesis - add comprehensive system prompt
+                synthesis_messages = messages + [{
+                    "role": "system",
+                    "content": synthesis_prompt
+                }]
+                
+                # Make final API call without tools to synthesize results
+                logger.info(f"🔄 SYNTHESIS: Making final API call without tools")
+                response = self.client.chat.completions.create(
+                    model=selected_model,
+                    messages=synthesis_messages,
+                    tools=None,  # No tools for final synthesis
+                    temperature=0.1,
+                    max_tokens=8000,
+                    timeout=120.0
+                )
+                
+                if response.choices and response.choices[0].message:
+                    final_content = response.choices[0].message.content or "Analysis complete based on investigation results"
+                    logger.info(f"✅ SYNTHESIS: Received final response ({len(final_content)} chars)")
+                    
+                    # Calculate execution metadata
+                    execution_time = asyncio.get_event_loop().time() - execution_start_time
+                    execution_metadata = {
+                        'total_time': execution_time,
+                        'iterations': iteration,
+                        'tool_calls': tool_call_count,
+                        'max_iterations_reached': True,
+                        'synthesis_triggered': True
+                    }
+                    
+                    # Process through unified pipeline
+                    from unified_response_pipeline import get_unified_pipeline
+                    unified_response = get_unified_pipeline().process_response(
+                        raw_response=final_content,
+                        tool_results=tool_results_for_formatting,
+                        query=user_query,
+                        execution_metadata=execution_metadata
+                    )
+                    
+                    # Add to consolidator with max iterations source
+                    response_consolidator.add_response_data(
+                        raw_output=unified_response.content,
+                        source=ResponseSource.UNIFIED,
+                        formatted_response=unified_response.to_dict(),
+                        execution_metadata=execution_metadata,
+                        max_iterations_reached=True,
+                        synthesis_triggered=True
+                    )
+                    
+                    logger.info("✅ SYNTHESIS: Successfully processed and added final response to consolidator")
+                    
+                else:
+                    logger.error("💥 SYNTHESIS: No response content received from API")
+                    response_consolidator.add_response_data(
+                        raw_output="Error: No final response received from synthesis call",
+                        source=ResponseSource.MAX_ITERATIONS,
+                        execution_metadata={'max_iterations_reached': True},
+                        max_iterations_reached=True,
+                        error="No response content from synthesis API call"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"💥 SYNTHESIS FAILED: {e}")
+                # Emergency fallback to prevent complete failure
+                response_consolidator.add_response_data(
+                    raw_output=f"Error: Failed to synthesize final response - {str(e)}",
+                    source=ResponseSource.MAX_ITERATIONS,
+                    execution_metadata={'max_iterations_reached': True},
+                    max_iterations_reached=True,
+                    error=f"Synthesis API call failed: {str(e)}"
+                )
         
         # RESPONSE CONSOLIDATION: Single yield point - consolidate all response data and yield once
         if response_consolidator.has_data():
@@ -2625,6 +2803,13 @@ class CerebrasNativeAgent:
                 logger.info(f"RESPONSE TYPE: {consolidated_response.get('type', 'MISSING')}")
                 logger.info(f"OUTPUT CONTENT ({len(consolidated_response.get('output', ''))} chars):")
                 logger.info(f"'{consolidated_response.get('output', 'MISSING_OUTPUT')}'")
+                
+                # DEBUG: Check for corruption in final JSON payload to frontend (Step 9 diagnosis)
+                final_output = consolidated_response.get('output', '')
+                if '--&gt;' in final_output or '--&amp;gt;' in final_output or '--@gt' in final_output:
+                    logger.error(f"🚨 CORRUPTION DETECTED IN FINAL JSON TO FRONTEND (STEP 9): {final_output}")
+                else:
+                    logger.info(f"✅ MERMAID DEBUG STEP 9 - No corruption detected in final output")
                 
                 if 'structured_response' in consolidated_response:
                     logger.info("STRUCTURED_RESPONSE PRESENT:")

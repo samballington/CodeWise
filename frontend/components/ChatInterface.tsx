@@ -60,12 +60,13 @@ export default function ChatInterface() {
     }
   }, [showProjects])
 
-  // Enhanced sendMessage handler that supports project mentions
-  const handleSendMessage = (message: string, mentionedProjects?: string[]) => {
-    // If mentionedProjects are provided, include them in the message context
+  // Enhanced sendMessage handler that supports project mentions and model selection
+  const handleSendMessage = (message: string, mentionedProjects?: string[], selectedModel?: string) => {
+    // Include message content, project context, and model selection
     const messageWithContext = {
       content: message,
-      mentionedProjects: mentionedProjects || []
+      mentionedProjects: mentionedProjects || [],
+      model: selectedModel || 'gpt-oss-120b'
     }
     
     console.log('Sending message with context:', messageWithContext)

@@ -260,9 +260,16 @@ class MermaidValidator:
         
         corrected = re.sub(r'([A-Za-z0-9_]+)(\[.*?\]|\(.*?\)|\{.*?\})', fix_numeric_node_ids, corrected)
         
-        # Fix common label issues
+        # Fix HTML entity encoding issues from markdown processing
         corrected = corrected.replace('&amp;amp;', '&amp;')  # Double encoding
-        corrected = corrected.replace('&lt;', '<').replace('&gt;', '>')  # Unnecessary HTML encoding in some contexts
+        corrected = corrected.replace('&amp;gt;', '>')  # Double-encoded > in arrows
+        corrected = corrected.replace('&amp;lt;', '<')  # Double-encoded < 
+        corrected = corrected.replace('&amp;quot;', '"')  # Double-encoded quotes
+        corrected = corrected.replace('&gt;', '>')  # Single-encoded > in arrows
+        corrected = corrected.replace('&lt;', '<')  # Single-encoded <
+        corrected = corrected.replace('&quot;', '"')  # Single-encoded quotes
+        
+        # Removed bandage fix - using diagnosis to find root cause instead
         
         return corrected
     
@@ -344,9 +351,17 @@ class MermaidValidator:
         if 'Missing graph declaration' in error_message or not re.match(r'^\s*(graph|flowchart)\s+', corrected, re.IGNORECASE):
             corrected = self._add_missing_graph_declaration(corrected)
         
-        # 2. Fix double-encoded ampersands
+        # 2. Fix HTML entity encoding issues from JSON-to-markdown transition
         if '&amp;amp;' in error_message or '&amp;amp;' in corrected:
             corrected = corrected.replace('&amp;amp;', '&amp;')
+        if '&amp;gt;' in corrected or '--&amp;gt;' in corrected:
+            corrected = corrected.replace('&amp;gt;', '>')
+        if '&amp;lt;' in corrected:
+            corrected = corrected.replace('&amp;lt;', '<')
+        if '&amp;quot;' in corrected:
+            corrected = corrected.replace('&amp;quot;', '"')
+            
+        # Removed bandage fix - using diagnosis to find root cause instead
         
         # 3. Fix lowercase directions
         if 'must be UPPERCASE' in error_message:

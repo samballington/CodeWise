@@ -488,11 +488,11 @@ def _generate_node_definition(node: Dict) -> str:
     # Map shapes to Mermaid syntax (following merprompt.md specifications)
     shape_syntax = {
         "square": f"{node_id}[\"{escaped_label}\"]",
-        "round-edge": f"{node_id}([{escaped_label}])",
+        "round-edge": f"{node_id}(\"{escaped_label}\")",  # Fixed: removed extra brackets
         "database": f"{node_id}[({escaped_label})]", 
-        "rhombus": f"{node_id}{{{escaped_label}}}",
+        "rhombus": f"{node_id}{{\"{escaped_label}\"}}",  # Fixed: single braces with quotes
         "circle": f"{node_id}(({escaped_label}))",
-        "hexagon": f"{node_id}{{{{  {escaped_label}  }}}}"
+        "hexagon": f"{node_id}{{\"{escaped_label}\"}}"   # Fixed: single braces with quotes
     }
     
     result = shape_syntax.get(shape, f"{node_id}[\"{escaped_label}\"]")
@@ -527,7 +527,9 @@ def _determine_arrow_type(edge: Dict) -> str:
         return "--x"
     
     # Default to basic arrow
-    return "-->"
+    arrow_type = "-->"
+    logger.debug(f"🔍 MERMAID ARROW DEBUG: Generated arrow type '{arrow_type}' for edge {edge}")
+    return arrow_type
 
 def _enhance_edge_label(label: str) -> str:
     """
@@ -690,12 +692,12 @@ def _escape_label(label: str) -> str:
     # Convert to string and handle common escape cases
     escaped = str(label)
     
-    # Replace quotes with HTML entities (per merprompt.md rules)
-    escaped = escaped.replace('"', '&quot;')
+    # Escape quotes for Mermaid labels (use backslash escaping instead of HTML entities)
+    escaped = escaped.replace('"', '\\"')
     
-    # Replace other problematic characters
+    # Replace other problematic characters (but not > for arrows)
     escaped = escaped.replace('<', '&lt;')
-    escaped = escaped.replace('>', '&gt;')
+    # Don't escape > characters as they break Mermaid arrow syntax (-->)
     
     return escaped
 

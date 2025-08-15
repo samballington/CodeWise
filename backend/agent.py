@@ -1749,7 +1749,7 @@ Available tools for direct code manipulation and exploration:
             early_stopping_method="generate"
         )
     
-    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None, selected_model: str = "gpt-oss-120b") -> AsyncGenerator[Dict[str, Any], None]:
         """Process a user request and yield updates"""
         
         # Set up project context isolation
@@ -1767,7 +1767,7 @@ Available tools for direct code manipulation and exploration:
         # Route to appropriate agent implementation
         if self.use_native_cerebras:
             # Use native Cerebras agent
-            async for update in self.cerebras_agent.process_request(user_query, chat_history, mentioned_projects):
+            async for update in self.cerebras_agent.process_request(user_query, chat_history, mentioned_projects, selected_model):
                 yield update
         else:
             # Use LangChain agent (existing implementation)

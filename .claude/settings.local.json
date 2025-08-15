@@ -11,7 +11,8 @@
       "Bash(docker-compose ps:*)",
       "Bash(docker-compose:*)",
       "Bash(curl:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "Bash(grep:*)"
     ],
     "deny": []
   }

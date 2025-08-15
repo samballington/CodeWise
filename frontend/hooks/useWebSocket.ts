@@ -230,6 +230,7 @@ export const useWebSocket = () => {
         
         const messageUpdate = {
           content: (structured || hasExistingStructured) ? '' : cleanOutput,
+          output: cleanOutput || undefined,  // NEW: Map backend output to frontend output field
           isProcessing: false,
           isComplete: true,
           toolCalls: finalLastMessage?.bufferedToolCalls || [],
@@ -309,10 +310,11 @@ export const useWebSocket = () => {
   }
 
   const sendMessage = useCallback(
-    (messageOrContent: string | { content: string; mentionedProjects: string[] }) => {
+    (messageOrContent: string | { content: string; mentionedProjects: string[]; model?: string }) => {
       if (socket && socket.readyState === WebSocket.OPEN) {
         let content: string
         let mentionedProjects: string[] = []
+        let model: string = 'gpt-oss-120b'
         
         // Handle both string and object formats
         if (typeof messageOrContent === 'string') {
@@ -320,12 +322,14 @@ export const useWebSocket = () => {
         } else {
           content = messageOrContent.content
           mentionedProjects = messageOrContent.mentionedProjects
+          model = messageOrContent.model || 'gpt-oss-120b'
         }
         
         const message = {
           type: 'user_message',
           content,
-          mentionedProjects: mentionedProjects.length > 0 ? mentionedProjects : undefined
+          mentionedProjects: mentionedProjects.length > 0 ? mentionedProjects : undefined,
+          model
         }
         socket.send(JSON.stringify(message))
         

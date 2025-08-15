@@ -4,6 +4,7 @@ export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  output?: string  // New field for canonical response contract
   timestamp: Date
   isError?: boolean
   isComplete?: boolean
@@ -61,6 +62,11 @@ interface ContextStore {
 interface ThemeStore {
   isDarkMode: boolean
   toggleTheme: () => void
+}
+
+interface ModelStore {
+  selectedModel: string
+  setSelectedModel: (model: string) => void
 }
 
 export const useChatStore = create<ChatStore>((set) => ({
@@ -126,4 +132,17 @@ export const useContextStore = create<ContextStore>((set) => ({
 export const useThemeStore = create<ThemeStore>((set) => ({
   isDarkMode: true, // Default to dark mode
   toggleTheme: () => set((state) => ({ isDarkMode: !state.isDarkMode })),
+}))
+
+export const useModelStore = create<ModelStore>((set) => ({
+  selectedModel: typeof window !== 'undefined' 
+    ? localStorage.getItem('codewise-selected-model') || 'gpt-oss-120b'
+    : 'gpt-oss-120b',
+  
+  setSelectedModel: (model) => {
+    set({ selectedModel: model })
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('codewise-selected-model', model)
+    }
+  },
 })) 

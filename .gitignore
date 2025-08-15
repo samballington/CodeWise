@@ -61,6 +61,10 @@ backend/.claude/
 **/*.md
 !README.md
 
+# Screenshots and assets - NEVER commit these
+screenshots/
+**screenshots/
+
 # Test files (not needed for running app)
 backend/test_*.py
 indexer/test_*.py

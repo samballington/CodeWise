@@ -93,6 +93,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 user_query = message.get("content", "")
                 mentioned_projects = message.get("mentionedProjects", [])
+                selected_model = message.get("model", "gpt-oss-120b")  # Default to current model
+                
+                # Validate model selection
+                SUPPORTED_MODELS = ["gpt-oss-120b", "qwen-3-coder-480b", "qwen-3-235b-a22b-thinking-2507"]
+                if selected_model not in SUPPORTED_MODELS:
+                    logger.warning(f"Unsupported model requested: {selected_model}, defaulting to gpt-oss-120b")
+                    selected_model = "gpt-oss-120b"
                 
                 # Quick fix: Extract @mentions from query if not provided by frontend
                 if not mentioned_projects and user_query:
@@ -140,11 +147,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Add user message to memory
                 chat_memory.add_message("user", user_query)
 
-                # Execute agent with streaming updates, including project context
+                # Execute agent with streaming updates, including project context and model selection
                 async for update in agent.process_request(
                     user_query, 
                     chat_history=chat_memory.as_langchain_messages(),
-                    mentioned_projects=mentioned_projects
+                    mentioned_projects=mentioned_projects,
+                    selected_model=selected_model
                 ):
                     # Handle context gathering messages with enhanced logging
                     if update.get("type") in ["context_gathering_start", "context_search", "context_gathering_complete", "context_debug"]:

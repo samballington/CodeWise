@@ -21,6 +21,10 @@ cerebras-cloud-sdk>=1.5.0
 sentence-transformers>=2.6.0
 # pymermaid - using built-in validator instead
 
+# Handbook-based markdown processing pipeline
+bleach==6.1.0
+markdown-it-py==3.0.0
+
 # --- Lightweight CPU-only PyTorch to keep Docker image small ---
 torch==2.6.0+cpu
 torchvision==0.21.0+cpu
