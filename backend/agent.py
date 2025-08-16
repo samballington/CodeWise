@@ -32,6 +32,10 @@ from project_context import (
 )
 from enhanced_project_structure import EnhancedProjectStructure
 
+# Set up enhanced logging for context retrieval
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Phase 2: Knowledge Graph imports
 try:
     from backend.kg_query_methods import (
@@ -43,10 +47,6 @@ try:
 except ImportError as e:
     logger.warning(f"Knowledge Graph components unavailable: {e}")
     KG_AVAILABLE = False
-
-# Set up enhanced logging for context retrieval
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Optional Redis cache if redis client is installed and LC_CACHE starts with redis://
 _cache_uri = os.getenv("LC_CACHE", "sqlite")

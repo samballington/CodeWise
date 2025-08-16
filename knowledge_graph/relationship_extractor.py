@@ -13,13 +13,29 @@ from typing import Dict, Set, List, Optional, Any, Tuple
 from pathlib import Path
 import logging
 import re
-from tree_sitter import Tree, Node
+try:
+    from tree_sitter import Tree, Node
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    # Mock classes for graceful degradation
+    class Tree:
+        pass
+    class Node:
+        pass
 
 # Import Phase 1 components
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
-from indexer.parsers.tree_sitter_parser import TreeSitterFactory
+try:
+    from indexer.parsers.tree_sitter_parser import TreeSitterFactory
+    TREE_SITTER_FACTORY_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_FACTORY_AVAILABLE = False
+    class TreeSitterFactory:
+        def parse_content(self, content, file_path):
+            return None
 from storage.database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -176,7 +192,7 @@ class RelationshipExtractor:
     def __init__(self, db_manager: DatabaseManager, symbol_table: Dict[str, Dict]):
         self.db_manager = db_manager
         self.symbol_table = symbol_table
-        self.parser_factory = TreeSitterFactory()
+        self.parser_factory = TreeSitterFactory() if TREE_SITTER_FACTORY_AVAILABLE else None
         self.import_resolver = ImportResolver(symbol_table)
         
         # Extraction statistics
@@ -205,6 +221,11 @@ class RelationshipExtractor:
             'relationships_by_type': {},
             'processing_errors': []
         }
+        
+        # Check if tree-sitter is available
+        if not TREE_SITTER_AVAILABLE or not TREE_SITTER_FACTORY_AVAILABLE:
+            logger.warning("Tree-sitter not available. Relationship extraction will use fallback methods.")
+            return self._fallback_relationship_extraction(file_paths)
         
         for file_path in file_paths:
             try:
@@ -763,6 +784,93 @@ class RelationshipExtractor:
                 max(self.extraction_stats['files_processed'], 1)
             )
         }
+    
+    def _fallback_relationship_extraction(self, file_paths: List[Path]):
+        """
+        Fallback relationship extraction when tree-sitter is not available.
+        Uses regex-based parsing for basic relationship detection.
+        """
+        logger.info("Using fallback relationship extraction (regex-based)")
+        
+        # Basic regex patterns for relationships
+        patterns = {
+            'function_call': re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', re.MULTILINE),
+            'import_from': re.compile(r'from\s+([a-zA-Z_][a-zA-Z0-9_.]*)\s+import', re.MULTILINE),
+            'import_simple': re.compile(r'import\s+([a-zA-Z_][a-zA-Z0-9_.]*)', re.MULTILINE),
+            'class_inheritance': re.compile(r'class\s+\w+\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)', re.MULTILINE),
+            'method_call': re.compile(r'\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', re.MULTILINE)
+        }
+        
+        for file_path in file_paths:
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                
+                # Find potential relationships using regex
+                relationships_found = 0
+                
+                # Process each pattern type
+                for pattern_name, pattern in patterns.items():
+                    for match in pattern.finditer(content):
+                        target_name = match.group(1)
+                        
+                        # Look for matching symbols in our symbol table
+                        matching_symbols = [
+                            symbol_id for symbol_id, symbol_info in self.symbol_table.items()
+                            if symbol_info['name'] == target_name
+                        ]
+                        
+                        if matching_symbols:
+                            # Find source symbols in the same file
+                            file_symbols = [
+                                symbol_id for symbol_id, symbol_info in self.symbol_table.items()
+                                if symbol_info['file_path'] == str(file_path)
+                            ]
+                            
+                            # Create relationships from file symbols to target
+                            for source_id in file_symbols:
+                                for target_id in matching_symbols:
+                                    if source_id != target_id:  # Avoid self-references
+                                        relationship_type = self._map_pattern_to_relationship_type(pattern_name)
+                                        
+                                        # Insert relationship into database
+                                        success = self.db_manager.insert_edge(
+                                            source_id=source_id,
+                                            target_id=target_id,
+                                            edge_type=relationship_type,
+                                            file_path=str(file_path),
+                                            line_number=content[:match.start()].count('\n') + 1,
+                                            properties={'extraction_method': 'regex_fallback'}
+                                        )
+                                        
+                                        if success:
+                                            relationships_found += 1
+                                            self.extraction_stats['relationships_found'] += 1
+                                            
+                                            # Update stats by type
+                                            if relationship_type not in self.extraction_stats['relationships_by_type']:
+                                                self.extraction_stats['relationships_by_type'][relationship_type] = 0
+                                            self.extraction_stats['relationships_by_type'][relationship_type] += 1
+                
+                self.extraction_stats['files_processed'] += 1
+                logger.debug(f"Fallback extraction found {relationships_found} relationships in {file_path}")
+                
+            except Exception as e:
+                logger.error(f"Fallback relationship extraction failed for {file_path}: {e}")
+                self.extraction_stats['files_failed'] += 1
+                self.extraction_stats['processing_errors'].append(str(e))
+        
+        logger.info(f"Fallback relationship extraction completed: {self.extraction_stats['relationships_found']} relationships from {self.extraction_stats['files_processed']} files")
+    
+    def _map_pattern_to_relationship_type(self, pattern_name: str) -> str:
+        """Map regex pattern names to relationship types."""
+        mapping = {
+            'function_call': 'calls',
+            'import_from': 'imports',
+            'import_simple': 'imports', 
+            'class_inheritance': 'inherits',
+            'method_call': 'calls'
+        }
+        return mapping.get(pattern_name, 'uses')
 
 
 if __name__ == "__main__":

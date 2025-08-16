@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Local MiniLM encoder (loads once)
-_vs_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# BGE encoder for high-quality embeddings (REQ-1.3.1)
+_vs_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
 
 WORKSPACE_DIR = "/workspace"
 CACHE_DIR = Path(WORKSPACE_DIR) / ".vector_cache"

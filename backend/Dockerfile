@@ -19,7 +19,7 @@ COPY requirements-prod.txt ./requirements-prod.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-prod.txt
 
-# Copy source into /app/backend so imports use backend.*
+# Copy backend source
 COPY . /app/backend
 
 # Install Node.js dependencies for mermaid validation

@@ -24,9 +24,19 @@ from backend.smart_search import SmartSearchEngine as BaseSmartSearchEngine, Que
 from backend.hybrid_search import HybridSearchEngine, SearchResult
 
 # Import Phase 2 Knowledge Graph components
-from storage.database_manager import DatabaseManager
-from knowledge_graph.kg_aware_rag import KGAwareRAG
-from indexer.enhanced_vector_store import EnhancedVectorStore
+try:
+    from storage.database_manager import DatabaseManager
+    from knowledge_graph.kg_aware_rag import KGAwareRAG
+    from indexer.enhanced_vector_store import EnhancedVectorStore
+except ImportError:
+    # Docker environment - backend is working directory
+    import sys
+    from pathlib import Path
+    parent_dir = Path(__file__).parent.parent
+    sys.path.insert(0, str(parent_dir))
+    from storage.database_manager import DatabaseManager
+    from knowledge_graph.kg_aware_rag import KGAwareRAG
+    from indexer.enhanced_vector_store import EnhancedVectorStore
 
 logger = logging.getLogger(__name__)
 

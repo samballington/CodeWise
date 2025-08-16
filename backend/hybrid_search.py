@@ -264,16 +264,30 @@ class ResultFusion:
         
         return normalized
     
-    def _apply_query_boosts(self, results: Dict[str, SearchResult], query_analysis: Dict):
+    def _apply_query_boosts(self, results: Dict[str, SearchResult], query_analysis):
         """Apply query-specific boosts to results"""
+        
+        # Handle both QueryAnalysis object (Phase 3.1) and Dict (legacy)
+        if hasattr(query_analysis, 'technical_terms'):
+            # Phase 3.1: QueryAnalysis object
+            technical_terms = query_analysis.technical_terms
+            detected_symbols = query_analysis.detected_symbols
+            is_exact_match = any('exact_match' in reasoning for reasoning in query_analysis.reasoning)
+            file_type_hints = []  # Not supported in QueryAnalysis yet
+        else:
+            # Legacy: Dictionary format
+            technical_terms = query_analysis.get('technical_terms', [])
+            detected_symbols = query_analysis.get('detected_symbols', [])
+            is_exact_match = query_analysis.get('is_exact_match_query', False)
+            file_type_hints = query_analysis.get('file_type_hints', [])
+        
         # Boost exact match queries for BM25 results
-        if query_analysis.get('is_exact_match_query', False):
+        if is_exact_match:
             for result in results.values():
                 if result.search_type in ['bm25', 'hybrid'] and result.matched_terms:
                     result.relevance_score *= 1.2
         
         # Boost results matching file type hints
-        file_type_hints = query_analysis.get('file_type_hints', [])
         if file_type_hints:
             for result in results.values():
                 file_ext = result.file_path.split('.')[-1].lower()
@@ -281,18 +295,20 @@ class ResultFusion:
                        for hint in file_type_hints):
                     result.relevance_score *= 1.15
         
-        # Boost technical term matches
-        if query_analysis.get('has_technical_terms', False):
+        # Boost technical term matches with detected symbols
+        has_technical_terms = len(technical_terms) > 0 if hasattr(query_analysis, 'technical_terms') else query_analysis.get('has_technical_terms', False)
+        if has_technical_terms:
             for result in results.values():
                 if result.search_type in ['bm25', 'hybrid']:
                     # Check if matched terms include technical terms
+                    all_terms = technical_terms + detected_symbols if hasattr(query_analysis, 'technical_terms') else query_analysis.get('query_terms', [])
                     technical_matches = len([term for term in result.matched_terms 
-                                           if term in query_analysis.get('query_terms', [])])
+                                           if term in all_terms])
                     if technical_matches > 0:
                         result.relevance_score *= (1.0 + 0.1 * technical_matches)
 
         # HARD GUARD: Filename-focused queries should prefer exact filename/path matches
-        filename_token = (query_analysis.get('filename_token') or '').lower()
+        filename_token = '' if hasattr(query_analysis, 'technical_terms') else (query_analysis.get('filename_token') or '').lower()
         if filename_token:
             # Determine if any result exactly matches the filename (basename equality)
             exact_matches = set()
@@ -425,6 +441,9 @@ class HybridSearchEngine:
             logger.info(f"🧠 DYNAMIC WEIGHTS: {vector_weight:.2f} vector / {bm25_weight:.2f} keyword "
                        f"(intent: {intent_analysis.intent.value}, confidence: {intent_analysis.confidence:.2f})")
             logger.debug(f"Reasoning: {', '.join(intent_analysis.reasoning)}")
+            
+            # Use intent_analysis as query_analysis for result fusion
+            query_analysis = intent_analysis
         else:
             # Fallback to original query analysis and static weights
             query_analysis = self.query_processor.analyze_query(query)

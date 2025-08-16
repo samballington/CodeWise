@@ -32,6 +32,10 @@ services:
     volumes:
       - ./workspace:/workspace
       - ./backend:/app/backend
+      - ./storage:/app/storage
+      - ./knowledge_graph:/app/knowledge_graph
+      - ./indexer:/app/indexer
+      - ./tests:/app/tests
       - vector_cache:/workspace/.vector_cache
     networks:
       - codewise-network

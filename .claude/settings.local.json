@@ -17,6 +17,9 @@
       "Bash(find:*)",
       "Bash(mkdir:*)"
     ],
-    "deny": []
+    "deny": [],
+    "additionalDirectories": [
+      "C:\\c\\Users\\suga\\Desktop\\aistuff"
+    ]
   }
 }

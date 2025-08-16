@@ -16,7 +16,15 @@ from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
-from storage.database_manager import DatabaseManager
+try:
+    from storage.database_manager import DatabaseManager
+except ImportError:
+    # Docker environment - backend is working directory
+    import sys
+    from pathlib import Path
+    parent_dir = Path(__file__).parent.parent
+    sys.path.insert(0, str(parent_dir))
+    from storage.database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 

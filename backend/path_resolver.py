@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
 
-from path_resolution_cache import (
+from backend.path_resolution_cache import (
     PathResolutionCache, 
     PathResolutionCacheConfig,
     get_global_cache

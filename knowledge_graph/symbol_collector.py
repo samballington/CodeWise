@@ -12,13 +12,29 @@ from typing import Dict, Set, List, Optional, Any
 from pathlib import Path
 import logging
 import re
-from tree_sitter import Tree, Node
+try:
+    from tree_sitter import Tree, Node
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    # Mock classes for graceful degradation
+    class Tree:
+        pass
+    class Node:
+        pass
 
 # Import Phase 1 components
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
-from indexer.parsers.tree_sitter_parser import TreeSitterFactory
+try:
+    from indexer.parsers.tree_sitter_parser import TreeSitterFactory
+    TREE_SITTER_FACTORY_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_FACTORY_AVAILABLE = False
+    class TreeSitterFactory:
+        def parse_content(self, content, file_path):
+            return None
 from storage.database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -37,7 +53,7 @@ class SymbolCollector:
     
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
-        self.parser_factory = TreeSitterFactory()
+        self.parser_factory = TreeSitterFactory() if TREE_SITTER_FACTORY_AVAILABLE else None
         self.symbol_table: Dict[str, Dict] = {}  # Global symbol table: symbol_id -> symbol_info
         self.file_symbols: Dict[str, Set[str]] = {}  # Per-file symbol tracking: file_path -> symbol_ids
         self.collection_stats = {
@@ -68,6 +84,11 @@ class SymbolCollector:
             'symbols_by_type': {},
             'processing_errors': []
         }
+        
+        # Check if tree-sitter is available
+        if not TREE_SITTER_AVAILABLE or not TREE_SITTER_FACTORY_AVAILABLE:
+            logger.warning("Tree-sitter not available. Symbol collection will use fallback methods.")
+            return self._fallback_symbol_collection(file_paths)
         
         for file_path in file_paths:
             try:
@@ -587,6 +608,105 @@ class SymbolCollector:
             symbol for symbol in self.symbol_table.values()
             if symbol['type'] == symbol_type
         ]
+    
+    def _fallback_symbol_collection(self, file_paths: List[Path]) -> Dict[str, Dict]:
+        """
+        Fallback symbol collection when tree-sitter is not available.
+        Uses regex-based parsing for basic symbol extraction.
+        """
+        logger.info("Using fallback symbol collection (regex-based)")
+        
+        # Basic regex patterns for common programming constructs
+        patterns = {
+            'python_function': re.compile(r'^\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', re.MULTILINE),
+            'python_class': re.compile(r'^\s*class\s+([a-zA-Z_][a-zA-Z0-9_]*)', re.MULTILINE),
+            'js_function': re.compile(r'function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', re.MULTILINE),
+            'js_const': re.compile(r'const\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=', re.MULTILINE),
+            'java_class': re.compile(r'class\s+([a-zA-Z_][a-zA-Z0-9_]*)', re.MULTILINE),
+            'java_method': re.compile(r'(public|private|protected)?\s*(static)?\s*\w+\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', re.MULTILINE)
+        }
+        
+        for file_path in file_paths:
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                file_ext = file_path.suffix.lower()
+                
+                # Select appropriate patterns based on file extension
+                active_patterns = []
+                if file_ext == '.py':
+                    active_patterns = ['python_function', 'python_class']
+                elif file_ext in ['.js', '.ts']:
+                    active_patterns = ['js_function', 'js_const']
+                elif file_ext == '.java':
+                    active_patterns = ['java_class', 'java_method']
+                else:
+                    # Try all patterns for unknown file types
+                    active_patterns = list(patterns.keys())
+                
+                file_symbols = set()
+                
+                for pattern_name in active_patterns:
+                    pattern = patterns[pattern_name]
+                    for match in pattern.finditer(content):
+                        symbol_name = match.group(1) if len(match.groups()) >= 1 else match.group(3) if len(match.groups()) >= 3 else None
+                        if symbol_name:
+                            # Create basic symbol info
+                            symbol_id = f"{file_path.stem}::{symbol_name}::{match.start()}"
+                            symbol_type = self._map_pattern_to_symbol_type(pattern_name)
+                            
+                            symbol_info = {
+                                'id': symbol_id,
+                                'name': symbol_name,
+                                'type': symbol_type,
+                                'file_path': str(file_path),
+                                'line_start': content[:match.start()].count('\n') + 1,
+                                'line_end': content[:match.end()].count('\n') + 1,
+                                'signature': match.group(0).strip(),
+                                'docstring': None,
+                                'properties': {'extraction_method': 'regex_fallback'}
+                            }
+                            
+                            self.symbol_table[symbol_id] = symbol_info
+                            file_symbols.add(symbol_id)
+                            
+                            # Insert into database
+                            self.db_manager.insert_node(
+                                node_id=symbol_id,
+                                node_type=symbol_type,
+                                name=symbol_name,
+                                file_path=str(file_path),
+                                line_start=symbol_info['line_start'],
+                                line_end=symbol_info['line_end'],
+                                signature=symbol_info['signature'],
+                                docstring=symbol_info['docstring'],
+                                properties=symbol_info['properties']
+                            )
+                
+                self.file_symbols[str(file_path)] = file_symbols
+                self.collection_stats['files_processed'] += 1
+                self.collection_stats['symbols_discovered'] += len(file_symbols)
+                
+                logger.debug(f"Fallback extraction found {len(file_symbols)} symbols in {file_path}")
+                
+            except Exception as e:
+                logger.error(f"Fallback symbol collection failed for {file_path}: {e}")
+                self.collection_stats['files_failed'] += 1
+                self.collection_stats['processing_errors'].append(str(e))
+        
+        logger.info(f"Fallback symbol collection completed: {self.collection_stats['symbols_discovered']} symbols from {self.collection_stats['files_processed']} files")
+        return self.symbol_table
+    
+    def _map_pattern_to_symbol_type(self, pattern_name: str) -> str:
+        """Map regex pattern names to symbol types."""
+        mapping = {
+            'python_function': 'function',
+            'python_class': 'class',
+            'js_function': 'function',
+            'js_const': 'variable',
+            'java_class': 'class',
+            'java_method': 'method'
+        }
+        return mapping.get(pattern_name, 'unknown')
 
 
 if __name__ == "__main__":
