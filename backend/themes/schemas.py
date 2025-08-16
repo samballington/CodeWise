@@ -32,13 +32,13 @@ class StyleRole(BaseModel):
     Provides validated color schemes and styling options with
     proper hex color validation and optional text color override.
     """
-    fill_color: str = Field(..., regex=r'^#[0-9a-fA-F]{6}$', 
+    fill_color: str = Field(..., pattern=r'^#[0-9a-fA-F]{6}$', 
                            description="Background fill color in hex format")
-    stroke_color: str = Field(..., regex=r'^#[0-9a-fA-F]{6}$',
+    stroke_color: str = Field(..., pattern=r'^#[0-9a-fA-F]{6}$',
                              description="Border stroke color in hex format")
     stroke_width: str = Field(default="2px", 
                              description="Border width (e.g., '2px', '3px')")
-    text_color: Optional[str] = Field(None, regex=r'^#[0-9a-fA-F]{6}$',
+    text_color: Optional[str] = Field(None, pattern=r'^#[0-9a-fA-F]{6}$',
                                      description="Optional text color override")
     
     def get_mermaid_classdef(self, role: SemanticRole) -> str:

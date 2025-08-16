@@ -12,8 +12,12 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
-from .evaluator import RetrievalEvaluator
-from ..indexer.enhanced_vector_store import EnhancedVectorStore
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from benchmarks.evaluator import RetrievalEvaluator
+from indexer.enhanced_vector_store import EnhancedVectorStore
 
 logger = logging.getLogger(__name__)
 

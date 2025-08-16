@@ -6,7 +6,7 @@ with bidirectional relationships and comprehensive metadata.
 """
 
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Literal
 from enum import Enum
 import re
 
@@ -65,7 +65,7 @@ class SymbolChunk(ChunkBase):
     These are the most granular chunks, representing specific code definitions
     that developers typically search for by name.
     """
-    type: ChunkType = Field(ChunkType.SYMBOL, const=True)
+    type: Literal[ChunkType.SYMBOL] = ChunkType.SYMBOL
     
     # Symbol-specific metadata
     symbol_name: str = Field(..., description="Name of the function/class/variable")
@@ -107,7 +107,7 @@ class BlockChunk(ChunkBase):
     These chunks capture code organization like class bodies, modules,
     or namespace blocks that contain multiple symbols.
     """
-    type: ChunkType = Field(ChunkType.BLOCK, const=True)
+    type: Literal[ChunkType.BLOCK] = ChunkType.BLOCK
     
     # Block-specific metadata
     block_type: str = Field(..., description="class_body|module|namespace|package")
@@ -147,7 +147,7 @@ class SummaryChunk(ChunkBase):
     These chunks provide file-level or module-level summaries that help
     with contextual understanding and hierarchical navigation.
     """
-    type: ChunkType = Field(ChunkType.SUMMARY, const=True)
+    type: Literal[ChunkType.SUMMARY] = ChunkType.SUMMARY
     
     # Summary-specific metadata
     summary_type: str = Field(..., description="file|directory|package|module")
@@ -169,10 +169,8 @@ class SummaryChunk(ChunkBase):
         return v
     
     @validator('child_chunk_ids')
-    def child_chunk_ids_must_not_be_empty(cls, v):
-        """Ensure summary has child chunks."""
-        if not v:
-            raise ValueError('SummaryChunk must have at least one child_chunk_id')
+    def child_chunk_ids_must_be_unique(cls, v):
+        """Ensure child chunk IDs are unique."""
         if len(v) != len(set(v)):
             raise ValueError('child_chunk_ids must be unique')
         return v

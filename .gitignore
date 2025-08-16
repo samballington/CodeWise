@@ -65,6 +65,10 @@ backend/.claude/
 screenshots/
 **screenshots/
 
+# Phase documentation - LOCAL ONLY
+docs/
+docs/*
+
 # Test files (not needed for running app)
 backend/test_*.py
 indexer/test_*.py

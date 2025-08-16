@@ -9,9 +9,13 @@ import logging
 from typing import Dict, List, Any, Optional
 
 # Phase 1 imports
-from ..backend.themes.theme_manager import ThemeManager
-from ..backend.themes.schemas import SemanticRole
-from ..backend.tools.mermaid_generator import RoleAwareMermaidGenerator
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from backend.themes.theme_manager import ThemeManager
+from backend.themes.schemas import SemanticRole
+from backend.tools.mermaid_generator import RoleAwareMermaidGenerator
 
 logger = logging.getLogger(__name__)
 

@@ -120,9 +120,12 @@ class ToolPerformanceMonitor:
             return 0.0
         
         duration = time.time() - start_data['start_time']
-        tool_name = timing_id.split('_')[0]
+        # Extract tool name from timing_id (format: tool_name_timestamp)
+        tool_name = timing_id.rsplit('_', 1)[0]
         
         # Update tool statistics
+        if tool_name not in self.tool_stats:
+            self.tool_stats[tool_name] = ToolPerformanceStats(tool_name=tool_name)
         stats = self.tool_stats[tool_name]
         stats.total_calls += 1
         
