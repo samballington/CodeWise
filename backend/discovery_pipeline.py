@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Set, Tuple
 from pathlib import Path
 
-from response_formatter import QueryType
-from path_resolver import PathResolver
+from backend.response_formatter import QueryType
+from backend.path_resolver import PathResolver
 
 logger = logging.getLogger(__name__)
 
