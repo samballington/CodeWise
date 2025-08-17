@@ -106,38 +106,18 @@ class ThemeManager:
         """
         Get complete Mermaid theme definitions for a theme.
         
+        DEPRECATED: This method was designed for the old format.
+        New format uses simple classDef at the end without init blocks.
+        
         Args:
             theme_name: Name of the theme
             
         Returns:
-            Complete Mermaid theme initialization and classDef strings
-            
-        Raises:
-            ValueError: If theme is not found
+            Empty string (classDef definitions now handled by mermaid generator)
         """
-        theme = self.get_theme(theme_name)
-        if not theme:
-            # Fallback to default theme
-            default_theme = self.get_default_theme()
-            if default_theme:
-                logger.warning(f"Theme '{theme_name}' not found, using default theme")
-                theme = default_theme
-            else:
-                raise ValueError(f"Theme '{theme_name}' not found and no default theme available")
-        
-        definitions = []
-        
-        # Mermaid theme initialization
-        definitions.append("%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#ffffff'}}}%%")
-        
-        # Add classDef for each semantic role
-        for role in SemanticRole:
-            if role in theme.roles:
-                definitions.append(theme.get_mermaid_classdef(role))
-            else:
-                logger.warning(f"Role {role.value} not defined in theme {theme.name}")
-        
-        return "\n    ".join(definitions)
+        # Return empty - we now generate classDef definitions in the mermaid generator
+        # to match the user's example format
+        return ""
     
     def get_role_style_class(self, role: SemanticRole, theme_name: str) -> str:
         """

@@ -86,22 +86,21 @@ class RoleAwareMermaidGenerator:
             # 1. Diagram declaration
             diagram_lines.append(self._get_diagram_declaration(diagram_type))
             
-            # 2. Theme definitions
-            theme_definitions = self.theme_manager.get_definitions(theme_name)
-            if theme_definitions:
-                diagram_lines.append(f"    {theme_definitions}")
-            
-            # 3. Node definitions with semantic styling
+            # 2. Node definitions with semantic styling
             node_lines = self._generate_nodes(nodes, theme_name)
             diagram_lines.extend(node_lines)
             
-            # 4. Edge definitions
+            # 3. Edge definitions
             edge_lines = self._generate_edges(edges)
             diagram_lines.extend(edge_lines)
             
-            # 5. Style applications
+            # 4. Style applications at the end (AFTER main diagram)
             style_lines = self._apply_semantic_styles(nodes)
             diagram_lines.extend(style_lines)
+            
+            # 5. ClassDef definitions at the very end (like your example)
+            classdef_lines = self._generate_classdef_definitions(theme_name)
+            diagram_lines.extend(classdef_lines)
             
             result = "\n".join(diagram_lines)
             
@@ -194,16 +193,21 @@ class RoleAwareMermaidGenerator:
                 errors.append(f"Edge {i} must be a dictionary")
                 continue
             
-            # Required fields
-            if "source" not in edge or not str(edge["source"]).strip():
-                errors.append(f"Edge {i} missing or empty 'source'")
-            elif str(edge["source"]) not in node_ids:
-                errors.append(f"Edge {i} references unknown source node '{edge['source']}'")
+            # Support both formats: {"source": "X", "target": "Y"} and {"from": "X", "to": "Y"}
+            source = edge.get("source") or edge.get("from")
+            target = edge.get("target") or edge.get("to")
             
-            if "target" not in edge or not str(edge["target"]).strip():
-                errors.append(f"Edge {i} missing or empty 'target'")
-            elif str(edge["target"]) not in node_ids:
-                errors.append(f"Edge {i} references unknown target node '{edge['target']}'")
+            # Validate source
+            if not source or not str(source).strip():
+                errors.append(f"Edge {i} missing or empty source/from field")
+            elif str(source) not in node_ids:
+                errors.append(f"Edge {i} references unknown source node '{source}'")
+            
+            # Validate target
+            if not target or not str(target).strip():
+                errors.append(f"Edge {i} missing or empty target/to field")
+            elif str(target) not in node_ids:
+                errors.append(f"Edge {i} references unknown target node '{target}'")
         
         return errors
     
@@ -242,15 +246,16 @@ class RoleAwareMermaidGenerator:
             node_id = self._sanitize_id(str(node["id"]))
             label = self._escape_label(str(node["label"]))
             shape = node.get("shape", "rectangle")
+            semantic_role = node.get("semantic_role")
             
-            # Generate node with appropriate shape
-            node_line = self._format_node_with_shape(node_id, label, shape)
+            # Generate node with appropriate shape and role class
+            node_line = self._format_node_with_shape(node_id, label, shape, semantic_role)
             node_lines.append(f"    {node_line}")
         
         return node_lines
     
-    def _format_node_with_shape(self, node_id: str, label: str, shape: str) -> str:
-        """Format node with Mermaid shape syntax."""
+    def _format_node_with_shape(self, node_id: str, label: str, shape: str, semantic_role: str = None) -> str:
+        """Format node with Mermaid shape syntax and semantic role class."""
         shape_mapping = {
             "rectangle": f'{node_id}["{label}"]',
             "round": f'{node_id}("{label}")',
@@ -264,15 +269,30 @@ class RoleAwareMermaidGenerator:
             "cylinder": f'{node_id}[("{label}")]'
         }
         
-        return shape_mapping.get(shape, f'{node_id}["{label}"]')
+        node_def = shape_mapping.get(shape, f'{node_id}["{label}"]')
+        
+        # Add semantic role class like your example format
+        if semantic_role:
+            try:
+                role_enum = SemanticRole(semantic_role)
+                node_def += f":::{role_enum.value}"
+            except ValueError:
+                # Use default if invalid role
+                node_def += ":::logic"
+        
+        return node_def
     
     def _generate_edges(self, edges: List[Dict]) -> List[str]:
         """Generate Mermaid edge definitions."""
         edge_lines = []
         
         for edge in edges:
-            source = self._sanitize_id(str(edge["source"]))
-            target = self._sanitize_id(str(edge["target"]))
+            # Support both formats: {"source": "X", "target": "Y"} and {"from": "X", "to": "Y"}
+            source = edge.get("source") or edge.get("from")
+            target = edge.get("target") or edge.get("to")
+            
+            source = self._sanitize_id(str(source))
+            target = self._sanitize_id(str(target))
             label = edge.get("label", "")
             
             if label:
@@ -288,24 +308,30 @@ class RoleAwareMermaidGenerator:
         return edge_lines
     
     def _apply_semantic_styles(self, nodes: List[Dict]) -> List[str]:
-        """Apply semantic role-based styling to nodes."""
-        style_lines = []
+        """Apply semantic role-based styling to nodes (deprecated - now using :::role format)."""
+        # Return empty since we're using :::role format in node definitions
+        return []
+    
+    def _generate_classdef_definitions(self, theme_name: str) -> List[str]:
+        """Generate classDef definitions at the end like your example format."""
+        theme = self.theme_manager.get_theme(theme_name)
+        if not theme:
+            return []
         
-        for node in nodes:
-            node_id = self._sanitize_id(str(node["id"]))
-            semantic_role = node.get("semantic_role")
-            
-            if semantic_role:
-                try:
-                    role_enum = SemanticRole(semantic_role)
-                    style_class = f"{role_enum.value}Style"
-                    style_lines.append(f"    class {node_id} {style_class}")
-                except ValueError:
-                    logger.warning(f"Unknown semantic role: {semantic_role} for node {node_id}")
-                    # Apply default styling
-                    style_lines.append(f"    class {node_id} logicStyle")
+        classdef_lines = []
         
-        return style_lines
+        # Add classDef for each semantic role (like your example)
+        for role in SemanticRole:
+            if role in theme.roles:
+                style_role = theme.roles[role]
+                classdef_line = f"    classDef {role.value} fill:{style_role.fill_color},stroke:{style_role.stroke_color}"
+                if style_role.text_color:
+                    classdef_line += f",color:{style_role.text_color}"
+                if style_role.stroke_width:
+                    classdef_line += f",stroke-width:{style_role.stroke_width}"
+                classdef_lines.append(classdef_line)
+        
+        return classdef_lines
     
     def _sanitize_id(self, node_id: str) -> str:
         """Sanitize node ID for Mermaid compatibility."""
