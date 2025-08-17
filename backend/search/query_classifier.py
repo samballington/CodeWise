@@ -17,6 +17,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Module availability flag for external components
+QUERY_CLASSIFIER_AVAILABLE = True
+
 
 class QueryIntent(Enum):
     """Classification of query intents for optimal search strategy selection."""

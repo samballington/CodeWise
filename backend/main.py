@@ -275,4 +275,65 @@ async def refresh_vector_store():
         return {"status": "success", "message": "Vector store refreshed from disk"}
     except Exception as e:
         logger.error(f"Failed to refresh vector store: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to refresh vector store: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to refresh vector store: {str(e)}")
+
+# REQ-CACHE-8: Cache Performance Monitoring API Endpoints
+@app.get("/api/cache/performance")
+async def get_cache_performance():
+    """Get comprehensive cache performance dashboard"""
+    try:
+        from cache.performance_monitor import get_global_performance_monitor
+        monitor = get_global_performance_monitor()
+        
+        # Start monitoring if not already running
+        if not monitor._monitoring:
+            monitor.start_monitoring()
+        
+        dashboard = monitor.get_performance_dashboard()
+        return dashboard
+    except Exception as e:
+        logger.error(f"Failed to get cache performance: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache performance error: {str(e)}")
+
+@app.post("/api/cache/optimize")
+async def force_cache_optimization():
+    """Force immediate cache optimization"""
+    try:
+        from cache.performance_monitor import get_global_performance_monitor
+        monitor = get_global_performance_monitor()
+        monitor.force_optimization()
+        return {"status": "success", "message": "Cache optimization completed"}
+    except Exception as e:
+        logger.error(f"Failed to optimize cache: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache optimization error: {str(e)}")
+
+@app.get("/api/cache/metrics")
+async def get_cache_metrics():
+    """Get detailed cache metrics from all layers"""
+    try:
+        from cache.cache_metrics import get_global_cache_metrics
+        metrics = get_global_cache_metrics()
+        
+        aggregated = metrics.get_aggregated_metrics()
+        recommendations = metrics.get_optimization_recommendations()
+        
+        return {
+            "metrics": aggregated,
+            "recommendations": recommendations,
+            "performance_report": metrics.generate_performance_report()
+        }
+    except Exception as e:
+        logger.error(f"Failed to get cache metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache metrics error: {str(e)}")
+
+@app.post("/api/cache/reset")
+async def reset_cache_monitoring():
+    """Reset cache monitoring data and statistics"""
+    try:
+        from cache.performance_monitor import get_global_performance_monitor
+        monitor = get_global_performance_monitor()
+        monitor.reset_monitoring_data()
+        return {"status": "success", "message": "Cache monitoring data reset"}
+    except Exception as e:
+        logger.error(f"Failed to reset cache monitoring: {e}")
+        raise HTTPException(status_code=500, detail=f"Cache reset error: {str(e)}") 

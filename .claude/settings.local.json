@@ -15,7 +15,8 @@
       "Bash(grep:*)",
       "Bash(git commit:*)",
       "Bash(find:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(docker cp:*)"
     ],
     "deny": [],
     "additionalDirectories": [

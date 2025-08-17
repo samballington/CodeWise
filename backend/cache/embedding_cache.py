@@ -23,7 +23,20 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 import tempfile
-import fcntl
+# Windows-compatible import for fcntl
+try:
+    import fcntl
+except ImportError:
+    # Windows doesn't have fcntl, provide a mock for Docker compatibility
+    class MockFcntl:
+        LOCK_EX = 2
+        LOCK_NB = 4
+        LOCK_UN = 8
+        
+        def flock(self, fd, op):
+            pass  # No-op on Windows
+    
+    fcntl = MockFcntl()
 import time
 
 # Integration with global cache metrics

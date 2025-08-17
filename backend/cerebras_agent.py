@@ -14,25 +14,29 @@ from typing import Dict, Any, List, AsyncGenerator
 from cerebras.cloud.sdk import Cerebras
 from pathlib import Path
 import re
-from directory_filters import (
+from .directory_filters import (
     get_find_filter_args, get_grep_filter_args, should_include_file,
     filter_file_list, resolve_workspace_path, get_project_from_path
 )
-from project_context import (
+from .project_context import (
     get_context_manager, set_project_context, get_current_context,
     filter_files_by_context
 )
-from enhanced_project_structure import EnhancedProjectStructure
-from backend.smart_search import smart_search
-from backend.path_resolver import PathResolver
-from backend.response_formatter import ResponseFormatter, StandardizedResponse
-from backend.tools.mermaid_generator import create_mermaid_diagram
-from backend.json_prompt_schema import parse_json_prompt
-from backend.json_prompt_postprocess import improve_json_prompt_readability
-from backend.response_consolidator import ResponseConsolidator, ResponseSource
-from backend.discovery_pipeline import DiscoveryPipeline
-from backend.query_context_manager import QueryContextManager
-from backend.table_generator import TableGenerator, StructuredTable, FileReference
+from .enhanced_project_structure import EnhancedProjectStructure
+from .smart_search import smart_search
+from .path_resolver import PathResolver
+from .response_formatter import ResponseFormatter, StandardizedResponse
+from .tools.mermaid_generator import create_mermaid_diagram
+from .tools.mermaid_renderer import MermaidRenderer, KGDiagramGenerator
+from .tools.unified_query import query_codebase
+from .context.code_annotator import CodeLensAnnotator
+from .json_prompt_schema import parse_json_prompt
+from .json_prompt_postprocess import improve_json_prompt_readability
+from .response_consolidator import ResponseConsolidator, ResponseSource
+from .discovery_pipeline import DiscoveryPipeline
+from .query_context_manager import QueryContextManager
+from .table_generator import TableGenerator, StructuredTable, FileReference
+from ..storage.database_manager import DatabaseManager
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -71,6 +75,25 @@ class CerebrasNativeAgent:
             cleanup_interval_seconds=60,
             enable_health_monitoring=True
         )
+        
+        # Phase 3.2.3: Initialize new components
+        try:
+            # Initialize Knowledge Graph database manager
+            db_path = os.getenv('KG_DATABASE_PATH', '/workspace/.vector_cache/codewise.db')
+            self.kg_database = DatabaseManager(db_path)
+            
+            # Initialize Phase 3 components
+            self.mermaid_renderer = MermaidRenderer()
+            self.kg_diagram_generator = KGDiagramGenerator(self.kg_database, self.mermaid_renderer.theme_manager)
+            self.code_annotator = CodeLensAnnotator(self.kg_database)
+            
+            logger.info("Phase 3 components initialized: KG diagrams, code annotations")
+        except Exception as e:
+            logger.warning(f"Phase 3 components initialization failed: {e}")
+            self.kg_database = None
+            self.mermaid_renderer = MermaidRenderer()  # Fallback renderer
+            self.kg_diagram_generator = None
+            self.code_annotator = None
         
         # Tool context for result chaining
         self.tool_context = {
@@ -607,58 +630,81 @@ class CerebrasNativeAgent:
             "examine_files": self._examine_files,
             "analyze_relationships": self._analyze_relationships,
             "mermaid_generator": self._mermaid_generator_wrapper,
-            # Phase 2.3 KG tools
+            # Phase 3.3.2: Unified query tool
+            "query_codebase": self._query_codebase_wrapper,
+            # Phase 2.3 KG tools (legacy - replaced by query_codebase)
             "kg_find_symbol": self._kg_find_symbol,
             "kg_explore_neighborhood": self._kg_explore_neighborhood,
             "kg_find_callers": self._kg_find_callers
         }
     
     async def _mermaid_generator_wrapper(self, diagram_type: str, nodes: List[Dict], edges: List[Dict]) -> str:
-        """Async wrapper for mermaid generator tool"""
+        """
+        Phase 3.2.3: Enhanced mermaid generator with KG-powered diagram capabilities.
+        
+        Intelligently routes between KG-powered factual diagrams and traditional 
+        LLM-based diagrams based on available data and diagram type.
+        """
         try:
-            # Validate input
+            # Phase 3.2.3: Try KG-powered diagram generation first for better accuracy
+            if hasattr(self, 'kg_diagram_generator') and self.kg_diagram_generator:
+                try:
+                    # KG-powered diagram generation for supported types
+                    if diagram_type == 'classDiagram' and 'class_name' in str(nodes):
+                        # Extract class name for KG lookup
+                        class_name = self._extract_class_name_from_nodes(nodes)
+                        if class_name:
+                            logger.info(f"🎯 Using KG-powered class diagram generation for: {class_name}")
+                            kg_result = self.kg_diagram_generator.generate_class_hierarchy(class_name)
+                            if kg_result and not kg_result.startswith('graph TD\n    error'):
+                                return self._format_mermaid_response(kg_result, diagram_type, "KG-powered", len(nodes), len(edges))
+                    
+                    elif diagram_type.startswith('graph') and 'function' in str(nodes):
+                        # Try call flow diagram
+                        function_name = self._extract_function_name_from_nodes(nodes)
+                        if function_name:
+                            logger.info(f"🎯 Using KG-powered call flow generation for: {function_name}")
+                            kg_result = self.kg_diagram_generator.generate_call_flow(function_name, max_depth=3)
+                            if kg_result and not kg_result.startswith('graph TD\n    error'):
+                                return self._format_mermaid_response(kg_result, diagram_type, "KG-powered", len(nodes), len(edges))
+                    
+                    elif 'module' in diagram_type.lower() or 'dependency' in diagram_type.lower():
+                        # Try module dependency diagram
+                        module_path = self._extract_module_path_from_nodes(nodes)
+                        if module_path:
+                            logger.info(f"🎯 Using KG-powered module dependency generation for: {module_path}")
+                            kg_result = self.kg_diagram_generator.generate_module_dependencies(module_path)
+                            if kg_result and not kg_result.startswith('graph TD\n    error'):
+                                return self._format_mermaid_response(kg_result, diagram_type, "KG-powered", len(nodes), len(edges))
+                    
+                except Exception as e:
+                    logger.warning(f"KG-powered diagram generation failed, falling back to traditional: {e}")
+            
+            # Fallback to traditional LLM-based diagram generation
+            logger.info(f"🎨 Using traditional diagram generation for {diagram_type} with {len(nodes)} nodes and {len(edges)} edges")
+            
+            # Validate input for traditional generation
             if not nodes:
                 return "❌ **Error**: No nodes provided for diagram generation"
                
             if not edges:
                 return "❌ **Error**: No edges provided for diagram generation"
             
-            logger.info(f"🎨 Generating {diagram_type} diagram with {len(nodes)} nodes and {len(edges)} edges")
-            
-            # Call the tool
-            diagram_data = {
-                "diagram_type": diagram_type,
-                "nodes": nodes,
-                "edges": edges
-            }
-            
-            result = create_mermaid_diagram(diagram_data)
-            
-            # DEBUG: Log raw mermaid output from generator (Step 6 diagnosis)
-            logger.info(f"🔍 MERMAID DEBUG STEP 6 - Raw generator output: {result[:200]}...")
-            if '--&gt;' in result or '--&amp;gt;' in result or '--@gt' in result:
-                logger.error(f"🚨 CORRUPTION DETECTED IN GENERATOR OUTPUT: {result}")
-            
-            # Removed automatic HTML entity arrow replacement - using diagnosis to find root cause
-            
-            # Format for structured response
-            response = f"✅ **Mermaid Diagram Generated Successfully**\n\n"
-            response += f"**📊 Diagram Details:**\n"
-            response += f"- **Type:** {diagram_type}\n"
-            response += f"- **Nodes:** {len(nodes)} components\n"
-            response += f"- **Connections:** {len(edges)} relationships\n"
-            response += f"- **Diagram Length:** {len(result)} characters\n\n"
-            response += "```mermaid\n"
-            response += result
-            response += "\n```"
-            
-            # DEBUG: Log final tool response before sending to LLM (Step 7 diagnosis)
-            logger.info(f"🔍 MERMAID DEBUG STEP 7 - Tool response to LLM: {response[:300]}...")
-            if '--&gt;' in response or '--&amp;gt;' in response or '--@gt' in response:
-                logger.error(f"🚨 CORRUPTION DETECTED IN TOOL RESPONSE: {response}")
-            
-            logger.info(f"🎨 Successfully generated Mermaid diagram ({len(result)} chars)")
-            return response
+            # Use Phase 3.2.1 Pure Rendering approach
+            if hasattr(self, 'mermaid_renderer') and self.mermaid_renderer:
+                # Use new pure renderer
+                graph_data = {'nodes': nodes, 'edges': edges}
+                result = self.mermaid_renderer.generate(diagram_type, graph_data)
+                return self._format_mermaid_response(result, diagram_type, "Pure Renderer", len(nodes), len(edges))
+            else:
+                # Legacy fallback
+                diagram_data = {
+                    "diagram_type": diagram_type,
+                    "nodes": nodes,
+                    "edges": edges
+                }
+                result = create_mermaid_diagram(diagram_data)
+                return self._format_mermaid_response(result, diagram_type, "Legacy", len(nodes), len(edges))
             
         except ValueError as ve:
             logger.error(f"Mermaid validation error: {ve}")
@@ -666,6 +712,182 @@ class CerebrasNativeAgent:
         except Exception as e:
             logger.error(f"Mermaid generator error: {e}")
             return f"❌ **Mermaid Generation Failed:** {str(e)}\n\nThe diagram could not be generated. Please verify your input data."
+
+    def _format_mermaid_response(self, mermaid_content: str, diagram_type: str, generation_method: str, node_count: int, edge_count: int) -> str:
+        """
+        Phase 3.2.3: Standardized mermaid response formatting with generation method tracking.
+        """
+        try:
+            # DEBUG: Log raw mermaid output (Step 6 diagnosis)
+            logger.info(f"🔍 MERMAID DEBUG STEP 6 - {generation_method} output: {mermaid_content[:200]}...")
+            if '--&gt;' in mermaid_content or '--&amp;gt;' in mermaid_content or '--@gt' in mermaid_content:
+                logger.error(f"🚨 CORRUPTION DETECTED IN {generation_method} OUTPUT: {mermaid_content}")
+            
+            # Format for structured response
+            response = f"✅ **Mermaid Diagram Generated Successfully** ({generation_method})\n\n"
+            response += f"**📊 Diagram Details:**\n"
+            response += f"- **Type:** {diagram_type}\n"
+            response += f"- **Method:** {generation_method}\n"
+            response += f"- **Nodes:** {node_count} components\n"
+            response += f"- **Connections:** {edge_count} relationships\n"
+            response += f"- **Diagram Length:** {len(mermaid_content)} characters\n\n"
+            response += "```mermaid\n"
+            response += mermaid_content
+            response += "\n```"
+            
+            # DEBUG: Log final tool response before sending to LLM (Step 7 diagnosis)
+            logger.info(f"🔍 MERMAID DEBUG STEP 7 - Tool response to LLM: {response[:300]}...")
+            if '--&gt;' in response or '--&amp;gt;' in response or '--@gt' in response:
+                logger.error(f"🚨 CORRUPTION DETECTED IN TOOL RESPONSE: {response}")
+            
+            logger.info(f"🎨 Successfully generated {generation_method} Mermaid diagram ({len(mermaid_content)} chars)")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Mermaid response formatting error: {e}")
+            return f"❌ **Diagram Formatting Error:** {str(e)}"
+
+    def _extract_class_name_from_nodes(self, nodes: List[Dict]) -> str:
+        """Extract class name from node data for KG lookup."""
+        try:
+            for node in nodes:
+                if isinstance(node, dict):
+                    # Look for class name in various possible fields
+                    for field in ['id', 'name', 'label', 'class_name']:
+                        if field in node and node[field]:
+                            value = str(node[field])
+                            # Check if it looks like a class name (starts with capital)
+                            if value and value[0].isupper():
+                                return value
+            return None
+        except Exception as e:
+            logger.debug(f"Class name extraction failed: {e}")
+            return None
+
+    def _extract_function_name_from_nodes(self, nodes: List[Dict]) -> str:
+        """Extract function name from node data for KG lookup."""
+        try:
+            for node in nodes:
+                if isinstance(node, dict):
+                    # Look for function indicators
+                    for field in ['id', 'name', 'label', 'function_name']:
+                        if field in node and node[field]:
+                            value = str(node[field])
+                            # Check if it looks like a function name
+                            if value and ('(' in value or field == 'function_name'):
+                                return value.split('(')[0]  # Remove parentheses if present
+                            elif value and not value[0].isupper():  # lowercase suggests function
+                                return value
+            return None
+        except Exception as e:
+            logger.debug(f"Function name extraction failed: {e}")
+            return None
+
+    def _extract_module_path_from_nodes(self, nodes: List[Dict]) -> str:
+        """Extract module path from node data for KG lookup."""
+        try:
+            for node in nodes:
+                if isinstance(node, dict):
+                    # Look for file path or module indicators
+                    for field in ['id', 'name', 'label', 'file_path', 'module', 'path']:
+                        if field in node and node[field]:
+                            value = str(node[field])
+                            # Check if it looks like a file path
+                            if '/' in value or '\\' in value or '.' in value:
+                                return value
+            return None
+        except Exception as e:
+            logger.debug(f"Module path extraction failed: {e}")
+            return None
+    
+    async def _query_codebase_wrapper(self, query: str, filters: dict = None, analysis_mode: str = 'auto') -> str:
+        """
+        Phase 3.3.2: Unified query tool wrapper that eliminates tool choice complexity.
+        
+        This single tool replaces the need to choose between smart_search, kg_find_symbol,
+        kg_explore_neighborhood, and kg_find_callers by intelligently routing queries
+        to the optimal strategy.
+        
+        Args:
+            query: Natural language query about the codebase
+            filters: Optional filters (file_type, directory, symbol_type, etc.)
+            analysis_mode: 'auto', 'structural_kg', 'semantic_rag', 'specific_symbol'
+            
+        Returns:
+            Formatted results with strategy information
+        """
+        try:
+            logger.info(f"🔍 UNIFIED QUERY: '{query}' (mode: {analysis_mode})")
+            
+            # Use the unified query system
+            result = await query_codebase(query, filters, analysis_mode)
+            
+            # Format response for the agent
+            response_parts = []
+            response_parts.append(f"✅ **Query Results** ({result['strategy']})")
+            response_parts.append(f"**Query Analysis:** {result.get('query_analysis', {}).get('intent', 'unknown')} (confidence: {result.get('query_analysis', {}).get('confidence', 0.0):.2f})")
+            response_parts.append(f"**Results Found:** {result.get('total_results', 0)}")
+            
+            if result.get('error'):
+                response_parts.append(f"**Error:** {result['error']}")
+                return '\n'.join(response_parts)
+            
+            # Add results
+            results = result.get('results', [])
+            if results:
+                response_parts.append("\n**📋 Results:**")
+                for i, item in enumerate(results[:10], 1):  # Limit to top 10
+                    if isinstance(item, dict):
+                        # Handle different result formats
+                        name = item.get('name', item.get('file_path', 'Unknown'))
+                        file_path = item.get('file_path', '')
+                        item_type = item.get('type', 'unknown')
+                        
+                        if 'snippet' in item:
+                            # Smart search result format
+                            snippet = item['snippet'][:200] + '...' if len(item['snippet']) > 200 else item['snippet']
+                            response_parts.append(f"   {i}. **{name}** ({item_type})")
+                            response_parts.append(f"      📁 {file_path}")
+                            response_parts.append(f"      📝 {snippet}")
+                        else:
+                            # KG result format
+                            line_info = f":{item.get('line_start', '')}" if item.get('line_start') else ""
+                            response_parts.append(f"   {i}. **{name}** ({item_type})")
+                            response_parts.append(f"      📁 {file_path}{line_info}")
+                            
+                            if 'relationship' in item:
+                                response_parts.append(f"      🔗 {item['relationship']}")
+                    else:
+                        # Handle other formats
+                        response_parts.append(f"   {i}. {str(item)}")
+                    
+                    response_parts.append("")  # Add spacing
+            else:
+                response_parts.append("\n❌ No results found for this query.")
+            
+            # Add metadata
+            if result.get('execution_time'):
+                response_parts.append(f"⏱️ **Execution Time:** {result['execution_time']:.2f}s")
+            
+            # Add strategy explanation
+            strategy_explanations = {
+                'kg_direct_find_callers': '🔍 Used Knowledge Graph to find function callers',
+                'kg_direct_explore_neighborhood': '🕸️ Used Knowledge Graph to explore symbol relationships',
+                'kg_direct_find_symbol': '🎯 Used Knowledge Graph for direct symbol lookup',
+                'symbol_expand': '🔄 Found symbol and expanded with neighborhood context',
+                'hybrid_intelligent': '🧠 Used intelligent hybrid search with Phase 3 classification',
+                'hybrid_legacy': '🔧 Used legacy hybrid search as fallback',
+                'error': '❌ Query processing encountered an error'
+            }
+            
+            strategy_explanation = strategy_explanations.get(result['strategy'], f"Used {result['strategy']} strategy")
+            response_parts.append(f"\n💡 **Strategy:** {strategy_explanation}")
+            
+            return '\n'.join(response_parts)
+            
+        except Exception as e:
+            logger.error(f"Query codebase wrapper failed: {e}")
+            return f"❌ **Query Failed:** {str(e)}\n\nPlease check your query and try again."
     
     async def _smart_search_router(self, query: str, max_results: int = 10) -> str:
         """Route to context-aware or legacy smart search based on availability"""
@@ -980,6 +1202,36 @@ class CerebrasNativeAgent:
         
         return highlighted_content
 
+    def _enhance_code_with_annotations(self, code_snippet: str, file_context: str = None) -> str:
+        """
+        Phase 3.2.3: Enhance code snippets with contextual annotations from Knowledge Graph.
+        
+        Uses the CodeLensAnnotator to add IDE-like context information to code snippets,
+        including function signatures, class inheritance, and import relationships.
+        
+        Args:
+            code_snippet: Raw code content to annotate
+            file_context: File path for better context resolution
+            
+        Returns:
+            Enhanced code with HTML/Markdown annotations
+        """
+        try:
+            # Only apply annotations if we have Phase 3.2.2 components available
+            if not hasattr(self, 'code_annotator') or not self.code_annotator:
+                logger.debug("CodeLensAnnotator not available, returning original code")
+                return code_snippet
+            
+            # Apply code lens annotations
+            annotated_code = self.code_annotator.annotate_code(code_snippet, file_context)
+            
+            logger.debug(f"Enhanced code snippet with {len(annotated_code) - len(code_snippet)} additional annotation characters")
+            return annotated_code
+            
+        except Exception as e:
+            logger.warning(f"Code annotation failed, returning original: {e}")
+            return code_snippet
+
     async def _examine_files(self, file_paths: List[str] = None, detail_level: str = "summary") -> str:
         """Flexible file inspection with multiple detail levels"""
         try:
@@ -1056,28 +1308,33 @@ class CerebrasNativeAgent:
                             results.append(f"   📝 CODE SAMPLE:\n{highlighted_sample}")
                     
                     elif detail_level == "summary":
-                        # Show first 20 and last 10 lines with syntax highlighting
+                        # Phase 3.2.3: Add code annotations for enhanced context
                         if line_count <= 30:
-                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
+                            enhanced_content = self._enhance_code_with_annotations(content, str(full_path))
+                            highlighted_content = self._apply_syntax_highlighting(enhanced_content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT (with context annotations):\n{highlighted_content}")
                         else:
                             head = '\n'.join(lines[:20])
                             tail = '\n'.join(lines[-10:])
-                            highlighted_head = self._apply_syntax_highlighting(head, full_path.suffix)
-                            highlighted_tail = self._apply_syntax_highlighting(tail, full_path.suffix)
-                            results.append(f"   📝 HEAD (20 lines):\n{highlighted_head}")
+                            enhanced_head = self._enhance_code_with_annotations(head, str(full_path))
+                            enhanced_tail = self._enhance_code_with_annotations(tail, str(full_path))
+                            highlighted_head = self._apply_syntax_highlighting(enhanced_head, full_path.suffix)
+                            highlighted_tail = self._apply_syntax_highlighting(enhanced_tail, full_path.suffix)
+                            results.append(f"   📝 HEAD (20 lines, with context annotations):\n{highlighted_head}")
                             results.append(f"\n   ... ({line_count - 30} lines omitted) ...")
-                            results.append(f"\n   📝 TAIL (10 lines):\n{highlighted_tail}")
+                            results.append(f"\n   📝 TAIL (10 lines, with context annotations):\n{highlighted_tail}")
                     
                     elif detail_level == "full":
-                        # Show complete content with syntax highlighting (truncated if very large)
+                        # Phase 3.2.3: Add code annotations for complete files
                         if file_size > 10000:  # 10KB limit
                             truncated_content = content[:10000] + "\n... (content truncated)"
-                            highlighted_content = self._apply_syntax_highlighting(truncated_content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT (truncated):\n{highlighted_content}")
+                            enhanced_content = self._enhance_code_with_annotations(truncated_content, str(full_path))
+                            highlighted_content = self._apply_syntax_highlighting(enhanced_content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT (truncated, with context annotations):\n{highlighted_content}")
                         else:
-                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
+                            enhanced_content = self._enhance_code_with_annotations(content, str(full_path))
+                            highlighted_content = self._apply_syntax_highlighting(enhanced_content, full_path.suffix)
+                            results.append(f"   📝 CODE CONTENT (with context annotations):\n{highlighted_content}")
                     
                     results.append("   " + "-" * 50)
                     successful_files.append(file_path)

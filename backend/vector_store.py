@@ -8,6 +8,9 @@ from pathlib import Path
 import logging
 from sentence_transformers import SentenceTransformer
 
+# Set up logging for vector store operations
+logger = logging.getLogger(__name__)
+
 # REQ-CACHE-6: BGE Embedding Cache Integration
 try:
     from cache.embedding_cache import get_global_embedding_cache
@@ -16,10 +19,6 @@ except ImportError:
     logger.warning("BGE Embedding Cache not available - running without cache")
     def get_global_embedding_cache():
         return None
-
-# Set up logging for vector store operations
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 # BGE encoder for high-quality embeddings (REQ-1.3.1)
