@@ -8,6 +8,15 @@ from pathlib import Path
 import logging
 from sentence_transformers import SentenceTransformer
 
+# REQ-CACHE-6: BGE Embedding Cache Integration
+try:
+    from cache.embedding_cache import get_global_embedding_cache
+except ImportError:
+    # Graceful fallback if cache module is not available
+    logger.warning("BGE Embedding Cache not available - running without cache")
+    def get_global_embedding_cache():
+        return None
+
 # Set up logging for vector store operations
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # BGE encoder for high-quality embeddings (REQ-1.3.1)
 _vs_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+# REQ-CACHE-6: Global embedding cache instance
+_embedding_cache = None
 
 WORKSPACE_DIR = "/workspace"
 CACHE_DIR = Path(WORKSPACE_DIR) / ".vector_cache"
@@ -41,7 +53,7 @@ class VectorStore:
         else:
             # If index not present, fallback to empty index (indexer builds asynchronously)
             logger.warning("No vector index found, creating empty index")
-            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
+            self.index = faiss.IndexFlatL2(1024)  # BGE uses 1024 dimensions
 
     # --------------------------- internal helpers ---------------------------
     def _chunk_text(self, text: str) -> List[str]:
@@ -68,32 +80,102 @@ class VectorStore:
                     paths.append(Path(root) / f)
         return paths
 
-    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # encode locally in smaller batches to prevent memory issues
-        embeddings: List[List[float]] = []
-        batch_size = 100  # Reduced from 256 to prevent memory exhaustion
-        total_batches = (len(texts) + batch_size - 1) // batch_size
+    def _embed_batch(self, texts: List[str], is_query: bool = False) -> List[List[float]]:
+        """
+        Generate embeddings with cache integration (REQ-CACHE-6).
         
-        logger.info(f"Processing {len(texts)} texts in {total_batches} batches of {batch_size}")
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            batch_num = (i // batch_size) + 1
-            
+        Args:
+            texts: List of text strings to embed
+            is_query: Whether these are query embeddings (vs document embeddings)
+        """
+        # REQ-CACHE-6: Initialize embedding cache if needed
+        global _embedding_cache
+        if _embedding_cache is None:
             try:
-                logger.debug(f"Processing embedding batch {batch_num}/{total_batches}")
-                vecs = _vs_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
-                embeddings.extend(vecs.tolist())
-                
-                # Small delay to prevent memory pressure
-                import time
-                time.sleep(0.05)
-                
+                _embedding_cache = get_global_embedding_cache()
+                logger.info("BGE Embedding Cache initialized for vector store")
             except Exception as e:
-                logger.error(f"Batch {batch_num} embedding error: {e}")
-                embeddings.extend([[0.0] * 384] * len(batch))
+                logger.warning(f"Failed to initialize embedding cache: {e}")
+                _embedding_cache = None
         
-        logger.info(f"Successfully generated {len(embeddings)} embeddings")
+        embeddings: List[List[float]] = []
+        cache_hits = 0
+        cache_misses = 0
+        
+        # REQ-CACHE-6: Check cache for each text if cache is available
+        uncached_texts = []
+        uncached_indices = []
+        
+        if _embedding_cache:
+            for i, text in enumerate(texts):
+                cached_embedding = _embedding_cache.get(text, is_query=is_query)
+                if cached_embedding is not None:
+                    embeddings.append(cached_embedding.tolist())
+                    cache_hits += 1
+                else:
+                    embeddings.append(None)  # Placeholder
+                    uncached_texts.append(text)
+                    uncached_indices.append(i)
+                    cache_misses += 1
+        else:
+            # No cache available, process all texts
+            uncached_texts = texts
+            uncached_indices = list(range(len(texts)))
+            embeddings = [None] * len(texts)
+        
+        if cache_hits > 0:
+            hit_rate = cache_hits/(cache_hits+cache_misses)*100
+            logger.info(f"BGE Cache: {cache_hits} hits, {cache_misses} misses ({hit_rate:.1f}% hit rate)")
+            
+            # Report batch cache performance to metrics
+            if _embedding_cache and _embedding_cache.global_metrics:
+                layer_name = 'bge_embeddings_query' if is_query else 'bge_embeddings_document'
+                # Record overall batch performance
+                avg_time_saved = 50 * (cache_hits / max(1, cache_hits + cache_misses))
+                _embedding_cache.global_metrics.record_cache_hit(
+                    f"{layer_name}_batch", 
+                    time_saved_ms=avg_time_saved,
+                    response_time_ms=1.0
+                )
+        
+        # Process uncached texts in batches
+        if uncached_texts:
+            batch_size = 100  # Reduced from 256 to prevent memory exhaustion
+            total_batches = (len(uncached_texts) + batch_size - 1) // batch_size
+            
+            logger.info(f"Processing {len(uncached_texts)} uncached texts in {total_batches} batches of {batch_size}")
+            
+            uncached_embeddings = []
+            for i in range(0, len(uncached_texts), batch_size):
+                batch = uncached_texts[i : i + batch_size]
+                batch_num = (i // batch_size) + 1
+                
+                try:
+                    logger.debug(f"Processing embedding batch {batch_num}/{total_batches}")
+                    vecs = _vs_embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+                    uncached_embeddings.extend(vecs.tolist())
+                    
+                    # REQ-CACHE-6: Cache the newly generated embeddings
+                    if _embedding_cache:
+                        try:
+                            batch_arrays = [np.array(vec) for vec in vecs.tolist()]
+                            _embedding_cache.set_batch(batch, batch_arrays, is_query=is_query)
+                        except Exception as cache_error:
+                            logger.warning(f"Failed to cache batch {batch_num}: {cache_error}")
+                    
+                    # Small delay to prevent memory pressure
+                    import time
+                    time.sleep(0.05)
+                    
+                except Exception as e:
+                    logger.error(f"Batch {batch_num} embedding error: {e}")
+                    uncached_embeddings.extend([[0.0] * 1024] * len(batch))  # BGE uses 1024 dimensions
+            
+            # Fill in the uncached embeddings at their original positions
+            for idx, embedding in zip(uncached_indices, uncached_embeddings):
+                embeddings[idx] = embedding
+        
+        logger.info(f"Successfully generated {len(embeddings)} embeddings (cache: {cache_hits} hits, {cache_misses} misses)")
         return embeddings
 
     def _build(self):
@@ -129,7 +211,7 @@ class VectorStore:
 
         if not texts:
             logger.warning("No text content found for indexing - creating empty index")
-            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
+            self.index = faiss.IndexFlatL2(1024)  # BGE uses 1024 dimensions
             return
 
         logger.info(f"Generating embeddings for {len(texts)} text chunks")
@@ -188,7 +270,7 @@ class VectorStore:
             current_mtime = self.index_path.stat().st_mtime
         except FileNotFoundError:
             logger.warning("Index file not found; using empty index")
-            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
+            self.index = faiss.IndexFlatL2(1024)  # BGE uses 1024 dimensions
             self.meta = []
             self._index_mtime = None
             return
@@ -275,8 +357,8 @@ class VectorStore:
             return []
         
         try:
-            # Generate embedding for query
-            emb_vec = np.array(self._embed_batch([query])[0]).astype("float32").reshape(1, -1)
+            # Generate embedding for query (REQ-CACHE-6: Mark as query embedding)
+            emb_vec = np.array(self._embed_batch([query], is_query=True)[0]).astype("float32").reshape(1, -1)
             
             # Search for more candidates than requested to allow for in-project filtering
             if allowed_projects:
@@ -399,7 +481,7 @@ class VectorStore:
         
         if not new_meta:
             # No embeddings left, create empty index
-            self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
+            self.index = faiss.IndexFlatL2(1024)  # BGE uses 1024 dimensions
             self.meta = []
         else:
             # Rebuild index with remaining embeddings
@@ -417,7 +499,7 @@ class VectorStore:
                     new_index.add(embeddings_array)
                     self.index = new_index
                 else:
-                    self.index = faiss.IndexFlatL2(384)  # Fixed: MiniLM uses 384 dimensions, not 768
+                    self.index = faiss.IndexFlatL2(1024)  # BGE uses 1024 dimensions
                 
                 self.meta = new_meta
             except Exception:

@@ -221,6 +221,29 @@ class DatabaseManager:
             logger.error(f"Failed to get nodes by file {file_path}: {e}")
             return []
     
+    def get_all_nodes(self, limit: int = None) -> List[Dict]:
+        """Get all nodes in the database."""
+        try:
+            cursor = self.connection.cursor()
+            
+            query = "SELECT * FROM nodes ORDER BY file_path, line_start"
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            results = cursor.execute(query).fetchall()
+            
+            nodes = []
+            for result in results:
+                node = dict(result)
+                node['properties'] = json.loads(node['properties'] or '{}')
+                nodes.append(node)
+            
+            return nodes
+            
+        except Exception as e:
+            logger.error(f"Failed to get all nodes: {e}")
+            return []
+    
     # ==================== EDGE OPERATIONS ====================
     
     def insert_edge(self, source_id: str, target_id: str, edge_type: str, 

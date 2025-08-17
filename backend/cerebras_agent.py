@@ -421,7 +421,7 @@ class CerebrasNativeAgent:
         return score
     
     def _create_tools_schema(self) -> List[Dict[str, Any]]:
-        """Create simplified 3-tool architecture schema with smart tools"""
+        """Create enhanced 7-tool architecture schema with Phase 2.3 KG tools"""
         return [
             {
                 "type": "function",
@@ -533,16 +533,84 @@ class CerebrasNativeAgent:
                         "required": ["diagram_type", "nodes", "edges"]
                     }
                 }
+            },
+            # ==================== PHASE 2.3: KNOWLEDGE GRAPH TOOLS ====================
+            {
+                "type": "function",
+                "function": {
+                    "name": "kg_find_symbol",
+                    "description": "Find symbols in the Knowledge Graph by name. Returns detailed symbol information with location, type, and metadata. Use this to locate specific functions, classes, or variables across the codebase.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbol_name": {
+                                "type": "string",
+                                "description": "Name of the symbol to find (function, class, variable)"
+                            },
+                            "exact_match": {
+                                "type": "boolean",
+                                "description": "Whether to use exact name matching (default: true)"
+                            }
+                        },
+                        "required": ["symbol_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "kg_explore_neighborhood",
+                    "description": "Explore the complete 'neighborhood' of relationships around a symbol. Returns comprehensive relationship analysis including callers, dependencies, inheritance, and file context.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbol_name": {
+                                "type": "string",
+                                "description": "Symbol to explore relationships for"
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum relationship depth to explore (default: 3)"
+                            }
+                        },
+                        "required": ["symbol_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "kg_find_callers",
+                    "description": "Find all symbols that call the target symbol through the Knowledge Graph. Returns accurate caller information with relationship context.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "symbol_name": {
+                                "type": "string",
+                                "description": "Symbol to find callers for"
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum caller depth to explore (default: 3)"
+                            }
+                        },
+                        "required": ["symbol_name"]
+                    }
+                }
             }
         ]
     
     def _create_function_mapping(self) -> Dict[str, callable]:
-        """Map function names to simplified 4-tool implementations"""
+        """Map function names to enhanced 7-tool implementations"""
         return {
             "smart_search": self._smart_search_router,  # Context-aware router
             "examine_files": self._examine_files,
             "analyze_relationships": self._analyze_relationships,
-            "mermaid_generator": self._mermaid_generator_wrapper
+            "mermaid_generator": self._mermaid_generator_wrapper,
+            # Phase 2.3 KG tools
+            "kg_find_symbol": self._kg_find_symbol,
+            "kg_explore_neighborhood": self._kg_explore_neighborhood,
+            "kg_find_callers": self._kg_find_callers
         }
     
     async def _mermaid_generator_wrapper(self, diagram_type: str, nodes: List[Dict], edges: List[Dict]) -> str:
@@ -1709,6 +1777,187 @@ class CerebrasNativeAgent:
         except Exception as e:
             return f"   Error analyzing impact: {e}"
     
+    # ==================== PHASE 2.3: KNOWLEDGE GRAPH TOOL IMPLEMENTATIONS ====================
+    
+    async def _kg_find_symbol(self, symbol_name: str, exact_match: bool = True) -> str:
+        """
+        Phase 2.3 KG Tool: Find symbols in the Knowledge Graph by name.
+        Returns detailed symbol information with location, type, and metadata.
+        """
+        try:
+            # Import here to avoid circular dependencies
+            from storage.database_manager import DatabaseManager
+            
+            # Initialize database connection (shared workspace path)
+            db_manager = DatabaseManager('/workspace/.vector_cache/codewise.db')
+            
+            # Search for symbols
+            if exact_match:
+                # Exact name match
+                symbol_nodes = [node for node in db_manager.get_all_nodes() 
+                              if node['name'] == symbol_name]
+            else:
+                # Partial name match
+                symbol_nodes = [node for node in db_manager.get_all_nodes() 
+                              if symbol_name.lower() in node['name'].lower()]
+            
+            if not symbol_nodes:
+                return f"🔍 **No symbols found** matching '{symbol_name}' in Knowledge Graph.\n\n💡 **Suggestions:**\n- Try using `smart_search` to locate the symbol first\n- Check for typos in the symbol name\n- Use exact_match=false for partial matching"
+            
+            # Format results
+            results = []
+            results.append(f"🎯 **Found {len(symbol_nodes)} symbol(s) matching '{symbol_name}':**\n")
+            
+            for i, node in enumerate(symbol_nodes[:5], 1):  # Limit to top 5
+                results.append(f"## {i}. {node['name']} ({node['type']})")
+                results.append(f"**Location:** {node['file_path']}")
+                if node.get('line_start'):
+                    results.append(f"**Lines:** {node['line_start']}-{node.get('line_end', node['line_start'])}")
+                if node.get('signature'):
+                    results.append(f"**Signature:** `{node['signature']}`")
+                if node.get('docstring'):
+                    results.append(f"**Description:** {node['docstring'][:200]}...")
+                results.append("")
+            
+            if len(symbol_nodes) > 5:
+                results.append(f"... and {len(symbol_nodes) - 5} more symbols. Use `kg_explore_neighborhood` for detailed analysis.")
+            
+            return "\n".join(results)
+            
+        except ImportError:
+            return "❌ **Knowledge Graph not available** - Phase 2.1 database components not found"
+        except Exception as e:
+            logger.error(f"KG find symbol error: {e}")
+            return f"❌ **Error finding symbol:** {str(e)}"
+    
+    async def _kg_explore_neighborhood(self, symbol_name: str, max_depth: int = 3) -> str:
+        """
+        Phase 2.3 KG Tool: Explore the complete 'neighborhood' of relationships around a symbol.
+        Returns comprehensive relationship analysis.
+        """
+        try:
+            from storage.database_manager import DatabaseManager
+            
+            db_manager = DatabaseManager('/workspace/.vector_cache/codewise.db')
+            
+            # Find the symbol first
+            symbol_nodes = [node for node in db_manager.get_all_nodes() 
+                          if node['name'] == symbol_name]
+            
+            if not symbol_nodes:
+                return f"🔍 **Symbol '{symbol_name}' not found** in Knowledge Graph. Use `kg_find_symbol` to locate it first."
+            
+            results = []
+            results.append(f"🌐 **Knowledge Graph Neighborhood Analysis for '{symbol_name}'**\n")
+            
+            for node in symbol_nodes[:3]:  # Analyze top 3 matches
+                results.append(f"## 📍 {node['name']} ({node['type']}) - {node['file_path']}")
+                
+                # Get callers
+                try:
+                    callers = db_manager.find_callers(node['id'], max_depth)
+                    if callers:
+                        results.append(f"### 📞 **Called by ({len(callers)} functions):**")
+                        for caller in callers[:5]:
+                            results.append(f"- {caller['name']} in {caller['file_path']}")
+                        if len(callers) > 5:
+                            results.append(f"- ... and {len(callers) - 5} more")
+                    else:
+                        results.append("### 📞 **Called by:** None found")
+                except:
+                    results.append("### 📞 **Called by:** Analysis failed")
+                
+                # Get dependencies  
+                try:
+                    dependencies = db_manager.find_dependencies(node['id'], max_depth)
+                    if dependencies:
+                        results.append(f"### 🔗 **Depends on ({len(dependencies)} symbols):**")
+                        for dep in dependencies[:5]:
+                            results.append(f"- {dep['name']} ({dep['type']}) in {dep['file_path']}")
+                        if len(dependencies) > 5:
+                            results.append(f"- ... and {len(dependencies) - 5} more")
+                    else:
+                        results.append("### 🔗 **Depends on:** None found")
+                except:
+                    results.append("### 🔗 **Depends on:** Analysis failed")
+                
+                results.append("")
+            
+            return "\n".join(results)
+            
+        except ImportError:
+            return "❌ **Knowledge Graph not available** - Phase 2.1 database components not found"
+        except Exception as e:
+            logger.error(f"KG explore neighborhood error: {e}")
+            return f"❌ **Error exploring neighborhood:** {str(e)}"
+    
+    async def _kg_find_callers(self, symbol_name: str, max_depth: int = 3) -> str:
+        """
+        Phase 2.3 KG Tool: Find all symbols that call the target symbol.
+        Returns accurate caller information with relationship context.
+        """
+        try:
+            from storage.database_manager import DatabaseManager
+            
+            db_manager = DatabaseManager('/workspace/.vector_cache/codewise.db')
+            
+            # Find the symbol first
+            symbol_nodes = [node for node in db_manager.get_all_nodes() 
+                          if node['name'] == symbol_name]
+            
+            if not symbol_nodes:
+                return f"🔍 **Symbol '{symbol_name}' not found** in Knowledge Graph. Use `kg_find_symbol` to locate it first."
+            
+            results = []
+            results.append(f"📞 **Caller Analysis for '{symbol_name}'**\n")
+            
+            all_callers = []
+            for node in symbol_nodes:
+                try:
+                    callers = db_manager.find_callers(node['id'], max_depth)
+                    all_callers.extend(callers)
+                except:
+                    continue
+            
+            if not all_callers:
+                results.append(f"**No callers found** for '{symbol_name}' (depth: {max_depth})")
+                results.append("\n💡 **This could mean:**")
+                results.append("- The function is only called via dynamic dispatch")
+                results.append("- It's an entry point (main function, API endpoint)")
+                results.append("- It's unused/dead code")
+                results.append("- The Knowledge Graph needs to be rebuilt")
+                return "\n".join(results)
+            
+            # Group by file for better organization
+            caller_by_file = {}
+            for caller in all_callers:
+                file_path = caller['file_path']
+                if file_path not in caller_by_file:
+                    caller_by_file[file_path] = []
+                caller_by_file[file_path].append(caller)
+            
+            results.append(f"**Found {len(all_callers)} callers across {len(caller_by_file)} files:**\n")
+            
+            for file_path, file_callers in list(caller_by_file.items())[:10]:  # Limit to 10 files
+                results.append(f"### 📁 {file_path}")
+                for caller in file_callers[:5]:  # Limit to 5 per file
+                    depth_indicator = "  " * caller.get('depth', 0)
+                    results.append(f"{depth_indicator}- {caller['name']}")
+                if len(file_callers) > 5:
+                    results.append(f"  - ... and {len(file_callers) - 5} more in this file")
+                results.append("")
+            
+            if len(caller_by_file) > 10:
+                results.append(f"... and {len(caller_by_file) - 10} more files with callers")
+            
+            return "\n".join(results)
+            
+        except ImportError:
+            return "❌ **Knowledge Graph not available** - Phase 2.1 database components not found"
+        except Exception as e:
+            logger.error(f"KG find callers error: {e}")
+            return f"❌ **Error finding callers:** {str(e)}"
+    
     async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None, selected_model: str = "gpt-oss-120b") -> AsyncGenerator[Dict[str, Any], None]:
         """Process a user request using native Cerebras tool calling with query context management"""
         
@@ -1822,7 +2071,7 @@ class CerebrasNativeAgent:
         is_file_query = any(word in query_lower for word in ['file', 'read', 'content', 'source'])
         is_architecture_query = any(keyword in query_lower for keyword in ['architecture', 'design', 'overview', 'structure', 'data flow', 'component', 'system layout', 'how does', 'explain the'])
         
-        # Build system prompt with simplified 3-tool guidance
+        # Build system prompt with enhanced 7-tool guidance including Phase 2.3 KG tools
         tool_guidance = (
             "\n🧠 SMART_SEARCH: Your comprehensive discovery engine for deep codebase exploration"
             "\n   - Automatically detects query intent and routes to optimal search strategies"
@@ -1844,6 +2093,33 @@ class CerebrasNativeAgent:
             "\n   - impact: Detailed change impact assessment with affected components"
             "\n   - all: Comprehensive bidirectional analysis with architectural insights"
             "\n   - TIP: Use this to understand system boundaries, coupling, and architectural patterns"
+            "\n"
+            "\n🎯 KNOWLEDGE GRAPH TOOLS (Phase 2.3) - USE THESE FOR SYMBOL-SPECIFIC QUERIES:"
+            "\n"
+            "\n🔍 KG_FIND_SYMBOL: Precise symbol location and metadata from Knowledge Graph"
+            "\n   - Use when user asks about specific functions, classes, variables by name"
+            "\n   - Returns exact location, signature, type, and metadata"
+            "\n   - WHEN TO USE: 'Where is BookController?', 'Find the login function', 'Show me UserService class'"
+            "\n   - EXAMPLE: kg_find_symbol('BookController') → finds exact class with file path and line numbers"
+            "\n"
+            "\n🌐 KG_EXPLORE_NEIGHBORHOOD: Complete relationship analysis around a symbol"
+            "\n   - Use when user wants to understand HOW symbols interact/connect"
+            "\n   - Returns comprehensive caller/dependency analysis with relationship context"
+            "\n   - WHEN TO USE: 'How does BookController interact?', 'What uses UserService?', 'Show me connections'"
+            "\n   - EXAMPLE: kg_explore_neighborhood('UserService') → shows all callers and dependencies"
+            "\n"
+            "\n📞 KG_FIND_CALLERS: Find all symbols that call/use a target symbol"
+            "\n   - Use when user asks WHO calls or uses a specific function/class"
+            "\n   - Returns detailed caller hierarchy with context and file locations"
+            "\n   - WHEN TO USE: 'What calls this function?', 'Who uses BookService?', 'Find all usages'"
+            "\n   - EXAMPLE: kg_find_callers('saveBook') → lists all functions calling saveBook"
+            "\n"
+            "\n🚨 KG TOOL PRIORITY RULES:"
+            "\n   1. IF user mentions specific symbol names (functions, classes) → START with kg_find_symbol"
+            "\n   2. IF user asks about interactions/relationships → USE kg_explore_neighborhood"
+            "\n   3. IF user asks about callers/usage → USE kg_find_callers"
+            "\n   4. THEN follow up with smart_search/examine_files for additional context"
+            "\n   5. KG tools are faster and more accurate for symbol-specific queries than search"
         )
         
         # Add project filtering context if mentioned_projects provided

@@ -185,6 +185,212 @@ def build_bm25_index_from_chunks(texts: List[str], enhanced_meta: List[dict]) ->
         print(f"[indexer] Error building BM25 index: {e}", flush=True)
         return False
 
+def build_knowledge_graph_from_chunks(enhanced_meta: List[dict], build_mode: str, project: str = None) -> bool:
+    """
+    Build Knowledge Graph from indexed metadata.
+    
+    Args:
+        enhanced_meta: List of metadata dictionaries for each chunk
+        build_mode: "full" or "incremental" 
+        project: Project name for incremental builds
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        print(f"[KG] ========== KNOWLEDGE GRAPH BUILDING START ==========", flush=True)
+        print(f"[KG] Mode: {build_mode}, Project: {project}, Chunks: {len(enhanced_meta)}", flush=True)
+        
+        # Import KG components
+        import sys
+        sys.path.append('/app/backend')
+        try:
+            from storage.database_manager import DatabaseManager
+            print(f"[KG] ✅ Successfully imported DatabaseManager", flush=True)
+        except ImportError as e:
+            print(f"[KG] ❌ Failed to import DatabaseManager: {e}", flush=True)
+            return False
+        
+        # Initialize database in shared workspace (accessible by both containers)
+        db_path = '/workspace/.vector_cache/codewise.db'
+        print(f"[KG] Initializing database at: {db_path}", flush=True)
+        
+        try:
+            db = DatabaseManager(db_path)
+            print(f"[KG] ✅ Database connection established", flush=True)
+        except Exception as e:
+            print(f"[KG] ❌ Database connection failed: {e}", flush=True)
+            return False
+        
+        # Check existing data
+        try:
+            cursor = db.connection.cursor()
+            existing_nodes = cursor.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            existing_edges = cursor.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            print(f"[KG] Existing data: {existing_nodes} nodes, {existing_edges} edges", flush=True)
+        except Exception as e:
+            print(f"[KG] Warning: Could not check existing data: {e}", flush=True)
+        
+        # For incremental builds, remove existing nodes for this project
+        if build_mode == "incremental" and project:
+            try:
+                print(f"[KG] Incremental build: cleaning existing data for project '{project}'", flush=True)
+                # Get all nodes for this project
+                cursor = db.connection.cursor()
+                nodes_to_delete = cursor.execute(
+                    "SELECT id FROM nodes WHERE file_path LIKE ?", 
+                    (f"%{project}%",)
+                ).fetchall()
+                
+                print(f"[KG] Found {len(nodes_to_delete)} existing nodes to delete", flush=True)
+                
+                # Delete nodes and related edges
+                deleted_edges = 0
+                for (node_id,) in nodes_to_delete:
+                    edges_result = cursor.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+                    deleted_edges += edges_result.rowcount
+                    cursor.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+                
+                db.connection.commit()
+                print(f"[KG] ✅ Cleaned {len(nodes_to_delete)} nodes and {deleted_edges} edges for project '{project}'", flush=True)
+                
+            except Exception as e:
+                print(f"[KG] ❌ Warning: Could not clean existing KG data for project '{project}': {e}", flush=True)
+        
+        # Process chunks and extract symbols
+        print(f"[KG] Starting symbol extraction from {len(enhanced_meta)} chunks", flush=True)
+        nodes_added = 0
+        edges_added = 0
+        chunks_processed = 0
+        
+        for meta in enhanced_meta:
+            chunks_processed += 1
+            chunk_type = meta.get('chunk_type', '')
+            function_name = meta.get('function_name')
+            class_name = meta.get('class_name')
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            
+            if chunks_processed % 1000 == 0:
+                print(f"[KG] Progress: {chunks_processed}/{len(enhanced_meta)} chunks processed, {nodes_added} nodes added", flush=True)
+            
+            # Add function nodes
+            if function_name and chunk_type == 'function':
+                node_id = f"{file_path}::{function_name}::{meta.get('start_line', 0)}"
+                if chunks_processed <= 10:  # Log first 10 for debugging
+                    print(f"[KG] Adding function node: {function_name} in {file_path}", flush=True)
+                
+                success = db.insert_node(
+                    node_id=node_id,
+                    node_type='function',
+                    name=function_name,
+                    file_path=file_path,
+                    line_start=meta.get('start_line'),
+                    line_end=meta.get('end_line'),
+                    signature=meta.get('chunk_text', '').split('\\n')[0] if meta.get('chunk_text') else '',
+                    docstring=meta.get('docstring'),
+                    properties={}
+                )
+                if success:
+                    nodes_added += 1
+                elif chunks_processed <= 10:
+                    print(f"[KG] ❌ Failed to add function node: {function_name}", flush=True)
+            
+            # Add class nodes
+            if class_name and chunk_type == 'class':
+                node_id = f"{file_path}::{class_name}::{meta.get('start_line', 0)}"
+                if chunks_processed <= 10:  # Log first 10 for debugging
+                    print(f"[KG] Adding class node: {class_name} in {file_path}", flush=True)
+                
+                success = db.insert_node(
+                    node_id=node_id,
+                    node_type='class',
+                    name=class_name,
+                    file_path=file_path,
+                    line_start=meta.get('start_line'),
+                    line_end=meta.get('end_line'),
+                    signature=meta.get('chunk_text', '').split('\\n')[0] if meta.get('chunk_text') else '',
+                    docstring=meta.get('docstring'),
+                    properties={}
+                )
+                if success:
+                    nodes_added += 1
+                elif chunks_processed <= 10:
+                    print(f"[KG] ❌ Failed to add class node: {class_name}", flush=True)
+            
+            # Add module-level imports as nodes
+            imports = meta.get('imports', [])
+            if imports and chunks_processed <= 5:  # Log first 5 imports for debugging
+                print(f"[KG] Processing {len(imports)} imports for {file_path}: {imports[:3]}...", flush=True)
+            
+            for import_name in imports:
+                if import_name and isinstance(import_name, str):
+                    node_id = f"{file_path}::import::{import_name}"
+                    success = db.insert_node(
+                        node_id=node_id,
+                        node_type='import',
+                        name=import_name,
+                        file_path=file_path,
+                        line_start=meta.get('start_line'),
+                        line_end=meta.get('start_line'),
+                        signature=f"import {import_name}",
+                        properties={}
+                    )
+                    if success:
+                        nodes_added += 1
+        
+        # Simple relationship extraction from dependencies
+        for meta in enhanced_meta:
+            function_name = meta.get('function_name')
+            dependencies = meta.get('dependencies', [])
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            
+            if function_name and dependencies:
+                source_id = f"{file_path}::{function_name}::{meta.get('start_line', 0)}"
+                
+                for dep in dependencies:
+                    if dep and isinstance(dep, str):
+                        # Simple heuristic: if dependency looks like a function call
+                        if '(' in dep or dep.endswith('()'):
+                            dep_clean = dep.replace('()', '').replace('(', '').strip()
+                            target_id = f"{file_path}::{dep_clean}::0"  # Simplified target
+                            
+                            success = db.insert_edge(
+                                source_id=source_id,
+                                target_id=target_id,
+                                edge_type='calls',
+                                file_path=file_path,
+                                line_number=meta.get('start_line')
+                            )
+                            if success:
+                                edges_added += 1
+        
+        print(f"[KG] Symbol extraction complete: {nodes_added} nodes, {edges_added} edges", flush=True)
+        
+        # Get final statistics
+        try:
+            cursor = db.connection.cursor()
+            final_nodes = cursor.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            final_edges = cursor.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            node_types = cursor.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type").fetchall()
+            
+            print(f"[KG] Final statistics: {final_nodes} total nodes, {final_edges} total edges", flush=True)
+            print(f"[KG] Node types: {dict(node_types)}", flush=True)
+            
+        except Exception as e:
+            print(f"[KG] Warning: Could not get final statistics: {e}", flush=True)
+        
+        print(f"[KG] ========== KNOWLEDGE GRAPH BUILDING COMPLETE ==========", flush=True)
+        return True
+        
+    except ImportError as e:
+        print(f"[KG] ❌ Knowledge Graph components not available: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[KG] ❌ Error building Knowledge Graph: {e}", flush=True)
+        import traceback
+        print(f"[KG] ❌ Traceback: {traceback.format_exc()}", flush=True)
+        return False
+
 def build_index(project: str | None = None):
     global _build_lock, _pending_rebuild
     if _build_lock:
@@ -523,6 +729,16 @@ def build_index(project: str | None = None):
             print("[indexer] Vector index built successfully, BM25 index failed (continuing)", flush=True)
     else:
         print("[indexer] No data available for BM25 index building", flush=True)
+    
+    # Build Knowledge Graph from the same data (Phase 2.1 integration)
+    if all_texts and all_meta:
+        kg_success = build_knowledge_graph_from_chunks(all_meta, build_mode, project)
+        if kg_success:
+            print("[indexer] Successfully built Knowledge Graph", flush=True)
+        else:
+            print("[indexer] Knowledge Graph build failed (continuing)", flush=True)
+    else:
+        print("[indexer] No data available for Knowledge Graph building", flush=True)
     
     # Log chunking statistics
     chunk_types = {}

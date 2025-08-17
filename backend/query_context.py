@@ -26,6 +26,10 @@ import logging
 import threading
 from contextlib import contextmanager
 
+# Cross-session cache integration
+from .cache.discovery_cache import get_global_discovery_cache
+from .cache.cache_metrics import get_global_cache_metrics
+
 # Configuration constants (following NO HARDCODING principle)
 DEFAULT_QUERY_TIMEOUT_SECONDS = 300  # 5 minutes max query execution
 DEFAULT_CONTEXT_CLEANUP_INTERVAL = 60  # Cleanup check every minute
@@ -104,6 +108,12 @@ class QueryExecutionContext:
     total_cache_hits: int = 0
     total_cache_misses: int = 0
     
+    # Cross-session cache tracking (NEW: REQ-CACHE-4, REQ-CACHE-5)
+    cross_session_cache_hits: int = 0
+    cross_session_cache_misses: int = 0
+    cross_session_cache: Any = field(default_factory=get_global_discovery_cache)
+    cache_metrics: Any = field(default_factory=get_global_cache_metrics)
+    
     # Resource management
     _is_initialized: bool = field(default=False, init=False)
     _is_cleanup: bool = field(default=False, init=False)
@@ -179,42 +189,95 @@ class QueryExecutionContext:
         
         try:
             async with self._discovery_lock:
+                # STEP 1: Check cross-session cache first (NEW: REQ-CACHE-4)
                 if self.discovery_results is None:
-                    logger.info(f"🔍 QUERY {self.query_id[:8]}: Running discovery pipeline (FIRST AND ONLY TIME)")
+                    # Get project file list for cache key generation
+                    project_files = self._get_project_file_list()
                     
-                    self.discovery_start_time = datetime.now()
-                    start_perf = time.perf_counter()
+                    # Check cross-session cache
+                    cross_session_start = time.perf_counter()
+                    cross_session_result = self.cross_session_cache.get(self.project, project_files)
+                    cross_session_time = (time.perf_counter() - cross_session_start) * 1000
                     
-                    try:
-                        self.discovery_results = await discovery_func(*args, **kwargs)
+                    if cross_session_result:
+                        # CROSS-SESSION CACHE HIT! 
+                        self.discovery_results = cross_session_result
+                        self.cross_session_cache_hits += 1
+                        self.discovery_duration_ms = cross_session_time
                         
-                        elapsed_perf = (time.perf_counter() - start_perf) * 1000  # Convert to ms
-                        self.discovery_duration_ms = elapsed_perf
+                        # Record metrics
+                        self.cache_metrics.record_cache_hit(
+                            'discovery_cross_session', 
+                            time_saved_ms=0,  # Will be calculated based on typical discovery time
+                            response_time_ms=cross_session_time
+                        )
                         
-                        logger.info(f"✅ QUERY {self.query_id[:8]}: Discovery complete in {elapsed_perf:.1f}ms")
+                        logger.info(f"🚀 CROSS-SESSION CACHE HIT for project '{self.project}' (query {self.query_id[:8]}) - {cross_session_time:.1f}ms")
                         
-                        # Extract discovered files for other tools (with bounds checking)
+                        # Extract discovered files for tools (same as original logic)
                         if isinstance(self.discovery_results, dict):
                             discovered = self.discovery_results.get('files', [])
                             if isinstance(discovered, list):
-                                # Prevent memory bloat by limiting discovered files
                                 limited_files = discovered[:DEFAULT_MAX_DISCOVERED_FILES]
                                 self.discovered_files.extend(limited_files)
-                                
-                                if len(discovered) > DEFAULT_MAX_DISCOVERED_FILES:
-                                    logger.warning(
-                                        f"⚠️ QUERY {self.query_id[:8]}: Limited discovered files "
-                                        f"({len(discovered)} -> {DEFAULT_MAX_DISCOVERED_FILES})"
-                                    )
+                    else:
+                        # Cross-session cache miss
+                        self.cross_session_cache_misses += 1
+                        self.cache_metrics.record_cache_miss('discovery_cross_session', cross_session_time)
                         
-                    except Exception as e:
-                        logger.error(f"❌ QUERY {self.query_id[:8]}: Discovery pipeline failed: {e}")
-                        self.discovery_results = {}  # Empty dict indicates failure but prevents re-run
-                        raise
+                        logger.info(f"🔍 QUERY {self.query_id[:8]}: Running discovery pipeline - no cross-session cache")
+                        
+                        # STEP 2: Execute discovery pipeline
+                        self.discovery_start_time = datetime.now()
+                        start_perf = time.perf_counter()
+                        
+                        try:
+                            self.discovery_results = await discovery_func(*args, **kwargs)
+                            
+                            elapsed_perf = (time.perf_counter() - start_perf) * 1000  # Convert to ms
+                            self.discovery_duration_ms = elapsed_perf
+                            
+                            logger.info(f"✅ QUERY {self.query_id[:8]}: Discovery complete in {elapsed_perf:.1f}ms")
+                            
+                            # STEP 3: Cache results for future cross-session use (NEW: REQ-CACHE-4)
+                            try:
+                                self.cross_session_cache.set(self.project, project_files, self.discovery_results)
+                                logger.debug(f"💾 Cached discovery results for project '{self.project}'")
+                            except Exception as cache_error:
+                                logger.warning(f"Failed to cache discovery results: {cache_error}")
+                                self.cache_metrics.record_cache_error('discovery_cross_session')
+                            
+                            # Extract discovered files for other tools (with bounds checking)
+                            if isinstance(self.discovery_results, dict):
+                                discovered = self.discovery_results.get('files', [])
+                                if isinstance(discovered, list):
+                                    # Prevent memory bloat by limiting discovered files
+                                    limited_files = discovered[:DEFAULT_MAX_DISCOVERED_FILES]
+                                    self.discovered_files.extend(limited_files)
+                                    
+                                    if len(discovered) > DEFAULT_MAX_DISCOVERED_FILES:
+                                        logger.warning(
+                                            f"⚠️ QUERY {self.query_id[:8]}: Limited discovered files "
+                                            f"({len(discovered)} -> {DEFAULT_MAX_DISCOVERED_FILES})"
+                                        )
+                            
+                        except Exception as e:
+                            logger.error(f"❌ QUERY {self.query_id[:8]}: Discovery pipeline failed: {e}")
+                            self.discovery_results = {}  # Empty dict indicates failure but prevents re-run
+                            self.cache_metrics.record_cache_error('discovery_cross_session')
+                            raise
                         
                 else:
-                    logger.info(f"♻️ QUERY {self.query_id[:8]}: Reusing discovery results (ZERO additional work)")
+                    # STEP 4: Session cache hit (existing logic enhanced)
+                    logger.info(f"♻️ QUERY {self.query_id[:8]}: Reusing discovery results (SESSION CACHE HIT)")
                     self.total_cache_hits += 1
+                    
+                    # Record session cache hit
+                    self.cache_metrics.record_cache_hit(
+                        'discovery_session', 
+                        time_saved_ms=0,  # Instant reuse
+                        response_time_ms=0.1  # Near-instant
+                    )
         
         except asyncio.TimeoutError:
             logger.error(f"⏱️ QUERY {self.query_id[:8]}: Discovery pipeline timed out")
@@ -344,6 +407,63 @@ class QueryExecutionContext:
             
             return content
     
+    def _get_project_file_list(self) -> List[str]:
+        """
+        Get list of files in the project for cache key generation.
+        
+        This method provides the file list used by cross-session cache
+        to generate deterministic cache keys based on project content.
+        
+        Returns:
+            List of file paths in the project
+        """
+        try:
+            import os
+            from pathlib import Path
+            
+            if not self.project:
+                return []
+            
+            # Use workspace directory + project as base path
+            workspace_dir = os.getenv('WORKSPACE_DIR', '/workspace')
+            project_path = Path(workspace_dir) / self.project
+            
+            if not project_path.exists():
+                logger.warning(f"Project path does not exist: {project_path}")
+                return []
+            
+            # Get all relevant files in the project
+            file_extensions = {
+                '.py', '.js', '.ts', '.tsx', '.jsx', '.java', '.cpp', '.c', '.h', '.hpp',
+                '.cs', '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala', '.clj',
+                '.md', '.txt', '.json', '.yaml', '.yml', '.xml', '.html', '.css'
+            }
+            
+            project_files = []
+            for root, dirs, files in os.walk(project_path):
+                # Skip hidden directories and common non-essential directories
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in {
+                    'node_modules', '__pycache__', 'target', 'build', 'dist', 'out'
+                }]
+                
+                for file in files:
+                    if Path(file).suffix.lower() in file_extensions:
+                        file_path = Path(root) / file
+                        # Use relative path from workspace for consistency
+                        try:
+                            rel_path = file_path.relative_to(workspace_dir)
+                            project_files.append(str(rel_path))
+                        except ValueError:
+                            # File is outside workspace, use absolute path
+                            project_files.append(str(file_path))
+            
+            logger.debug(f"Found {len(project_files)} files for project '{self.project}'")
+            return sorted(project_files)  # Sort for deterministic cache keys
+            
+        except Exception as e:
+            logger.error(f"Failed to get project file list for '{self.project}': {e}")
+            return []
+    
     def get_execution_summary(self) -> Dict[str, Any]:
         """
         Get comprehensive summary of query execution for monitoring.
@@ -356,9 +476,16 @@ class QueryExecutionContext:
         """
         elapsed = datetime.now() - self.start_time
         
-        # Calculate cache hit rate
-        total_cache_ops = self.total_cache_hits + self.total_cache_misses
-        cache_hit_rate = (self.total_cache_hits / total_cache_ops * 100) if total_cache_ops > 0 else 0.0
+        # Calculate comprehensive cache hit rate (SESSION + CROSS-SESSION)
+        total_session_ops = self.total_cache_hits + self.total_cache_misses
+        total_cross_session_ops = self.cross_session_cache_hits + self.cross_session_cache_misses
+        total_all_cache_ops = total_session_ops + total_cross_session_ops
+        total_all_hits = self.total_cache_hits + self.cross_session_cache_hits
+        
+        # Overall cache hit rate including cross-session optimization
+        overall_cache_hit_rate = (total_all_hits / total_all_cache_ops * 100) if total_all_cache_ops > 0 else 0.0
+        session_cache_hit_rate = (self.total_cache_hits / total_session_ops * 100) if total_session_ops > 0 else 0.0
+        cross_session_hit_rate = (self.cross_session_cache_hits / total_cross_session_ops * 100) if total_cross_session_ops > 0 else 0.0
         
         summary = {
             # Core identification
@@ -382,11 +509,16 @@ class QueryExecutionContext:
             'files_examined': len(self.examined_files),
             'relationships_analyzed': len(self.relationships_analyzed),
             
-            # Cache performance
+            # Cache performance (ENHANCED: REQ-CACHE-5)
             'cache_hits': self.total_cache_hits,
             'cache_misses': self.total_cache_misses,
-            'cache_hit_rate_percent': round(cache_hit_rate, 1),
+            'cross_session_cache_hits': self.cross_session_cache_hits,
+            'cross_session_cache_misses': self.cross_session_cache_misses,
+            'cache_hit_rate_percent': round(overall_cache_hit_rate, 1),  # Overall rate
+            'session_cache_hit_rate_percent': round(session_cache_hit_rate, 1),
+            'cross_session_hit_rate_percent': round(cross_session_hit_rate, 1),
             'file_content_cache_size': len(self._file_content_cache),
+            'total_cache_operations': total_all_cache_ops,
             
             # Resource usage
             'memory_estimated_kb': self._estimate_memory_usage(),
