@@ -18,20 +18,46 @@ from dataclasses import dataclass
 from pathlib import Path
 from enum import Enum
 
-from backend.hybrid_search import HybridSearchEngine, SearchResult
-from backend.bm25_index import BM25Index, BM25Result
-from backend.vector_store import get_vector_store
-from backend.discovery_pipeline import DiscoveryPipeline
-from backend.path_resolver import PathResolver
-from backend.directory_filters import get_project_from_path
-from backend.project_context import get_context_manager
-from backend.file_content_cache import get_global_content_cache
-from backend.query_context import QueryExecutionContext
-
-# Phase 3 imports
-from backend.search.query_classifier import QueryClassifier, QueryIntent as Phase3QueryIntent, QueryAnalysis
-from backend.context.code_annotator import CodeLensAnnotator
-from storage.database_manager import DatabaseManager
+try:
+    from backend.hybrid_search import HybridSearchEngine, SearchResult
+    from backend.bm25_index import BM25Index, BM25Result
+    from backend.vector_store import get_vector_store
+    from backend.discovery_pipeline import DiscoveryPipeline
+    from backend.path_resolver import PathResolver
+    from backend.directory_filters import get_project_from_path
+    from backend.project_context import get_context_manager
+    from backend.file_content_cache import get_global_content_cache
+except ImportError:
+    from hybrid_search import HybridSearchEngine, SearchResult
+    from bm25_index import BM25Index, BM25Result
+    from vector_store import get_vector_store
+    from discovery_pipeline import DiscoveryPipeline
+    from path_resolver import PathResolver
+    from directory_filters import get_project_from_path
+    from project_context import get_context_manager
+    from file_content_cache import get_global_content_cache
+try:
+    from backend.query_context import QueryExecutionContext
+    # Phase 3 components now replaced by SDK native reasoning
+    # QueryClassifier eliminated - SDK handles intent classification
+    Phase3QueryIntent = None
+    QueryAnalysis = None
+except ImportError:
+    from query_context import QueryExecutionContext
+    # Phase 3 components now replaced by SDK native reasoning
+    Phase3QueryIntent = None
+    QueryAnalysis = None
+try:
+    from backend.context.code_annotator import CodeLensAnnotator
+    from storage.database_manager import DatabaseManager
+except ImportError:
+    try:
+        from context.code_annotator import CodeLensAnnotator
+        from storage.database_manager import DatabaseManager  
+    except ImportError:
+        # Graceful fallback if Phase 3 components not available
+        CodeLensAnnotator = None
+        DatabaseManager = None
 
 logger = logging.getLogger(__name__)
 
@@ -400,7 +426,8 @@ class SmartSearchEngine:
         self.vector_store = get_vector_store()
         try:
             self.db_manager = DatabaseManager()
-            self.query_classifier = QueryClassifier()  # Phase 3 QueryClassifier doesn't need parameters in constructor
+            # QueryClassifier eliminated - SDK now handles all intent classification
+            self.query_classifier = None  # SDK native reasoning replaces this
             self.code_annotator = CodeLensAnnotator(self.db_manager)
             self.phase3_available = True
             logger.info("✅ Phase 3 components initialized successfully")
@@ -1237,32 +1264,27 @@ class SmartSearchEngine:
             logger.warning("⚠️ Phase 3 not available, falling back to legacy search")
             return await self.search(query, k, strategy_override, mentioned_projects)
         
-        # Phase 3: Intelligent query classification
-        try:
-            query_analysis = self.query_classifier.classify_query(query)
-            logger.info(f"Query classified as {query_analysis.intent.value} with "
-                       f"{query_analysis.confidence:.2f} confidence. "
-                       f"Strategy: {query_analysis.reasoning}")
-        except Exception as e:
-            logger.error(f"Query classification failed: {e}")
-            return await self.search(query, k, strategy_override, mentioned_projects)
+        # Phase 3: SDK native reasoning eliminates custom classification
+        # All reasoning is now handled by Cerebras SDK - use adaptive search strategy
+        logger.info("Using SDK-native intelligent search - no custom classification needed")
         
-        # Adaptive search based on classification
+        # Use adaptive search strategy (eliminates custom query analysis)
         search_results = []
         try:
-            if query_analysis.intent in [QueryIntent.SPECIFIC_SYMBOL, QueryIntent.DEBUGGING]:
-                # High-precision search for specific queries
-                search_results = await self._precision_search_phase3(query, query_analysis, k)
-                
-            elif query_analysis.intent == QueryIntent.STRUCTURAL:
-                # KG-powered relationship search
+            # SDK will handle intent analysis through tool selection
+            # Use hybrid search as baseline with KG enhancement if available
+            if self.db_manager:
+                # Try KG-enhanced search first
                 search_results = await self._structural_search_phase3(query, k)
-                
+                if not search_results:
+                    # Fallback to semantic search
+                    search_results = await self._semantic_search_enhanced(query, k)
             else:
-                # Semantic-heavy search for conceptual queries  
-                search_results = await self._semantic_search_phase3(query, query_analysis, k)
+                # Pure semantic search when KG unavailable
+                search_results = await self._semantic_search_enhanced(query, k)
+                
         except Exception as e:
-            logger.error(f"Phase 3 search failed: {e}, falling back to legacy")
+            logger.error(f"Phase 3 enhanced search failed: {e}, falling back to legacy")
             return await self.search(query, k, strategy_override, mentioned_projects)
         
         # Phase 3: Enhance results with Code Lens

@@ -10,7 +10,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pathlib import Path
 
-from agent import CodeWiseAgent
+from websocket_adapter_simple import CodeWiseAgent
 from chat_memory import ChatMemory
 from starlette.middleware.sessions import SessionMiddleware
 from github_auth import router as github_oauth_router
@@ -65,11 +65,8 @@ async def websocket_endpoint(websocket: WebSocket):
     # Initialize or reuse the global agent
     global global_agent
     if global_agent is None:
-        global_agent = CodeWiseAgent(
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            mcp_server_url=os.getenv("MCP_SERVER_URL", "http://mcp_server:8001")
-        )
-        logger.info("Global agent initialized")
+        global_agent = CodeWiseAgent()
+        logger.info("Global SDK-compatible agent initialized")
     
     agent = global_agent
     chat_memory = ChatMemory()
