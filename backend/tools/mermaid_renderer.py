@@ -16,8 +16,12 @@ from pathlib import Path
 try:
     from ..themes.theme_manager import ThemeManager
 except ImportError:
-    # Fallback for Docker environment
-    from backend.themes.theme_manager import ThemeManager
+    try:
+        # Fallback for Docker environment
+        from backend.themes.theme_manager import ThemeManager
+    except ImportError:
+        # Fallback for standalone execution
+        from themes.theme_manager import ThemeManager
 
 logger = logging.getLogger(__name__)
 
