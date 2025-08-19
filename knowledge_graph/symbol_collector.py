@@ -144,9 +144,17 @@ class SymbolCollector:
         # Mark file as processing
         self.db_manager.update_file_status(str(file_path), 'processing')
         
-        tree = self.parser_factory.parse_content(content, file_path)
+        # Parse with detailed error reporting
+        tree = None
+        if self.parser_factory:
+            try:
+                tree = self.parser_factory.parse_content(content, file_path)
+            except Exception as e:
+                logger.error(f"Parse exception for {file_path}: {e}")
+                return
+        
         if not tree:
-            logger.warning(f"Could not parse {file_path}")
+            logger.warning(f"Could not parse {file_path} - parser returned None")
             return
         
         file_symbols = set()

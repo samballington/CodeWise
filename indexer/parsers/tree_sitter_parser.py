@@ -64,35 +64,33 @@ class TreeSitterFactory:
         self._initialize_languages()
     
     def _initialize_languages(self) -> None:
-        """Initialize available language parsers."""
+        """Initialize available language parsers using new tree-sitter API."""
         if not TREE_SITTER_AVAILABLE:
             logger.info("Tree-sitter not available, using fallback parsers")
             return
         
-        # Language configurations for tree-sitter
-        language_configs = {
-            'python': 'tree-sitter-python',
-            'javascript': 'tree-sitter-javascript', 
-            'typescript': 'tree-sitter-typescript/typescript',
-            'go': 'tree-sitter-go',
-            'rust': 'tree-sitter-rust',
-            'java': 'tree-sitter-java',
-            'cpp': 'tree-sitter-cpp',
-            'c': 'tree-sitter-c'
+        # Language module imports for new tree-sitter API
+        language_modules = {
+            'python': 'tree_sitter_python',
+            'javascript': 'tree_sitter_javascript', 
+            'java': 'tree_sitter_java',
+            # Add other languages as modules become available
         }
         
-        for lang_name, grammar_path in language_configs.items():
+        for lang_name, module_name in language_modules.items():
             try:
-                so_file = self.grammars_dir / f"{grammar_path}.so"
-                if so_file.exists():
-                    language = Language(str(so_file))
-                    self._languages[lang_name] = language
-                    parser = Parser()
-                    parser.set_language(language)
-                    self._parsers[lang_name] = parser
-                    logger.debug(f"Loaded tree-sitter parser for {lang_name}")
+                # Import the language module dynamically
+                module = __import__(module_name)
+                language_capsule = module.language()
+                language = Language(language_capsule)
+                self._languages[lang_name] = language
+                parser = Parser(language)
+                self._parsers[lang_name] = parser
+                logger.info(f"✅ Loaded tree-sitter parser for {lang_name}")
+            except ImportError as e:
+                logger.warning(f"⚠️ {lang_name} parser not available: {module_name} not installed")
             except Exception as e:
-                logger.warning(f"Failed to load {lang_name} grammar: {e}")
+                logger.warning(f"❌ Failed to load {lang_name} grammar: {e}")
     
     def get_parser(self, file_extension: str) -> Optional[Any]:
         """

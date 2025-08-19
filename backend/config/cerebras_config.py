@@ -17,7 +17,7 @@ class CerebrasConfig:
     def __init__(self):
         """Initialize configuration with environment variables and secure defaults"""
         self.api_key = self._get_api_key()
-        self.model = os.getenv("CEREBRAS_MODEL", "llama3.1-70b")
+        self.model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
         self.reasoning_effort = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
         self.max_tokens = int(os.getenv("CEREBRAS_MAX_TOKENS", "4096"))
         self.timeout = float(os.getenv("CEREBRAS_TIMEOUT", "30.0"))

@@ -45,19 +45,21 @@ class SimpleWebSocketAdapter:
                 "message": "Initializing Cerebras SDK native reasoning..."
             }
             
-            # For now, provide a meaningful response while SDK integration is being completed
-            response = f"""I'm now running with the new Cerebras SDK integration architecture. 
+            # Try to use the real SDK agent, fall back to simplified response if issues
+            try:
+                from cerebras_agent import get_native_agent
+                agent = get_native_agent()
+                response = await agent.process_query(user_query)
+                logger.info("✅ Used real Cerebras SDK agent")
+            except Exception as e:
+                logger.warning(f"⚠️ SDK agent failed, using fallback: {e}")
+                response = f"""I'm running with the Cerebras SDK integration, but encountered an issue with the full SDK agent.
 
 Your query: "{user_query}"
 
-The system has been upgraded with:
-- Native Cerebras SDK integration (435 lines vs 3357 lines previously)  
-- Pure tool execution functions with zero custom logic
-- SDK-native reasoning and conversation management
-- Future-proof architecture that automatically inherits SDK improvements
+Fallback response: The system has been upgraded with native Cerebras SDK integration. The WebSocket streaming is working, but there may be configuration issues preventing full SDK usage.
 
-The WebSocket streaming adapter is working and I can process your queries. 
-The full Phase 1/2 infrastructure integration is being completed.
+Error details: {str(e)}
 
 Selected model: {selected_model}
 Mentioned projects: {mentioned_projects or 'None'}
