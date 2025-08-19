@@ -30,6 +30,21 @@ from indexer.chunkers.hierarchical_chunker import HierarchicalChunker
 logger = logging.getLogger(__name__)
 
 
+def safe_get(obj, key: str, default=None):
+    """
+    Safely get attribute/key from object - handles both dict and Pydantic objects.
+    REQ-3.7.2: Fix SummaryChunk attribute errors
+    """
+    if hasattr(obj, 'get'):
+        # Dictionary-like object
+        return obj.get(key, default)
+    elif hasattr(obj, key):
+        # Object with attributes (like Pydantic models)
+        return getattr(obj, key, default)
+    else:
+        return default
+
+
 @dataclass
 class IndexingResult:
     """Results from the unified indexing process."""
@@ -353,7 +368,7 @@ class UnifiedIndexer:
                 
                 chunk_stats['files_processed'] += 1
                 chunk_stats['chunks_created'] += len(stored_chunks)
-                chunk_stats['kg_linked_chunks'] += sum(1 for chunk in stored_chunks if chunk.get('node_id'))
+                chunk_stats['kg_linked_chunks'] += sum(1 for chunk in stored_chunks if safe_get(chunk, 'node_id'))
                 
                 # Update file processing stats
                 processing_time = time.time() - file_start_time
@@ -436,9 +451,9 @@ class UnifiedIndexer:
     
     def _find_matching_kg_node(self, chunk: Dict, file_symbols: Dict[str, Dict]) -> Optional[str]:
         """Find the best matching KG node for a chunk."""
-        chunk_line_start = chunk.get('line_start')
-        chunk_line_end = chunk.get('line_end')
-        chunk_content = chunk.get('content', '')
+        chunk_line_start = safe_get(chunk, 'line_start')
+        chunk_line_end = safe_get(chunk, 'line_end')
+        chunk_content = safe_get(chunk, 'content', '')
         
         if not chunk_line_start or not chunk_line_end:
             return None
@@ -480,7 +495,7 @@ class UnifiedIndexer:
         for chunk in chunks:
             try:
                 # Generate embedding for chunk content
-                content = chunk.get('content', '')
+                content = safe_get(chunk, 'content', '')
                 if not content.strip():
                     continue
                 
@@ -492,15 +507,19 @@ class UnifiedIndexer:
                     chunk_id=chunk_id,
                     content=content,
                     file_path=str(file_path),
-                    chunk_type=chunk.get('type', 'unknown'),
-                    node_id=chunk.get('node_id'),
-                    line_start=chunk.get('line_start'),
-                    line_end=chunk.get('line_end'),
-                    metadata=chunk.get('metadata', {})
+                    chunk_type=safe_get(chunk, 'type', 'unknown'),
+                    node_id=safe_get(chunk, 'node_id'),
+                    line_start=safe_get(chunk, 'line_start'),
+                    line_end=safe_get(chunk, 'line_end'),
+                    metadata=safe_get(chunk, 'metadata', {})
                 )
                 
                 if success:
-                    chunk['id'] = chunk_id
+                    # Handle both dict and object formats
+                    if hasattr(chunk, '__setitem__'):
+                        chunk['id'] = chunk_id
+                    elif hasattr(chunk, 'id'):
+                        chunk.id = chunk_id
                     stored_chunks.append(chunk)
                     
                     # Store embedding in vector store (if available)
@@ -521,9 +540,9 @@ class UnifiedIndexer:
         import hashlib
         
         # Create ID based on file path, line numbers, and content hash
-        content = chunk.get('content', '')
-        line_start = chunk.get('line_start', 0)
-        line_end = chunk.get('line_end', 0)
+        content = safe_get(chunk, 'content', '')
+        line_start = safe_get(chunk, 'line_start', 0)
+        line_end = safe_get(chunk, 'line_end', 0)
         
         # Create content hash for uniqueness
         content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:8]

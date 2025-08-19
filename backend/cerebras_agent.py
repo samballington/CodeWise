@@ -114,7 +114,7 @@ class CerebrasNativeAgent:
         }
         
         # Conversation limits for safety
-        self.max_iterations = 10
+        self.max_iterations = 20
         self.current_iteration = 0
         
         logger.info("✅ CerebrasNativeAgent initialized - SDK handles all reasoning")
@@ -162,6 +162,8 @@ class CerebrasNativeAgent:
         """
         Pure SDK loop - NO custom logic, just tool execution when requested
         """
+        last_successful_content = None
+        successful_iterations = 0
         
         while self.current_iteration < self.max_iterations:
             self.current_iteration += 1
@@ -198,6 +200,7 @@ class CerebrasNativeAgent:
                             "content": json.dumps(result)
                         })
                     
+                    successful_iterations += 1
                     continue  # Let SDK process results
                 
                 # SDK provides final answer
@@ -207,10 +210,72 @@ class CerebrasNativeAgent:
                     
             except Exception as e:
                 logger.error(f"❌ SDK iteration {self.current_iteration} failed: {e}")
-                return f"I encountered a technical error during processing: {str(e)}"
+                
+                # If we had successful iterations, try to provide a helpful response
+                if successful_iterations > 0:
+                    logger.info(f"⚠️ Partial success: {successful_iterations} iterations completed before error")
+                    return (
+                        f"I've gathered information about your query but encountered a technical issue "
+                        f"in the final processing step. Based on the data I found, I can provide you with "
+                        f"relevant information, though the response formatting may be affected. "
+                        f"The technical error was: {str(e)}"
+                    )
+                else:
+                    return f"I encountered a technical error during processing: {str(e)}"
         
         logger.warning(f"⚠️ Reached maximum iterations ({self.max_iterations})")
-        return "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
+        
+        # Instead of giving up, try to synthesize a response from gathered context
+        if successful_iterations > 0:
+            logger.info(f"💡 Attempting to synthesize response from {successful_iterations} successful tool calls")
+            
+            # Extract the original user query from the conversation
+            user_query = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    user_query = msg.get("content", "")
+                    break
+            
+            # Create a synthesis prompt using gathered context
+            synthesis_messages = [
+                {
+                    "role": "system", 
+                    "content": "You are an expert code analyst. Based on the tool results gathered so far, provide a comprehensive answer to the user's question. Use all available context from previous tool calls to give a complete response."
+                },
+                {
+                    "role": "user", 
+                    "content": f"Original question: {user_query}\n\nBased on the information gathered from previous tool calls in this conversation, please provide a comprehensive answer. Synthesize all the context and data that was collected to give the user a complete response."
+                }
+            ]
+            
+            # Add the conversation history (contains all tool results)
+            for msg in messages[1:]:  # Skip initial system prompt
+                if msg.get("role") in ["assistant", "tool"]:
+                    synthesis_messages.append(msg)
+            
+            try:
+                # Make final synthesis call without tools
+                synthesis_response = self.client.chat.completions.create(
+                    **cerebras_config.get_completion_config(),
+                    messages=synthesis_messages,
+                    reasoning_effort=cerebras_config.reasoning_effort
+                )
+                
+                synthesis_result = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
+                logger.info(f"✅ Successfully synthesized response from gathered context")
+                return synthesis_result
+                
+            except Exception as e:
+                logger.error(f"❌ Synthesis failed: {e}")
+                return (
+                    f"I gathered substantial information about your query through {successful_iterations} "
+                    f"research steps, but reached the processing limit while organizing the final response. "
+                    f"The system found relevant information but encountered a technical limitation in "
+                    f"synthesizing the complete answer. Please try rephrasing your question or breaking "
+                    f"it into smaller parts."
+                )
+        else:
+            return "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
     
     async def _execute_pure_tool_call(self, tool_call) -> Dict[str, Any]:
         """
@@ -345,6 +410,23 @@ class CerebrasNativeAgent:
             
             for file_path in limited_paths:
                 try:
+                    # Resolve file path to absolute workspace path
+                    from pathlib import Path
+                    workspace_path = Path("/workspace")
+                    
+                    # Handle different path formats
+                    if file_path.startswith("/workspace/"):
+                        absolute_path = Path(file_path)
+                    elif file_path.startswith("./"):
+                        absolute_path = workspace_path / file_path[2:]
+                    elif file_path.startswith("/"):
+                        absolute_path = Path(file_path)
+                    else:
+                        # Relative path - try with workspace prefix
+                        absolute_path = workspace_path / file_path
+                    
+                    logger.debug(f"Resolving '{file_path}' to '{absolute_path}'")
+                    
                     # Read file with encoding detection
                     encodings = ['utf-8', 'latin-1', 'cp1252']
                     content = None
@@ -352,12 +434,22 @@ class CerebrasNativeAgent:
                     
                     for encoding in encodings:
                         try:
-                            with open(file_path, 'r', encoding=encoding) as f:
+                            with open(absolute_path, 'r', encoding=encoding) as f:
                                 content = f.read()
                             encoding_used = encoding
                             break
                         except UnicodeDecodeError:
                             continue
+                        except FileNotFoundError:
+                            # If not found, try without workspace prefix
+                            if not file_path.startswith("/workspace/"):
+                                try:
+                                    with open(file_path, 'r', encoding=encoding) as f:
+                                        content = f.read()
+                                    encoding_used = encoding
+                                    break
+                                except:
+                                    continue
                     
                     if content is None:
                         raise ValueError(f"Could not decode file with any encoding: {encodings}")
@@ -559,7 +651,13 @@ Your goal is to help users understand complex systems by providing clear, accura
         
         try:
             # Test for parallel tool calls capability
-            features["parallel_tools"] = hasattr(self.client.chat.completions.create, "parallel_tool_calls")
+            completion_method = getattr(self.client.chat.completions, "create", None)
+            if completion_method:
+                import inspect
+                sig = inspect.signature(completion_method)
+                features["parallel_tools"] = "parallel_tool_calls" in sig.parameters
+            else:
+                features["parallel_tools"] = False
             logger.debug(f"Parallel tools supported: {features['parallel_tools']}")
         except Exception:
             features["parallel_tools"] = False
@@ -606,23 +704,19 @@ Your goal is to help users understand complex systems by providing clear, accura
         Build tool schema that adapts to SDK capabilities
         
         This ensures we automatically use new SDK features as they become available.
+        Note: We don't modify the schema structure as that breaks API compatibility.
+        Feature adaptation happens at the execution level, not schema level.
         """
         base_schema = UNIFIED_TOOL_SCHEMA.copy()
         
-        # Add advanced features if SDK supports them
+        # Log available features but don't modify schema (causes API errors)
         if self.available_features.get("parallel_tools", False):
-            # Enable parallel tool execution
-            for tool in base_schema:
-                tool["parallel_enabled"] = True
-            logger.info("✅ Parallel tool execution enabled")
+            logger.info("✅ Parallel tool execution available")
         
         if self.available_features.get("streaming", False):
-            # Enable streaming responses
-            for tool in base_schema:
-                tool["streaming_compatible"] = True
-            logger.info("✅ Streaming tool responses enabled")
+            logger.info("✅ Streaming tool responses available")
         
-        logger.info(f"🔧 Adaptive tool schema built with {len(base_schema)} tools")
+        logger.info(f"🔧 Standard tool schema built with {len(base_schema)} tools")
         return base_schema
 
 # Global native agent instance

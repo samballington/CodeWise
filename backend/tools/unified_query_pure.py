@@ -145,18 +145,61 @@ async def _execute_symbol_search(query: str, filters: Optional[Dict]) -> tuple[L
         from storage.database_manager import DatabaseManager
         db = DatabaseManager()
         
-        # Search for symbols by name
         results = []
-        symbols = db.get_nodes_by_name(query, exact_match=False)
         
-        for symbol in symbols[:10]:
+        # First try: Search for symbols by name
+        symbols = db.get_nodes_by_name(query, exact_match=False)
+        for symbol in symbols[:5]:
             results.append({
                 "type": "symbol_match",
-                "symbol": symbol,
+                "data": symbol,
+                "content": f"{symbol.get('type', 'symbol')}: {symbol.get('name', 'unknown')}",
+                "file_path": symbol.get('file_path', ''),
                 "source": "knowledge_graph_symbols"
             })
         
-        return results, "symbol_kg"
+        # Second try: If query looks like a project name (contains @ or _Project), search by file path
+        if '@' in query or 'Project' in query:
+            # Extract project name from query (e.g., "explain @SWE_Project architecture" -> "SWE_Project")
+            import re
+            project_match = re.search(r'@([A-Za-z_][A-Za-z0-9_]*)', query)
+            if project_match:
+                project_name = project_match.group(1)
+            else:
+                # Fallback: look for words containing "Project" 
+                words = query.split()
+                project_words = [w for w in words if 'Project' in w]
+                project_name = project_words[0] if project_words else query.replace('@', '').strip()
+            
+            logger.info(f"Extracted project name: '{project_name}' from query: '{query[:50]}...'")
+            try:
+                cursor = db.connection.cursor()
+                project_results = cursor.execute(
+                    "SELECT * FROM nodes WHERE file_path LIKE ? LIMIT 10",
+                    (f'%{project_name}%',)
+                ).fetchall()
+                
+                for result in project_results:
+                    node = dict(result)
+                    # Parse JSON properties if present
+                    if node.get('properties'):
+                        import json
+                        try:
+                            node['properties'] = json.loads(node['properties'])
+                        except:
+                            pass
+                    
+                    results.append({
+                        "type": "project_file",
+                        "data": node,
+                        "content": f"File: {node.get('file_path', '').split('/')[-1]} - {node.get('type', 'symbol')}: {node.get('name', 'unknown')}",
+                        "file_path": node.get('file_path', ''),
+                        "source": "knowledge_graph_project"
+                    })
+            except Exception as e:
+                logger.warning(f"Project file search failed: {e}")
+        
+        return results[:15], "symbol_kg"  # Return max 15 results
         
     except Exception as e:
         logger.warning(f"Symbol search failed: {e}")

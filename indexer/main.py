@@ -22,8 +22,8 @@ except ImportError as e:
     print(f"[indexer] Warning: BM25Index not available: {e}", flush=True)
     BM25_AVAILABLE = False
 
-# Load local embedder once
-_local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# Load local embedder once - MUST match backend VectorStore model
+_local_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
 
 WORKSPACE = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
 CACHE_DIR = WORKSPACE / ".vector_cache"
@@ -74,11 +74,11 @@ def discover_files() -> List[FileInfo]:
     return discovered_files
 
 def embed_batch(texts: List[str], batch_size: int = 100):
-    """Generate embeddings locally using MiniLM with batch processing; returns float32 numpy array."""
+    """Generate embeddings locally using BGE-large-en-v1.5 with batch processing; returns float32 numpy array."""
     import numpy as np
     
     if not texts:
-        return np.zeros((0, 384), dtype="float32")
+        return np.zeros((0, 1024), dtype="float32")
     
     all_vectors = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
@@ -101,7 +101,7 @@ def embed_batch(texts: List[str], batch_size: int = 100):
         except Exception as e:
             print(f"[indexer] Batch {batch_num} embedding error: {e}, using zero vectors", flush=True)
             # Create zero vectors for failed batch
-            zero_vectors = np.zeros((len(batch), 384), dtype="float32")
+            zero_vectors = np.zeros((len(batch), 1024), dtype="float32")
             all_vectors.append(zero_vectors)
     
     if all_vectors:
@@ -110,7 +110,7 @@ def embed_batch(texts: List[str], batch_size: int = 100):
         return result
     else:
         print(f"[indexer] No embeddings generated, returning zero array", flush=True)
-        return np.zeros((len(texts), 384), dtype="float32")
+        return np.zeros((len(texts), 1024), dtype="float32")
 
 def build_bm25_index_from_chunks(texts: List[str], enhanced_meta: List[dict]) -> bool:
     """
@@ -701,10 +701,10 @@ def build_index(project: str | None = None):
         print(f"[indexer] Final embedding array shape: {embs.shape}", flush=True)
     else:
         print("[indexer] No embeddings generated, creating empty index", flush=True)
-        embs = np.zeros((0, 384), dtype="float32")
+        embs = np.zeros((0, 1024), dtype="float32")
     
     # Create and save final index
-    dim = embs.shape[1] if embs.size > 0 else 384
+    dim = embs.shape[1] if embs.size > 0 else 1024
     index = faiss.IndexFlatL2(dim)
     if embs.size > 0:
         index.add(embs)

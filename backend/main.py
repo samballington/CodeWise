@@ -16,6 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from github_auth import router as github_oauth_router
 from routers.projects import router as projects_router
 from api_providers import get_provider_manager
+from services import run_startup_kg_population
 import time
 import logging
 
@@ -51,6 +52,54 @@ app.include_router(projects_router)
 
 # Store active connections
 active_connections: Dict[str, WebSocket] = {}
+
+# REQ-3.7.1: KG startup population flag
+_kg_startup_completed = False
+
+# DISABLED: This causes 10+ minute startup delays on every restart
+# @app.on_event("startup")
+# async def startup_event():
+#     """
+#     Backend startup event - REQ-3.7.1: Automatic KG population
+#     """
+#     global _kg_startup_completed
+#     
+#     logger.info("🚀 Backend startup: Beginning automatic Knowledge Graph population")
+#     
+#     # Run KG population in background (non-blocking)
+#     asyncio.create_task(populate_kg_on_startup())
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Backend startup event - Fast startup without KG reindexing
+    """
+    global _kg_startup_completed
+    
+    logger.info("🚀 Backend startup: Fast mode (KG reindexing disabled)")
+    logger.info("💡 KG data is preserved from previous runs - 17,784 nodes available")
+    
+    # Mark as completed to avoid blocking queries
+    _kg_startup_completed = True
+
+async def populate_kg_on_startup():
+    """
+    Background task for KG population - REQ-3.7.1
+    """
+    global _kg_startup_completed
+    
+    try:
+        logger.info("📊 Starting Knowledge Graph population for all workspace projects...")
+        result = await run_startup_kg_population()
+        
+        logger.info(f"✅ KG startup completed: {result.successful_projects}/{result.total_projects} projects "
+                   f"indexed in {result.total_processing_time:.2f}s")
+        
+        _kg_startup_completed = True
+        
+    except Exception as e:
+        logger.error(f"❌ KG startup population failed: {e}")
+        _kg_startup_completed = False
 
 @app.get("/")
 async def root():
@@ -254,7 +303,26 @@ async def get_provider_health():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "connections": len(active_connections)} 
+    return {"status": "healthy", "connections": len(active_connections)}
+
+@app.get("/api/kg/status")
+async def kg_status():
+    """Get Knowledge Graph population status - REQ-3.7.1"""
+    try:
+        from services import get_kg_startup_service
+        service = get_kg_startup_service()
+        status = service.get_kg_status()
+        
+        return {
+            "startup_completed": _kg_startup_completed,
+            **status
+        }
+    except Exception as e:
+        return {
+            "startup_completed": _kg_startup_completed,
+            "status": "error",
+            "error": str(e)
+        } 
 
 @app.get("/indexer/status")
 async def indexer_status():

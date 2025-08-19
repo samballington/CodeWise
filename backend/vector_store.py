@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import faiss
 # type: ignore
@@ -445,7 +445,53 @@ class VectorStore:
             return final_results
             
         except Exception as e:
+            import traceback
             logger.error(f"Error during vector search: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return []
+    
+    async def similarity_search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        """
+        Compatibility method for similarity search.
+        
+        This method provides compatibility with unified_query_pure which expects
+        a similarity_search method. It wraps the existing query method.
+        
+        Args:
+            query: Search query string
+            k: Number of results to return
+            
+        Returns:
+            List of dictionaries with search results
+        """
+        try:
+            # Use existing query method with scores enabled
+            raw_results = self.query(query, k=k, return_scores=True)
+            
+            # Convert to expected format for unified_query_pure
+            formatted_results = []
+            for result in raw_results:
+                if len(result) >= 3:  # (path, snippet, score)
+                    path, content, score = result[0], result[1], result[2]
+                else:  # (path, snippet) - fallback
+                    path, content = result[0], result[1]
+                    score = 0.5  # Default score
+                
+                formatted_results.append({
+                    "content": content,
+                    "file_path": path,
+                    "score": float(score),
+                    "metadata": {
+                        "source": "vector_store",
+                        "method": "similarity_search"
+                    }
+                })
+            
+            logger.debug(f"similarity_search returned {len(formatted_results)} results for query: {query[:50]}...")
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"similarity_search failed: {e}")
             return []
 
     def remove_project_embeddings(self, project_path: str) -> bool:

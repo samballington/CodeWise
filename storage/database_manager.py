@@ -25,7 +25,7 @@ class DatabaseManager:
     over SQLite + VSS for graph relationships and vector operations.
     """
     
-    def __init__(self, db_path: str = "codewise.db"):
+    def __init__(self, db_path: str = "/app/storage/codewise.db"):
         self.db_path = Path(db_path)
         self.connection = None
         self.vss_enabled = False
