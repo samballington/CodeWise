@@ -209,9 +209,9 @@ class CerebrasNativeAgent:
                 # Only add reasoning_effort for models that support it
                 if cerebras_config.supports_reasoning_effort(selected_model):
                     api_params["reasoning_effort"] = cerebras_config.reasoning_effort
-                    logger.debug(f"✅ Using reasoning_effort '{cerebras_config.reasoning_effort}' for {selected_model}")
+                    logger.info(f"✅ Using reasoning_effort '{cerebras_config.reasoning_effort}' for {selected_model}")
                 else:
-                    logger.debug(f"⏭️ Skipping reasoning_effort for {selected_model} (not supported)")
+                    logger.info(f"⏭️ Skipping reasoning_effort for {selected_model} (not supported)")
                 
                 response = self.client.chat.completions.create(**api_params)
                 
@@ -301,6 +301,9 @@ class CerebrasNativeAgent:
                 # Only add reasoning_effort for models that support it
                 if cerebras_config.supports_reasoning_effort(selected_model):
                     synthesis_params["reasoning_effort"] = cerebras_config.reasoning_effort
+                    logger.info(f"✅ Using reasoning_effort for synthesis with {selected_model}")
+                else:
+                    logger.info(f"⏭️ Skipping reasoning_effort for synthesis with {selected_model} (not supported)")
                 
                 synthesis_response = self.client.chat.completions.create(**synthesis_params)
                 
