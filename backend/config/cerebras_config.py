@@ -83,12 +83,21 @@ class CerebrasConfig:
             "timeout": self.timeout
         }
     
-    def get_completion_config(self) -> dict:
+    def get_completion_config(self, selected_model: str = None) -> dict:
         """Get configuration dictionary for completion requests"""
+        model_to_use = selected_model or self.model
         return {
-            "model": self.model,
+            "model": model_to_use,
             "max_tokens": self.max_tokens
         }
+    
+    def supports_reasoning_effort(self, model_name: str) -> bool:
+        """Check if a model supports reasoning_effort parameter"""
+        # Registry of models that support reasoning_effort
+        reasoning_supported_models = {
+            "gpt-oss-120b"
+        }
+        return model_name in reasoning_supported_models
 
 # Global configuration instance
 cerebras_config = CerebrasConfig()

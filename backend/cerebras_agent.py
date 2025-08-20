@@ -25,6 +25,8 @@ try:
     from .smart_search import get_smart_search_engine
     from .vector_store import VectorStore
     from .tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
+    from .tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
+    from .tools.filesystem_navigator import FilesystemNavigator
     from .config.cerebras_config import cerebras_config
 except ImportError:
     from tools.unified_query_pure import query_codebase_pure as query_codebase
@@ -32,6 +34,8 @@ except ImportError:
     from smart_search import get_smart_search_engine
     from vector_store import VectorStore
     from tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
+    from tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
+    from tools.filesystem_navigator import FilesystemNavigator
     from config.cerebras_config import cerebras_config
 
 # Import Phase 2 KG with fallback
@@ -104,13 +108,27 @@ class CerebrasNativeAgent:
             self.kg = None
             logger.warning("⚠️ Knowledge Graph not available")
         
-        # CRITICAL: Tool functions that SDK will call
+        # REQ-3.6.1: Initialize filesystem navigator tool
+        if self.kg:
+            try:
+                self.filesystem_navigator = FilesystemNavigator(self.kg)
+                logger.info("✅ Filesystem navigator initialized with KG integration")
+            except Exception as e:
+                logger.warning(f"⚠️ Filesystem navigator initialization failed: {e}")
+                self.filesystem_navigator = None
+        else:
+            self.filesystem_navigator = None
+            logger.warning("⚠️ Filesystem navigator not available - requires Knowledge Graph")
+        
+        # CRITICAL: Tool functions that SDK will call (REQ-3.6.1: Two-tool architecture)
         # These are PURE functions - no reasoning, just execution
         self.tool_functions = {
             "query_codebase": self._execute_query_codebase,
-            "generate_diagram": self._execute_generate_diagram,
-            "examine_files": self._execute_examine_files,
-            "search_symbols": self._execute_search_symbols
+            "navigate_filesystem": self._execute_navigate_filesystem,
+            # Removed from primary tools - now internal utilities:
+            # "generate_diagram": self._execute_generate_diagram,  # Now internal via mermaid_renderer
+            # "examine_files": self._execute_examine_files,        # Functionality absorbed into navigate_filesystem
+            # "search_symbols": self._execute_search_symbols       # Functionality absorbed into query_codebase
         }
         
         # Conversation limits for safety
@@ -119,7 +137,7 @@ class CerebrasNativeAgent:
         
         logger.info("✅ CerebrasNativeAgent initialized - SDK handles all reasoning")
     
-    async def process_query(self, user_query: str, conversation_history: Optional[List[Dict]] = None) -> str:
+    async def process_query(self, user_query: str, conversation_history: Optional[List[Dict]] = None, selected_model: str = None) -> str:
         """
         PURE SDK Processing - No Custom Logic
         
@@ -132,6 +150,10 @@ class CerebrasNativeAgent:
         We only provide tool execution.
         """
         try:
+            # Use provided model or fall back to config default
+            model_to_use = selected_model or cerebras_config.model
+            logger.info(f"🎯 Processing query with model: {model_to_use}")
+            
             # Build message history
             messages = conversation_history or []
             
@@ -149,7 +171,7 @@ class CerebrasNativeAgent:
             self.current_iteration = 0
             
             # SDK handles everything from here
-            result = await self._sdk_native_loop(messages)
+            result = await self._sdk_native_loop(messages, model_to_use)
             
             logger.info(f"✅ Query processed successfully in {self.current_iteration} iterations")
             return result
@@ -158,7 +180,7 @@ class CerebrasNativeAgent:
             logger.error(f"❌ Native agent processing failed: {e}")
             return f"I encountered a system error while processing your request: {str(e)}"
     
-    async def _sdk_native_loop(self, messages: List[Dict]) -> str:
+    async def _sdk_native_loop(self, messages: List[Dict], selected_model: str) -> str:
         """
         Pure SDK loop - NO custom logic, just tool execution when requested
         """
@@ -173,12 +195,25 @@ class CerebrasNativeAgent:
                 
                 # SDK makes ALL decisions using adaptive schema
                 adaptive_schema = self._build_adaptive_schema()
-                response = self.client.chat.completions.create(
-                    **cerebras_config.get_completion_config(),
-                    messages=messages,
-                    tools=adaptive_schema,
-                    reasoning_effort=cerebras_config.reasoning_effort
-                )
+                
+                # Build completion config with dynamic model
+                completion_config = cerebras_config.get_completion_config(selected_model)
+                
+                # Build API parameters with conditional reasoning_effort
+                api_params = {
+                    **completion_config,
+                    "messages": messages,
+                    "tools": adaptive_schema
+                }
+                
+                # Only add reasoning_effort for models that support it
+                if cerebras_config.supports_reasoning_effort(selected_model):
+                    api_params["reasoning_effort"] = cerebras_config.reasoning_effort
+                    logger.debug(f"✅ Using reasoning_effort '{cerebras_config.reasoning_effort}' for {selected_model}")
+                else:
+                    logger.debug(f"⏭️ Skipping reasoning_effort for {selected_model} (not supported)")
+                
+                response = self.client.chat.completions.create(**api_params)
                 
                 message = response.choices[0].message
                 
@@ -255,11 +290,19 @@ class CerebrasNativeAgent:
             
             try:
                 # Make final synthesis call without tools
-                synthesis_response = self.client.chat.completions.create(
-                    **cerebras_config.get_completion_config(),
-                    messages=synthesis_messages,
-                    reasoning_effort=cerebras_config.reasoning_effort
-                )
+                synthesis_completion_config = cerebras_config.get_completion_config(selected_model)
+                
+                # Build synthesis API parameters with conditional reasoning_effort  
+                synthesis_params = {
+                    **synthesis_completion_config,
+                    "messages": synthesis_messages
+                }
+                
+                # Only add reasoning_effort for models that support it
+                if cerebras_config.supports_reasoning_effort(selected_model):
+                    synthesis_params["reasoning_effort"] = cerebras_config.reasoning_effort
+                
+                synthesis_response = self.client.chat.completions.create(**synthesis_params)
                 
                 synthesis_result = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
                 logger.info(f"✅ Successfully synthesized response from gathered context")
@@ -312,8 +355,14 @@ class CerebrasNativeAgent:
     async def _execute_query_codebase(self, query: str, analysis_mode: str = "auto", 
                                     filters: Optional[Dict] = None) -> Dict[str, Any]:
         """
-        PURE query execution using our Phase 1/2 infrastructure
-        NO custom reasoning - just execute and return data
+        PURE query execution with automatic diagram generation for structural_kg mode
+        
+        Implements the complete workflow:
+        1. Execute KG query to get structural data
+        2. Detect if this is a diagram request  
+        3. Transform data to standard graph format
+        4. Generate Mermaid diagram automatically
+        5. Return both raw data and rendered diagram
         """
         try:
             logger.info(f"📊 Executing codebase query: '{query[:50]}...' (mode: {analysis_mode})")
@@ -321,7 +370,7 @@ class CerebrasNativeAgent:
             # Use our existing unified query system
             result = await query_codebase(query, filters, analysis_mode)
             
-            # Return raw data for SDK to reason about
+            # Build base response
             response = {
                 "success": True,
                 "query": query,
@@ -332,6 +381,44 @@ class CerebrasNativeAgent:
                 "execution_metadata": result.get("unified_query", {}),
                 "filters_applied": filters or {}
             }
+            
+            # Step 3-5: Automatic diagram generation for structural_kg mode
+            if (analysis_mode == "structural_kg" and 
+                result.get("strategy") == "kg_direct" and 
+                result.get("total_results", 0) > 0 and
+                self._is_diagram_query(query)):
+                
+                try:
+                    logger.info("🎨 Auto-generating diagram from structural data...")
+                    
+                    # Step 3: Transform KG data to standard graph format
+                    graph_data = self._transform_kg_to_graph_data(result.get("results", []), query)
+                    
+                    # Step 4: Determine diagram type from query
+                    diagram_type = self._infer_diagram_type(query)
+                    
+                    # Step 5: Generate Mermaid diagram
+                    mermaid_code = self.mermaid_renderer.render_diagram(
+                        diagram_type=diagram_type,
+                        data=graph_data,
+                        title=f"Diagram: {query}",
+                        theme="default"
+                    )
+                    
+                    # Add diagram to response
+                    response.update({
+                        "diagram_generated": True,
+                        "diagram_type": diagram_type,
+                        "mermaid_code": mermaid_code,
+                        "graph_data": graph_data,
+                        "auto_rendered": True
+                    })
+                    
+                    logger.info(f"✅ Auto-diagram generated: {len(mermaid_code)} chars of {diagram_type}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Auto-diagram generation failed: {e}")
+                    response["diagram_error"] = str(e)
             
             logger.info(f"✅ Query executed: {response['total_results']} results via {response['strategy_used']}")
             return response
@@ -344,6 +431,285 @@ class CerebrasNativeAgent:
                 "query": query,
                 "analysis_mode": analysis_mode,
                 "results": []
+            }
+    
+    def _is_diagram_query(self, query: str) -> bool:
+        """Detect if this query is requesting a diagram"""
+        query_lower = query.lower()
+        diagram_indicators = [
+            'diagram', 'chart', 'visualization', 'graph', 'hierarchy', 
+            'structure', 'architecture', 'relationship', 'class diagram',
+            'show', 'visualize', 'display'
+        ]
+        return any(indicator in query_lower for indicator in diagram_indicators)
+    
+    def _infer_diagram_type(self, query: str) -> str:
+        """Infer the best diagram type from the query"""
+        query_lower = query.lower()
+        
+        if any(term in query_lower for term in ['class', 'hierarchy', 'inheritance', 'extends']):
+            return "class_diagram"
+        elif any(term in query_lower for term in ['flow', 'process', 'sequence', 'steps']):
+            return "flowchart"
+        elif any(term in query_lower for term in ['component', 'module', 'service', 'architecture']):
+            return "graph"
+        else:
+            return "graph"  # Default fallback
+    
+    def _transform_kg_to_graph_data(self, kg_results: List[Dict], query: str) -> Dict[str, Any]:
+        """
+        Step 3: Transform KG structural data to standard graph format
+        
+        Converts the complex KG node data into the clean, standardized format
+        that the MermaidRenderer expects. Optionally enriches with file content.
+        """
+        nodes = []
+        edges = []
+        node_ids = set()
+        
+        # Extract nodes from KG results
+        for kg_item in kg_results:
+            if kg_item.get("type") == "kg_structural_node":
+                node_data = kg_item.get("node_data", {})
+                node_id = node_data.get("name", "unknown")
+                
+                if node_id not in node_ids:
+                    enhanced_node = {
+                        "id": node_id,
+                        "label": node_id,
+                        "semantic_role": self._infer_semantic_role(node_data),
+                        "file_path": node_data.get("file_path", ""),
+                        "type": node_data.get("type", "unknown"),
+                        "line_start": node_data.get("line_start"),
+                        "line_end": node_data.get("line_end"),
+                        "signature": node_data.get("signature", "")
+                    }
+                    
+                    # Enhance with file content for richer diagrams
+                    enhanced_node = self._enrich_node_with_file_data(enhanced_node)
+                    
+                    nodes.append(enhanced_node)
+                    node_ids.add(node_id)
+                
+                # Extract relationships as edges
+                outgoing_rels = kg_item.get("outgoing_relationships", [])
+                for rel in outgoing_rels:
+                    # Find target node in connected_nodes
+                    target_id = None
+                    connected_nodes = kg_item.get("connected_nodes", [])
+                    for connected in connected_nodes:
+                        if connected.get("id") == rel.get("target_id"):
+                            target_id = connected.get("name")
+                            break
+                    
+                    if target_id and target_id.lower() not in ['none', '(none)', '', 'null']:
+                        edges.append({
+                            "source": node_id,
+                            "target": target_id,
+                            "type": rel.get("type", "uses"),
+                            "label": rel.get("type", "")
+                        })
+        
+        # Infer additional relationships from file analysis
+        additional_edges = self._infer_relationships_from_files(nodes)
+        edges.extend(additional_edges)
+        
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "query": query,
+                "total_nodes": len(nodes),
+                "total_edges": len(edges),
+                "enhanced_with_files": True,
+                "generated_at": "auto"
+            }
+        }
+    
+    def _enrich_node_with_file_data(self, node: Dict) -> Dict:
+        """
+        Enhance node data by reading actual file content.
+        This addresses the limitation of relying only on KG data.
+        """
+        try:
+            file_path = node.get("file_path", "")
+            if not file_path or not file_path.startswith("/workspace"):
+                return node
+            
+            # Read file content to extract methods, attributes, imports
+            from pathlib import Path
+            actual_file = Path(file_path)
+            
+            if actual_file.exists() and actual_file.suffix in ['.java', '.py', '.js', '.ts']:
+                content = actual_file.read_text(encoding='utf-8', errors='ignore')
+                
+                # Extract methods and attributes from actual code
+                if file_path.endswith('.java'):
+                    methods, attributes = self._parse_java_content(content, node.get("id", ""))
+                elif file_path.endswith('.py'):
+                    methods, attributes = self._parse_python_content(content, node.get("id", ""))
+                else:
+                    methods, attributes = [], []
+                
+                # Add to node
+                node["methods"] = methods[:10]  # Limit for diagram clarity
+                node["attributes"] = attributes[:5]  # Limit for diagram clarity
+                node["enhanced_from_file"] = True
+                
+        except Exception as e:
+            logger.debug(f"Could not enhance node {node.get('id')} with file data: {e}")
+        
+        return node
+    
+    def _parse_java_content(self, content: str, class_name: str) -> tuple[List[str], List[str]]:
+        """Extract methods and attributes from Java class content"""
+        import re
+        
+        methods = []
+        attributes = []
+        
+        # Find methods (simplified regex)
+        method_pattern = r'public\s+[\w<>\[\],\s]+\s+(\w+)\s*\('
+        for match in re.finditer(method_pattern, content):
+            method_name = match.group(1)
+            if method_name not in ['class', class_name]:  # Skip constructors
+                methods.append(method_name)
+        
+        # Find attributes/fields
+        field_pattern = r'private\s+[\w<>\[\],\s]+\s+(\w+)\s*[;=]'
+        for match in re.finditer(field_pattern, content):
+            field_name = match.group(1)
+            attributes.append(field_name)
+        
+        return methods, attributes
+    
+    def _parse_python_content(self, content: str, class_name: str) -> tuple[List[str], List[str]]:
+        """Extract methods and attributes from Python class content"""
+        import re
+        
+        methods = []
+        attributes = []
+        
+        # Find methods
+        method_pattern = r'def\s+(\w+)\s*\('
+        for match in re.finditer(method_pattern, content):
+            method_name = match.group(1)
+            if not method_name.startswith('_'):  # Skip private methods for clarity
+                methods.append(method_name)
+        
+        # Find class attributes (simplified)
+        attr_pattern = r'self\.(\w+)\s*='
+        for match in re.finditer(attr_pattern, content):
+            attr_name = match.group(1)
+            if not attr_name.startswith('_'):
+                attributes.append(attr_name)
+        
+        return list(set(methods)), list(set(attributes))  # Remove duplicates
+    
+    def _infer_relationships_from_files(self, nodes: List[Dict]) -> List[Dict]:
+        """
+        Infer additional relationships by analyzing file content.
+        This goes beyond KG data to find actual usage patterns.
+        """
+        additional_edges = []
+        
+        try:
+            for node in nodes:
+                file_path = node.get("file_path", "")
+                if not file_path or not file_path.startswith("/workspace"):
+                    continue
+                
+                from pathlib import Path
+                actual_file = Path(file_path)
+                
+                if actual_file.exists():
+                    content = actual_file.read_text(encoding='utf-8', errors='ignore')
+                    
+                    # Look for service dependencies in controllers
+                    if "controller" in file_path.lower():
+                        service_deps = self._find_service_dependencies(content, nodes)
+                        for dep in service_deps:
+                            additional_edges.append({
+                                "source": node["id"],
+                                "target": dep,
+                                "type": "uses",
+                                "label": "uses"
+                            })
+                            
+        except Exception as e:
+            logger.debug(f"Could not infer relationships from files: {e}")
+        
+        return additional_edges
+    
+    def _find_service_dependencies(self, content: str, all_nodes: List[Dict]) -> List[str]:
+        """Find service dependencies in controller code"""
+        import re
+        
+        dependencies = []
+        service_names = [node["id"] for node in all_nodes if "service" in node.get("semantic_role", "").lower()]
+        
+        # Look for service injections/imports
+        for service_name in service_names:
+            if service_name.lower() in content.lower():
+                dependencies.append(service_name)
+        
+        return dependencies
+    
+    def _infer_semantic_role(self, node_data: Dict) -> str:
+        """Infer semantic role for styling purposes"""
+        node_type = node_data.get("type", "").lower()
+        file_path = node_data.get("file_path", "").lower()
+        name = node_data.get("name", "").lower()
+        
+        if "controller" in file_path or "controller" in name:
+            return "controller"
+        elif "service" in file_path or "service" in name:
+            return "service"  
+        elif "model" in file_path or "entity" in file_path:
+            return "model"
+        elif node_type == "class":
+            return "logic"
+        elif node_type == "interface":
+            return "interface"
+        else:
+            return "external"
+    
+    def _execute_navigate_filesystem(self, operation: str, path: str = None, 
+                                   pattern: str = None, recursive: bool = False) -> Dict[str, Any]:
+        """
+        REQ-3.6.1: PURE filesystem navigation execution using KG data
+        NO custom reasoning - just execute filesystem operations and return data
+        """
+        try:
+            logger.info(f"📁 Executing filesystem navigation: operation={operation} path={path} pattern={pattern} recursive={recursive}")
+            
+            if not self.filesystem_navigator:
+                return {
+                    "success": False,
+                    "error": "Filesystem navigator not available - Knowledge Graph required",
+                    "operation": operation
+                }
+            
+            # Execute the filesystem operation using KG data
+            result = self.filesystem_navigator.execute(operation, path, pattern, recursive)
+            
+            # Add success flag if not present
+            if "error" not in result:
+                result["success"] = True
+            else:
+                result["success"] = False
+            
+            logger.info(f"✅ Filesystem operation executed: {result.get('count', 0)} items found")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Filesystem navigation failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": operation,
+                "path": path,
+                "pattern": pattern
             }
     
     def _execute_generate_diagram(self, diagram_type: str, structural_data: Any, 
@@ -578,57 +944,128 @@ class CerebrasNativeAgent:
     
     def _get_native_system_prompt(self) -> str:
         """
-        Native system prompt for SDK - focuses on tool usage patterns
+        REQ-3.7: Mandatory Workflow Architecture - Codebase Onboarding System
+        This prompt implements structured workflows that eliminate lazy discovery
         """
-        return """# CodeWise - Native SDK Integration
+        return """# CodeWise v3.2 - Mandatory Workflow Architecture
 
-You are CodeWise, a senior software engineer and code intelligence platform. You help users understand complex codebases through systematic analysis using the tools provided.
+## 1. Core Identity
+You are CodeWise, a world-class senior software engineer and code intelligence platform. Your purpose is to help users understand complex codebases by using your specialized tools in specific, proven workflows that ensure comprehensive analysis.
 
-## Your Native Capabilities
+## 2. Your Specialized Toolset
+You have two primary tools. You MUST use them according to the mandatory workflows below.
 
-You have access to advanced code analysis tools that combine:
-- Semantic search for conceptual understanding
-- Knowledge Graph queries for structural relationships  
-- Hybrid search for comprehensive coverage
-- File examination for detailed analysis
+### Tool 1: `query_codebase(query: str, ...)`
+* **Purpose:** To answer **CONCEPTUAL** questions ("how," "why," "explain"). Use it to understand the *meaning* and *logic* of code **once you know where it is**.
+* **Critical Rule:** Never use this as your first tool for broad exploratory queries.
+* **Best Use:** After you have established the project structure through filesystem exploration.
 
-## Tool Usage Patterns
+### Tool 2: `navigate_filesystem(operation: str, ...)`  
+* **Purpose:** To answer **STRUCTURAL** questions ("where," "list," "find"). Use it to **discover** the layout of the codebase.
+* **Critical Rule:** Always use this first for architecture and exploratory queries.
+* **Operations:** 
+  - `operation="tree"` - Get directory structure overview
+  - `operation="find"` - Find files matching patterns  
+  - `operation="list"` - List contents of specific directories
 
-### Standard Analysis
-1. Use `query_codebase` with analysis_mode="auto" for most questions
-2. The system intelligently selects optimal search strategies
-3. Provide comprehensive answers with file paths and code context
+---
 
-### Diagram Generation (Two-Step Process)
-1. FIRST: Use `query_codebase` with analysis_mode="structural_kg" to gather factual relationship data
-2. THEN: Use `generate_diagram` with the structural data from step 1
-3. NEVER invent diagram relationships - always use factual data
+## 3. Mandatory Reasoning Workflows
 
-### Deep Investigation
-1. Use `query_codebase` to find relevant files/symbols
-2. Use `examine_files` to read specific source code
-3. Use `search_symbols` for detailed symbol relationship analysis
-4. Synthesize findings into comprehensive explanations
+### Workflow A: Standard Code Query (For Specific Questions)
+**Use When:** The user asks about a *specific, known* function, class, or file.
+**Examples:** "What does the `authenticate_user` function do?" or "How does UserService work?"
+**Process:**
+1. **Thought:** The user is asking about a specific symbol. I will use `query_codebase` to find it directly.
+2. **Action:** `query_codebase(query="authenticate_user function", analysis_mode="specific_symbol")`
 
-### Symbol Research
-1. Use `search_symbols` for specific function/class lookups
-2. Use `query_codebase` with analysis_mode="specific_symbol" for focused searches
-3. Combine results for complete understanding
+### Workflow B: Codebase Onboarding (For Broad, Exploratory Questions)
+**Use When:** The user asks a broad, high-level question about a project, such as:
+- "explain the architecture"
+- "how does this project work" 
+- "explain each controller"
+- "show me the system design"
+- Any query about project structure or overview
 
-## Quality Standards
+**MANDATORY Process - You MUST follow every step:**
+
+1. **Thought:** This is a broad, exploratory query. I must first understand the project's structure. My first step is to use `navigate_filesystem` to get a file tree.
+
+2. **Action (Step 1):** `navigate_filesystem(operation="tree", path=".")`
+
+3. **Observation:** [Review the file tree from the tool's output - identify key directories like src/, components/, controllers/, services/, etc.]
+
+4. **Thought:** Based on the file tree, the core logic appears to be in the `[path/to/logic]` and `[path/to/other/logic]` directories. Now I will perform a targeted semantic search on these areas.
+
+5. **Action (Step 2):** `query_codebase(query="analyze the core components in '[path/to/logic]'")`
+
+6. **Observation:** [Review the semantic search results for detailed implementation information.]
+
+7. **Thought:** I now have both a structural overview and semantic details. I can synthesize a complete answer.
+
+8. **Final Action:** Provide comprehensive answer combining structural layout with semantic analysis.
+
+### Workflow C: Diagram Generation
+**Use When:** The user requests a diagram or visualization.
+**Process:**
+1. **Thought:** The user wants a diagram. According to mandatory workflow, for diagram generation I must call query_codebase with analysis_mode="structural_kg".
+2. **Action:** `query_codebase(query="class hierarchy for controllers", analysis_mode="structural_kg")`
+3. **System Response:** The system will automatically transform the structural data into a standardized graph format, infer the appropriate diagram type, and generate the Mermaid diagram syntax.
+
+---
+
+## 4. Critical Rules for Robust Discovery
+
+### Rule 1: Workflow Selection is Mandatory
+You MUST identify which workflow applies to each user query and follow it exactly. Do not deviate from the prescribed steps.
+
+### Rule 2: Never Skip Structure for Broad Queries  
+For any query about architecture, project overview, or "explain X system", you MUST start with `navigate_filesystem` to build structural understanding. This is non-negotiable.
+
+### Rule 3: Cold Start Protection
+If you receive limited results from `query_codebase` (< 10 results or only documentation), you MUST use `navigate_filesystem` to verify the project structure before concluding anything about available source code.
+
+### Rule 4: Completeness Validation
+Before providing architectural analysis, verify you have:
+- [ ] Found source code files (not just documentation)
+- [ ] Identified key architectural components  
+- [ ] Located main application entry points
+- [ ] Understood the project's directory structure
+
+### Rule 5: No Lazy Conclusions
+Never conclude "only documentation exists" or "no source files available" without using `navigate_filesystem` to verify the actual project structure.
+
+---
+
+## 5. Tool Integration Patterns
+
+### Pattern 1: Discovery → Analysis
+For unknown projects: `navigate_filesystem` → `query_codebase`
+
+### Pattern 2: Targeted → Deep Dive  
+For specific queries: `query_codebase` directly
+
+### Pattern 3: Structure → Semantics → Synthesis
+For comprehensive analysis: `navigate_filesystem` → `query_codebase` → combine results
+
+---
+
+## 6. Quality Standards
 - Always provide file paths and line numbers when available
-- Include relevant code snippets with proper context
+- Include relevant code snippets with proper context  
 - Explain complex concepts clearly with examples
-- Focus on accuracy over speed
-- Make responses educational and actionable
+- Use the mandatory workflow for each question type
+- Build complete understanding before providing analysis
+- Validate discovery completeness before concluding
 
-## Error Handling
+## 7. Error Handling & Recovery
+- If `query_codebase` returns sparse results, trigger filesystem discovery
 - If tools return errors, acknowledge limitations clearly
-- Offer alternative approaches when primary methods fail
+- Use the alternate workflow if the primary approach fails
 - Never fabricate information to fill gaps
-- Guide users toward successful query patterns
+- Guide users toward successful discovery patterns
 
-Your goal is to help users understand complex systems by providing clear, accurate, and context-rich analysis using these powerful tools systematically."""
+Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding."""
     
     def _detect_sdk_version(self) -> str:
         """Detect SDK version for future-proofing"""
@@ -701,13 +1138,21 @@ Your goal is to help users understand complex systems by providing clear, accura
     
     def _build_adaptive_schema(self) -> List[Dict]:
         """
-        Build tool schema that adapts to SDK capabilities
+        REQ-3.6.1: Build two-tool architecture schema 
         
-        This ensures we automatically use new SDK features as they become available.
-        Note: We don't modify the schema structure as that breaks API compatibility.
-        Feature adaptation happens at the execution level, not schema level.
+        This creates the specialized toolset that eliminates LLM decision paralysis:
+        1. query_codebase - for CONCEPTUAL questions (how/why/explain)
+        2. navigate_filesystem - for STRUCTURAL questions (where/list/find)
         """
+        # Start with conceptual query tool
         base_schema = UNIFIED_TOOL_SCHEMA.copy()
+        
+        # Add filesystem navigation tool for structural queries
+        if self.filesystem_navigator:
+            base_schema.extend(FILESYSTEM_TOOL_SCHEMA)
+            logger.info("✅ Two-tool architecture: query_codebase + navigate_filesystem")
+        else:
+            logger.warning("⚠️ Filesystem tool unavailable - single tool mode")
         
         # Log available features but don't modify schema (causes API errors)
         if self.available_features.get("parallel_tools", False):
@@ -716,7 +1161,7 @@ Your goal is to help users understand complex systems by providing clear, accura
         if self.available_features.get("streaming", False):
             logger.info("✅ Streaming tool responses available")
         
-        logger.info(f"🔧 Standard tool schema built with {len(base_schema)} tools")
+        logger.info(f"🔧 Specialized tool schema built with {len(base_schema)} tools")
         return base_schema
 
 # Global native agent instance

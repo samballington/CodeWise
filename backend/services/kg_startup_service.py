@@ -82,20 +82,22 @@ class KGStartupService:
         
         self.logger.info(f"✅ KGStartupService initialized for workspace: {workspace_dir}")
     
-    async def populate_all_projects(self) -> KGStartupResult:
+    async def populate_all_projects(self, incremental: bool = True) -> KGStartupResult:
         """
         Main entry point - populate KG for all workspace projects.
         
         REQ-3.7.1: Automatic KG population with error isolation.
+        REQ-3.9.1: Incremental indexing support
         """
         startup_start = time.time()
-        self.logger.info("🚀 Starting automatic Knowledge Graph population for all projects")
+        mode = "incremental" if incremental else "full"
+        self.logger.info(f"🚀 Starting {mode} Knowledge Graph population for all projects")
         
         # Discover all projects in workspace
-        projects = self._discover_workspace_projects()
-        self.logger.info(f"📁 Found {len(projects)} projects to index: {[p.name for p in projects]}")
+        all_projects = self._discover_workspace_projects()
+        self.logger.info(f"📁 Found {len(all_projects)} total projects: {[p.name for p in all_projects]}")
         
-        if not projects:
+        if not all_projects:
             self.logger.warning("⚠️ No projects found in workspace - nothing to index")
             return KGStartupResult(
                 total_projects=0,
@@ -106,11 +108,33 @@ class KGStartupService:
                 startup_timestamp=datetime.now()
             )
         
+        # Filter to only unindexed projects if incremental mode
+        if incremental:
+            indexed_projects = self._get_indexed_projects()
+            projects_to_index = [p for p in all_projects if p.name not in indexed_projects]
+            self.logger.info(f"📊 Incremental mode: {len(indexed_projects)} already indexed, "
+                           f"{len(projects_to_index)} new projects to index")
+            self.logger.info(f"🔄 New projects to index: {[p.name for p in projects_to_index]}")
+        else:
+            projects_to_index = all_projects
+            self.logger.info(f"🔄 Full reindex mode: processing all {len(projects_to_index)} projects")
+        
+        if not projects_to_index:
+            self.logger.info("✅ All projects already indexed - nothing to do")
+            return KGStartupResult(
+                total_projects=len(all_projects),
+                successful_projects=len(all_projects),
+                failed_projects=0,
+                total_processing_time=time.time() - startup_start,
+                project_results=[],
+                startup_timestamp=datetime.now()
+            )
+        
         # Process each project (with error isolation)
         project_results = []
         successful_count = 0
         
-        for project_path in projects:
+        for project_path in projects_to_index:
             try:
                 self.logger.info(f"🔄 Processing project: {project_path.name}")
                 result = await self._index_single_project(project_path)
@@ -138,11 +162,11 @@ class KGStartupService:
                 ))
         
         total_time = time.time() - startup_start
-        failed_count = len(projects) - successful_count
+        failed_count = len(projects_to_index) - successful_count
         
         # Create summary result
         result = KGStartupResult(
-            total_projects=len(projects),
+            total_projects=len(all_projects),
             successful_projects=successful_count,
             failed_projects=failed_count,
             total_processing_time=total_time,
@@ -151,8 +175,12 @@ class KGStartupService:
         )
         
         # Log final summary
-        self.logger.info(f"🎉 KG startup completed: {successful_count}/{len(projects)} projects successful "
-                        f"in {total_time:.2f}s")
+        if incremental:
+            self.logger.info(f"🎉 Incremental KG indexing completed: {successful_count}/{len(projects_to_index)} new projects indexed "
+                           f"in {total_time:.2f}s")
+        else:
+            self.logger.info(f"🎉 Full KG reindexing completed: {successful_count}/{len(projects_to_index)} projects successful "
+                           f"in {total_time:.2f}s")
         
         if failed_count > 0:
             self.logger.warning(f"⚠️ {failed_count} projects failed - check logs for details")
@@ -185,6 +213,38 @@ class KGStartupService:
             self.logger.error(f"❌ Error scanning workspace: {e}")
         
         return projects
+    
+    def _get_indexed_projects(self) -> set:
+        """
+        Get list of projects already indexed in Knowledge Graph.
+        
+        REQ-3.9.1: Determine which projects are already indexed
+        """
+        try:
+            from storage.database_manager import DatabaseManager
+            
+            db = DatabaseManager()
+            cursor = db.connection.cursor()
+            
+            # Get all file paths and extract project names
+            query = "SELECT DISTINCT file_path FROM nodes WHERE file_path LIKE '/workspace/%'"
+            results = cursor.execute(query).fetchall()
+            
+            indexed_projects = set()
+            for row in results:
+                file_path = row[0]
+                # Extract project name from /workspace/ProjectName/...
+                parts = file_path.split('/')
+                if len(parts) >= 3 and parts[1] == 'workspace':
+                    project_name = parts[2]
+                    indexed_projects.add(project_name)
+            
+            self.logger.debug(f"🔍 Found {len(indexed_projects)} indexed projects: {sorted(indexed_projects)}")
+            return indexed_projects
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error getting indexed projects: {e}")
+            return set()
     
     def _has_code_files(self, project_path: Path) -> bool:
         """Check if directory contains code files worth indexing."""

@@ -72,14 +72,18 @@ _kg_startup_completed = False
 @app.on_event("startup")
 async def startup_event():
     """
-    Backend startup event - Fast startup without KG reindexing
+    Backend startup event - Fast startup with incremental KG indexing
+    REQ-3.9.2: Fast startup mode with new project detection
     """
     global _kg_startup_completed
     
-    logger.info("🚀 Backend startup: Fast mode (KG reindexing disabled)")
-    logger.info("💡 KG data is preserved from previous runs - 17,784 nodes available")
+    logger.info("🚀 Backend startup: Fast mode with incremental KG indexing")
+    logger.info("💡 Existing KG data preserved - checking for new projects to index")
     
-    # Mark as completed to avoid blocking queries
+    # Run incremental KG population in background (non-blocking)
+    asyncio.create_task(populate_incremental_kg_on_startup())
+    
+    # Mark as completed to avoid blocking queries (incremental runs in background)
     _kg_startup_completed = True
 
 async def populate_kg_on_startup():
@@ -100,6 +104,36 @@ async def populate_kg_on_startup():
     except Exception as e:
         logger.error(f"❌ KG startup population failed: {e}")
         _kg_startup_completed = False
+
+async def populate_incremental_kg_on_startup():
+    """
+    Background task for incremental KG population - REQ-3.9.2
+    Only indexes new projects, preserving fast startup
+    """
+    global _kg_startup_completed
+    
+    try:
+        logger.info("📊 Starting incremental Knowledge Graph indexing for new projects...")
+        
+        # Import the service
+        from services import get_kg_startup_service
+        service = get_kg_startup_service()
+        
+        # Run incremental indexing (only new projects)
+        result = await service.populate_all_projects(incremental=True)
+        
+        if result.project_results:
+            logger.info(f"✅ Incremental KG indexing completed: {result.successful_projects} new projects "
+                       f"indexed in {result.total_processing_time:.2f}s")
+        else:
+            logger.info("✅ All projects already indexed - no new projects found")
+        
+        if result.failed_projects > 0:
+            logger.warning(f"⚠️ {result.failed_projects} projects failed indexing")
+        
+    except Exception as e:
+        logger.error(f"❌ Incremental KG indexing failed: {e}")
+        # Don't mark as failed - queries can still work with existing data
 
 @app.get("/")
 async def root():
