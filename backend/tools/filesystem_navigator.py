@@ -89,6 +89,27 @@ class FilesystemNavigator:
         # Normalize path (remove leading/trailing slashes)
         path = path.strip('/')
         
+        # Quick validation - check if path exists in any files before doing expensive queries
+        cursor = self.db.connection.cursor()
+        path_check = cursor.execute(
+            "SELECT COUNT(*) FROM nodes WHERE file_path LIKE ?", (f"%{path}%",)
+        ).fetchone()[0]
+        
+        if path_check == 0:
+            # Suggest alternatives
+            project_suggestions = cursor.execute(
+                "SELECT DISTINCT SUBSTR(file_path, 1, INSTR(file_path, '/') - 1) as project FROM nodes WHERE project != '' LIMIT 5"
+            ).fetchall()
+            suggestions = [s[0] for s in project_suggestions if s[0]]
+            
+            return {
+                "error": f"Path '{path}' not found in codebase",
+                "suggestions": f"Try searching in these projects: {', '.join(suggestions)}",
+                "files": [],
+                "operation": "list",
+                "path": path
+            }
+        
         cursor = self.db.connection.cursor()
         
         if recursive:

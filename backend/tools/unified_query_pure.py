@@ -323,8 +323,8 @@ async def _execute_semantic_search(query: str, filters: Optional[Dict]) -> tuple
         from vector_store import get_vector_store
         vs = get_vector_store()
         
-        # Basic vector search
-        results = await vs.similarity_search(query, k=10)
+        # Basic vector search with project filtering
+        results = await vs.similarity_search(query, k=10, filters=filters)
         formatted_results = []
         
         for result in results:

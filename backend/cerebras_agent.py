@@ -138,7 +138,7 @@ class CerebrasNativeAgent:
         
         logger.info("✅ CerebrasNativeAgent initialized - SDK handles all reasoning")
     
-    async def process_query(self, user_query: str, conversation_history: Optional[List[Dict]] = None, selected_model: str = None) -> str:
+    async def process_query(self, user_query: str, conversation_history: Optional[List[Dict]] = None, selected_model: str = None, mentioned_projects: Optional[List[str]] = None) -> str:
         """
         PURE SDK Processing - No Custom Logic
         
@@ -151,6 +151,11 @@ class CerebrasNativeAgent:
         We only provide tool execution.
         """
         try:
+            # Store project context for tool filtering
+            self.mentioned_projects = mentioned_projects
+            if mentioned_projects:
+                logger.info(f"🎯 Project context set: {mentioned_projects}")
+            
             # Use provided model or fall back to config default
             model_to_use = selected_model or cerebras_config.model
             logger.info(f"🎯 Processing query with model: {model_to_use}")
@@ -195,10 +200,17 @@ class CerebrasNativeAgent:
                 logger.info(f"🔄 SDK Iteration {self.current_iteration}/{self.max_iterations}")
                 
                 # REQ-CTX-MONITORING: Track context usage before each iteration
-                self._log_context_usage(messages)
+                try:
+                    self._log_context_usage(messages)
+                except Exception as e:
+                    logger.warning(f"Failed to log context usage: {e}")
                 
                 # REQ-CTX-FALLBACK: Check if we need graceful degradation
-                context_health = self._check_context_health(messages)
+                try:
+                    context_health = self._check_context_health(messages)
+                except Exception as e:
+                    logger.warning(f"Failed to check context health: {e}")
+                    context_health = {"utilization_percent": 0}
                 if context_health.get("utilization_percent", 0) > 90:
                     logger.warning("🚨 Context critical - applying graceful degradation")
                     return await self._apply_graceful_degradation(messages, context_health)
@@ -285,8 +297,16 @@ class CerebrasNativeAgent:
             # Extract the original user query from the conversation
             user_query = ""
             for msg in messages:
-                if msg.get("role") == "user":
-                    user_query = msg.get("content", "")
+                # Handle both dict and SDK response objects
+                if hasattr(msg, 'role'):
+                    role = msg.role
+                    content = msg.content if hasattr(msg, 'content') else ""
+                else:
+                    role = msg.get("role", "") if isinstance(msg, dict) else ""
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                
+                if role == "user":
+                    user_query = content
                     break
             
             # Create a synthesis prompt using gathered context
@@ -303,8 +323,24 @@ class CerebrasNativeAgent:
             
             # Add the conversation history (contains all tool results)
             for msg in messages[1:]:  # Skip initial system prompt
-                if msg.get("role") in ["assistant", "tool"]:
-                    synthesis_messages.append(msg)
+                # Handle both dict and SDK response objects
+                if hasattr(msg, 'role'):
+                    role = msg.role
+                else:
+                    role = msg.get("role", "") if isinstance(msg, dict) else ""
+                
+                if role in ["assistant", "tool"]:
+                    # Convert SDK response objects to dict format for synthesis
+                    if hasattr(msg, 'role'):
+                        dict_msg = {
+                            "role": msg.role,
+                            "content": msg.content if hasattr(msg, 'content') else ""
+                        }
+                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                            dict_msg["tool_calls"] = msg.tool_calls
+                        synthesis_messages.append(dict_msg)
+                    else:
+                        synthesis_messages.append(msg)
             
             try:
                 # Make final synthesis call without tools
@@ -388,8 +424,14 @@ class CerebrasNativeAgent:
         try:
             logger.info(f"📊 Executing codebase query: '{query[:50]}...' (mode: {analysis_mode})")
             
+            # Add project context to filters if available
+            enhanced_filters = filters or {}
+            if hasattr(self, 'mentioned_projects') and self.mentioned_projects:
+                enhanced_filters['project'] = self.mentioned_projects[0]  # Use first project
+                logger.info(f"🎯 Applying project filter: {self.mentioned_projects[0]}")
+            
             # Use our existing unified query system
-            result = await query_codebase(query, filters, analysis_mode)
+            result = await query_codebase(query, enhanced_filters, analysis_mode)
             
             # Build base response
             response = {
@@ -1300,8 +1342,14 @@ COMPRESSION RULES:
             tool_usage = {}
             
             for message in messages:
-                role = message.get("role", "unknown")
-                content = str(message.get("content", ""))
+                # Handle both dict messages and SDK response objects
+                if hasattr(message, 'role'):
+                    role = message.role if hasattr(message, 'role') else "unknown"
+                    content = str(message.content if hasattr(message, 'content') else "")
+                else:
+                    role = message.get("role", "unknown") if isinstance(message, dict) else "unknown"
+                    content = str(message.get("content", "") if isinstance(message, dict) else "")
+                
                 char_count = len(content)
                 token_estimate = char_count // 4  # Rough estimate: 4 chars per token
                 
@@ -1312,7 +1360,9 @@ COMPRESSION RULES:
                     message_breakdown[role] += token_estimate
                 
                 # Track tool usage
-                if role == "tool" and "tool_call_id" in message:
+                has_tool_call_id = (hasattr(message, 'tool_call_id') or 
+                                   (isinstance(message, dict) and "tool_call_id" in message))
+                if role == "tool" and has_tool_call_id:
                     # Try to identify tool type from content
                     if "query_codebase" in content:
                         tool_usage["query_codebase"] = tool_usage.get("query_codebase", 0) + 1
@@ -1379,7 +1429,15 @@ COMPRESSION RULES:
             Dictionary with context health metrics
         """
         try:
-            total_tokens = sum(self._estimate_token_count(str(msg.get("content", ""))) for msg in messages)
+            total_tokens = 0
+            for msg in messages:
+                if hasattr(msg, 'content'):
+                    content = str(msg.content)
+                elif isinstance(msg, dict):
+                    content = str(msg.get("content", ""))
+                else:
+                    content = ""
+                total_tokens += self._estimate_token_count(content)
             utilization = (total_tokens / 65536) * 100
             
             # Count summarization events
@@ -1709,6 +1767,7 @@ You have two primary tools. You MUST use them according to the mandatory workflo
 - "how does this project work" 
 - "explain each controller"
 - "show me the system design"
+- "how is authentication handled"
 - Any query about project structure or overview
 
 **MANDATORY Process - You MUST follow every step:**
@@ -1719,9 +1778,9 @@ You have two primary tools. You MUST use them according to the mandatory workflo
 
 3. **Observation:** [Review the file tree from the tool's output - identify key directories like src/, components/, controllers/, services/, etc.]
 
-4. **Thought:** Based on the file tree, the core logic appears to be in the `[path/to/logic]` and `[path/to/other/logic]` directories. Now I will perform a targeted semantic search on these areas.
+4. **Thought:** Based on the file tree, the core logic appears to be in the `[path/to/logic]` and `[path/to/other/logic]` directories. For authentication queries, I should search semantically rather than guessing file paths.
 
-5. **Action (Step 2):** `query_codebase(query="analyze the core components in '[path/to/logic]'")`
+5. **Action (Step 2):** `query_codebase(query="authentication security implementation", analysis_mode="semantic_rag")` OR for more specific searches use patterns like `navigate_filesystem(operation="find", pattern="*Auth*")` to locate auth-related files
 
 6. **Observation:** [Review the semantic search results for detailed implementation information.]
 
@@ -1749,7 +1808,13 @@ For any query about architecture, project overview, or "explain X system", you M
 ### Rule 3: Cold Start Protection
 If you receive limited results from `query_codebase` (< 10 results or only documentation), you MUST use `navigate_filesystem` to verify the project structure before concluding anything about available source code.
 
-### Rule 4: Completeness Validation
+### Rule 4: Path Validation - CRITICAL
+NEVER explore non-existent paths. If navigate_filesystem returns 0 items, STOP trying similar paths. Instead:
+- Use `navigate_filesystem(operation="find", pattern="*keyword*")` to search by filename patterns
+- Use `query_codebase(query="concept", analysis_mode="semantic_rag")` for semantic searches
+- Check actual project structure before assuming paths exist
+
+### Rule 5: Completeness Validation
 Before providing architectural analysis, verify you have:
 - [ ] Found source code files (not just documentation)
 - [ ] Identified key architectural components  
