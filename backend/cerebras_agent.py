@@ -15,6 +15,7 @@ import os
 import json
 import asyncio
 import logging
+import time
 from typing import Dict, List, Any, Optional
 from cerebras.cloud.sdk import Cerebras
 
@@ -193,6 +194,15 @@ class CerebrasNativeAgent:
             try:
                 logger.info(f"🔄 SDK Iteration {self.current_iteration}/{self.max_iterations}")
                 
+                # REQ-CTX-MONITORING: Track context usage before each iteration
+                self._log_context_usage(messages)
+                
+                # REQ-CTX-FALLBACK: Check if we need graceful degradation
+                context_health = self._check_context_health(messages)
+                if context_health.get("utilization_percent", 0) > 90:
+                    logger.warning("🚨 Context critical - applying graceful degradation")
+                    return await self._apply_graceful_degradation(messages, context_health)
+                
                 # SDK makes ALL decisions using adaptive schema
                 adaptive_schema = self._build_adaptive_schema()
                 
@@ -226,13 +236,21 @@ class CerebrasNativeAgent:
                     logger.info(f"🔧 SDK requested {len(message.tool_calls)} tool calls")
                     messages.append(message)
                     
-                    # Execute ONLY what SDK requests - no custom logic
+                    # Execute tools with intelligent summarization for large outputs
                     for tool_call in message.tool_calls:
+                        # Execute tool normally
                         result = await self._execute_pure_tool_call(tool_call)
+                        
+                        # Apply summarization if output is large  
+                        user_query = self._extract_user_query(messages)
+                        tool_content = await self._execute_tool_and_summarize(
+                            tool_call.function.name, result, user_query
+                        )
+                        
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": json.dumps(result)
+                            "content": tool_content
                         })
                     
                     successful_iterations += 1
@@ -944,6 +962,709 @@ class CerebrasNativeAgent:
                 "symbol_type": symbol_type,
                 "kg_available": self.kg is not None
             }
+    
+    # REQ-CTX-UNIFIED: Core Summarization Engine Implementation
+    async def _execute_tool_and_summarize(self, tool_name: str, tool_result: Dict[str, Any], user_query: str) -> str:
+        """
+        REQ-CTX-UNIFIED: Execute tool and apply summarization if output is large
+        
+        Args:
+            tool_name: Name of the tool that was executed
+            tool_result: Raw result from tool execution
+            user_query: Original user query for context
+            
+        Returns:
+            Either raw tool result (if small) or intelligent summary (if large)
+        """
+        try:
+            # Convert result to string for size analysis
+            raw_result_str = json.dumps(tool_result, indent=2)
+            raw_size_chars = len(raw_result_str)
+            
+            # Character threshold: 20,000 chars ≈ 5,000 tokens
+            SUMMARIZATION_THRESHOLD = 20000
+            
+            if raw_size_chars <= SUMMARIZATION_THRESHOLD:
+                # Small output - return as-is
+                logger.info(f"🔧 Tool output size: {raw_size_chars} chars (below threshold, no summarization)")
+                return raw_result_str
+            else:
+                # Large output - apply intelligent summarization
+                logger.info(f"🔧 Tool output size: {raw_size_chars} chars (above threshold, applying summarization)")
+                
+                summary = await self._summarize_with_llm(raw_result_str, user_query, tool_name)
+                summary_size = len(summary)
+                compression_ratio = ((raw_size_chars - summary_size) / raw_size_chars) * 100
+                
+                # REQ-CTX-MONITORING: Log compression metrics
+                logger.info(f"🔧 Tool compression: {tool_name} {raw_size_chars//1000}KB→{summary_size//1000}KB "
+                           f"({compression_ratio:.1f}% reduction)")
+                
+                return summary
+                
+        except Exception as e:
+            logger.error(f"❌ Summarization failed for {tool_name}: {e}")
+            # Fallback: return truncated raw result
+            truncated = raw_result_str[:15000] + "\n\n[TRUNCATED DUE TO SUMMARIZATION ERROR]"
+            return truncated
+    
+    async def _summarize_with_llm(self, large_content: str, user_query: str, tool_name: str) -> str:
+        """
+        REQ-CTX-UNIFIED: Make isolated LLM call to summarize large tool output
+        
+        Args:
+            large_content: Large tool output to summarize
+            user_query: Original user query for context
+            tool_name: Name of tool that generated the content
+            
+        Returns:
+            Dense, structured summary preserving key information
+        """
+        try:
+            # REQ-CTX-PROMPT: Get specialized prompt based on tool type
+            compression_prompt = self._get_compression_prompt(tool_name, user_query)
+            
+            # Truncate input to safely fit in summarization context
+            # Reserve space for prompt + response (≈8K tokens)
+            max_input_chars = 30000
+            content_to_summarize = large_content[:max_input_chars]
+            if len(large_content) > max_input_chars:
+                content_to_summarize += "\n\n[INPUT TRUNCATED FOR SUMMARIZATION]"
+            
+            # Build isolated summarization prompt
+            full_prompt = f"""{compression_prompt}
+
+INPUT DATA TO SUMMARIZE:
+---
+{content_to_summarize}
+---
+
+Remember: Extract key facts, preserve all important entities and relationships, format as structured Markdown. Maximum 2000 tokens."""
+            
+            # Make isolated API call (no conversation history to save tokens)
+            summarization_messages = [
+                {"role": "user", "content": full_prompt}
+            ]
+            
+            # Use same model as main query for consistency
+            completion_config = cerebras_config.get_completion_config()
+            
+            # Build API parameters for summarization
+            api_params = {
+                **completion_config,
+                "messages": summarization_messages,
+                "max_tokens": 2500  # Ensure room for 2000 token summary
+            }
+            
+            # Only add reasoning_effort for models that support it
+            if cerebras_config.supports_reasoning_effort(completion_config.get("model", "")):
+                api_params["reasoning_effort"] = "low"  # Faster for summarization
+            
+            # Execute summarization call
+            logger.info(f"🔧 Starting summarization for {tool_name} ({len(content_to_summarize)} chars)")
+            
+            start_time = time.time()
+            response = self.client.chat.completions.create(**api_params)
+            summarization_time = time.time() - start_time
+            
+            summary = response.choices[0].message.content
+            
+            # REQ-CTX-MONITORING: Log summarization metrics
+            logger.info(f"🔧 Summarization completed: {tool_name} in {summarization_time:.2f}s, "
+                       f"output: {len(summary)} chars")
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"❌ LLM summarization failed: {e}")
+            # Fallback: return structured truncation
+            return self._fallback_summarization(large_content, user_query, tool_name)
+    
+    def _get_compression_prompt(self, tool_name: str, user_query: str) -> str:
+        """
+        REQ-CTX-PROMPT: Get specialized compression prompt based on tool type
+        
+        Args:
+            tool_name: Name of the tool that generated content
+            user_query: Original user query for context
+            
+        Returns:
+            Specialized compression prompt for the tool type
+        """
+        # REQ-CTX-PROMPT: Specialized prompts by tool type
+        if tool_name == "query_codebase":
+            return f"""You are compressing code analysis results for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Class definitions, main functions, API endpoints, file paths, line numbers
+2. IMPORTANT: Dependencies, inheritance relationships, method signatures, design patterns
+3. SECONDARY: Helper functions, utilities, configuration details
+4. NOISE: Debug output, verbose descriptions, duplicate information
+
+OUTPUT FORMAT (use this exact structure):
+## Key Components
+- **ComponentName** (`file/path.py:123-145`)
+  - Type: [class/function/interface]
+  - Purpose: [one-line description]
+  - Key methods: method1(), method2()
+  - Dependencies: [list key dependencies]
+
+## Architecture Patterns
+- **Pattern**: [MVC/Singleton/Factory/etc] in [location]
+- **Data Flow**: [describe key data flows]
+
+## Critical Code Snippets
+```[language]
+// Only essential code that directly answers the query
+```
+
+## File References
+- Main files: [list with line numbers]
+- Configuration: [config files and settings]
+
+COMPRESSION RULES:
+- Be extremely dense - every sentence contains multiple facts
+- Preserve ALL file paths and line numbers
+- Include method signatures for key functions  
+- Remove verbose explanations and debug info
+- Maximum 2000 tokens"""
+        
+        elif tool_name == "navigate_filesystem":
+            return f"""You are compressing project structure analysis for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Main directories, entry points, configuration files
+2. IMPORTANT: Source code directories, test directories, build files
+3. SECONDARY: Documentation, assets, utilities
+4. NOISE: Hidden files, cache directories, generated files
+
+OUTPUT FORMAT (use this exact structure):
+## Project Architecture
+```
+project/
+├── src/main/           # Core application logic
+├── src/components/     # UI components  
+├── config/            # Configuration files
+└── tests/             # Test suites
+```
+
+## Key Entry Points
+- **Main**: [path to main application file]
+- **Build**: [build configuration files]
+- **Tests**: [test runner locations]
+
+## Module Organization
+- **Backend**: [backend directories and purposes]
+- **Frontend**: [frontend directories and purposes]  
+- **Shared**: [shared utilities and libraries]
+
+## Configuration
+- **Environment**: [env files, config locations]
+- **Dependencies**: [package.json, requirements.txt, etc]
+
+COMPRESSION RULES:
+- Focus on architectural significance
+- Show directory hierarchy with purposes
+- Identify main code vs config vs tests
+- Note build and deployment files
+- Maximum 1000 tokens"""
+        
+        else:
+            # Default compression prompt for any other tools
+            return f"""You are compressing technical tool output for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Direct answers to the query, key findings, file paths
+2. IMPORTANT: Supporting details, relationships, technical specs
+3. SECONDARY: Background information, context
+4. NOISE: Verbose descriptions, debug output, duplicates
+
+OUTPUT FORMAT (use structured Markdown):
+## Key Findings
+- [Most important discoveries]
+
+## Technical Details
+- [Relevant specifications, configurations, etc]
+
+## File References
+- [Important file paths and locations]
+
+## Additional Context
+- [Supporting information that helps answer the query]
+
+COMPRESSION RULES:
+- Prioritize information that directly answers the user's query
+- Preserve all file paths and technical identifiers
+- Remove verbose explanations and redundant information
+- Structure for easy scanning and comprehension
+- Maximum 2000 tokens"""
+    
+    def _fallback_summarization(self, content: str, user_query: str, tool_name: str) -> str:
+        """
+        REQ-CTX-FALLBACK: Fallback summarization when LLM summarization fails
+        
+        Args:
+            content: Content to summarize
+            user_query: Original user query
+            tool_name: Tool that generated content
+            
+        Returns:
+            Basic structured truncation with key information preserved
+        """
+        try:
+            # Extract key sections intelligently
+            lines = content.split('\n')
+            
+            # Preserve key patterns (file paths, class names, function definitions)
+            important_lines = []
+            for line in lines:
+                # Keep lines with file paths, class definitions, function definitions, errors
+                if any(pattern in line.lower() for pattern in [
+                    'file_path', 'class ', 'def ', 'function ', 'error', 'exception',
+                    '.py:', '.js:', '.ts:', '.java:', 'line ', 'extends', 'implements'
+                ]):
+                    important_lines.append(line)
+            
+            # Build fallback summary
+            fallback_summary = f"""# Summarization Fallback for {tool_name}
+
+**Query**: {user_query}
+**Note**: LLM summarization failed, showing key extracted information
+
+## Key Information Found:
+"""
+            
+            # Add important lines (truncated to fit)
+            char_budget = 10000  # Conservative limit for fallback
+            current_chars = len(fallback_summary)
+            
+            for line in important_lines:
+                if current_chars + len(line) + 2 > char_budget:
+                    break
+                fallback_summary += f"- {line.strip()}\n"
+                current_chars += len(line) + 3
+            
+            fallback_summary += f"\n[FALLBACK SUMMARIZATION - LLM COMPRESSION FAILED]"
+            
+            logger.info(f"🔧 Applied fallback summarization: {len(content)} → {len(fallback_summary)} chars")
+            return fallback_summary
+            
+        except Exception as e:
+            logger.error(f"❌ Even fallback summarization failed: {e}")
+            # Last resort: simple truncation
+            return f"# Error in summarization\n\nQuery: {user_query}\nTool: {tool_name}\n\n" + content[:8000] + "\n\n[TRUNCATED]"
+    
+    def _extract_user_query(self, messages: List[Dict]) -> str:
+        """
+        Extract the user's original query from the message history
+        
+        Args:
+            messages: Message history from the conversation
+            
+        Returns:
+            The user's query string, or fallback if not found
+        """
+        try:
+            # Find the first user message (skip system messages)
+            for message in messages:
+                if message.get("role") == "user":
+                    content = message.get("content", "")
+                    if content and len(content.strip()) > 0:
+                        return content.strip()
+            
+            # Fallback if no user message found
+            return "architecture analysis query"
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract user query: {e}")
+            return "code analysis query"
+    
+    # REQ-CTX-MONITORING: Context Usage Analytics Implementation
+    def _log_context_usage(self, messages: List[Dict]) -> None:
+        """
+        REQ-CTX-MONITORING: Log comprehensive context usage analytics
+        
+        Args:
+            messages: Current message history to analyze
+        """
+        try:
+            # Calculate total context size
+            total_chars = 0
+            total_tokens_estimate = 0
+            message_breakdown = {
+                "system": 0,
+                "user": 0, 
+                "assistant": 0,
+                "tool": 0
+            }
+            tool_usage = {}
+            
+            for message in messages:
+                role = message.get("role", "unknown")
+                content = str(message.get("content", ""))
+                char_count = len(content)
+                token_estimate = char_count // 4  # Rough estimate: 4 chars per token
+                
+                total_chars += char_count
+                total_tokens_estimate += token_estimate
+                
+                if role in message_breakdown:
+                    message_breakdown[role] += token_estimate
+                
+                # Track tool usage
+                if role == "tool" and "tool_call_id" in message:
+                    # Try to identify tool type from content
+                    if "query_codebase" in content:
+                        tool_usage["query_codebase"] = tool_usage.get("query_codebase", 0) + 1
+                    elif "navigate_filesystem" in content:
+                        tool_usage["navigate_filesystem"] = tool_usage.get("navigate_filesystem", 0) + 1
+                    else:
+                        tool_usage["other"] = tool_usage.get("other", 0) + 1
+            
+            # Context limits (Cerebras specific)
+            CONTEXT_LIMIT_TOKENS = 65536
+            context_utilization = (total_tokens_estimate / CONTEXT_LIMIT_TOKENS) * 100
+            
+            # REQ-CTX-MONITORING: Log metrics at INFO level for operational visibility
+            logger.info(f"📊 Context usage: {total_tokens_estimate:,}/{CONTEXT_LIMIT_TOKENS:,} tokens "
+                       f"({context_utilization:.1f}% utilization)")
+            
+            # Log breakdown
+            logger.info(f"📈 Message breakdown: system={message_breakdown['system']}, "
+                       f"user={message_breakdown['user']}, assistant={message_breakdown['assistant']}, "
+                       f"tool={message_breakdown['tool']} tokens")
+            
+            # Log tool usage if any tools were used
+            if tool_usage:
+                tool_summary = ", ".join([f"{tool}={count}" for tool, count in tool_usage.items()])
+                logger.info(f"🔧 Tool usage: {tool_summary}")
+            
+            # Warning at 75% capacity
+            if context_utilization > 75:
+                logger.warning(f"⚠️ Context usage approaching limit: {context_utilization:.1f}% utilized")
+            
+            # Critical warning at 90% capacity  
+            if context_utilization > 90:
+                logger.warning(f"🚨 Context usage critical: {context_utilization:.1f}% - compression strongly recommended")
+                
+        except Exception as e:
+            logger.warning(f"Failed to log context usage: {e}")
+    
+    def _estimate_token_count(self, text: str) -> int:
+        """
+        REQ-CTX-MONITORING: Estimate token count for text
+        
+        Args:
+            text: Text to estimate tokens for
+            
+        Returns:
+            Estimated token count (rough approximation)
+        """
+        # Rough estimation: 4 characters per token on average
+        # This is a conservative estimate for most English text
+        char_count = len(text)
+        token_estimate = char_count // 4
+        
+        # Add slight buffer for tokenization overhead
+        return int(token_estimate * 1.1)
+    
+    def _check_context_health(self, messages: List[Dict]) -> Dict[str, Any]:
+        """
+        REQ-CTX-MONITORING: Comprehensive context health assessment
+        
+        Args:
+            messages: Message history to analyze
+            
+        Returns:
+            Dictionary with context health metrics
+        """
+        try:
+            total_tokens = sum(self._estimate_token_count(str(msg.get("content", ""))) for msg in messages)
+            utilization = (total_tokens / 65536) * 100
+            
+            # Count summarization events
+            summarization_count = 0
+            for message in messages:
+                content = str(message.get("content", ""))
+                if "[SUMMARIZED FROM" in content or "COMPRESSION APPLIED" in content:
+                    summarization_count += 1
+            
+            # Count tool calls
+            tool_calls = len([msg for msg in messages if msg.get("role") == "tool"])
+            
+            return {
+                "total_tokens": total_tokens,
+                "utilization_percent": utilization,
+                "context_health": "healthy" if utilization < 75 else "warning" if utilization < 90 else "critical",
+                "summarization_events": summarization_count,
+                "tool_calls": tool_calls,
+                "message_count": len(messages),
+                "efficiency_score": 100 - utilization if utilization < 100 else 0
+            }
+            
+        except Exception as e:
+            logger.warning(f"Failed to check context health: {e}")
+            return {"error": str(e)}
+    
+    # REQ-CTX-FALLBACK: Graceful Degradation Implementation
+    async def _apply_graceful_degradation(self, messages: List[Dict], context_health: Dict[str, Any]) -> str:
+        """
+        REQ-CTX-FALLBACK: Apply four-tier graceful degradation strategy
+        
+        Args:
+            messages: Current message history
+            context_health: Context health metrics
+            
+        Returns:
+            Response using appropriate fallback strategy
+        """
+        try:
+            utilization = context_health.get("utilization_percent", 0)
+            logger.info(f"🔧 Applying graceful degradation for {utilization:.1f}% context utilization")
+            
+            # Tier 2: Progressive context trimming (90-95% utilization)
+            if utilization < 95:
+                logger.info("📝 Tier 2: Progressive context trimming")
+                trimmed_messages = await self._progressive_context_trimming(messages)
+                
+                # Try to continue with trimmed context
+                if len(trimmed_messages) < len(messages):
+                    logger.info(f"✅ Context trimmed: {len(messages)} → {len(trimmed_messages)} messages")
+                    return await self._sdk_native_loop(trimmed_messages, self._get_current_model())
+            
+            # Tier 3: Multi-turn synthesis (95-98% utilization)
+            elif utilization < 98:
+                logger.info("📝 Tier 3: Multi-turn synthesis")
+                return await self._multi_turn_synthesis(messages)
+            
+            # Tier 4: Partial response with explanation (98%+ utilization)
+            else:
+                logger.info("📝 Tier 4: Partial response with explanation")
+                return self._partial_response_with_explanation(messages, context_health)
+                
+        except Exception as e:
+            logger.error(f"❌ Graceful degradation failed: {e}")
+            return self._emergency_fallback(messages)
+    
+    async def _progressive_context_trimming(self, messages: List[Dict]) -> List[Dict]:
+        """
+        REQ-CTX-FALLBACK: Tier 2 - Remove oldest tool responses, preserve key context
+        
+        Args:
+            messages: Original message history
+            
+        Returns:
+            Trimmed message history with preserved essential context
+        """
+        try:
+            # Always preserve: system prompt + user query + last 2 tool responses
+            trimmed = []
+            tool_responses = []
+            
+            for message in messages:
+                role = message.get("role")
+                
+                if role == "system":
+                    # Always keep system prompt
+                    trimmed.append(message)
+                elif role == "user":
+                    # Always keep user messages
+                    trimmed.append(message)
+                elif role == "assistant":
+                    # Keep assistant messages (reasoning)
+                    trimmed.append(message)
+                elif role == "tool":
+                    # Collect tool responses for selective keeping
+                    tool_responses.append(message)
+            
+            # Keep only last 2 tool responses (most recent context)
+            if tool_responses:
+                recent_tools = tool_responses[-2:]
+                trimmed.extend(recent_tools)
+                logger.info(f"🔧 Kept {len(recent_tools)}/{len(tool_responses)} tool responses")
+            
+            return trimmed
+            
+        except Exception as e:
+            logger.error(f"❌ Progressive trimming failed: {e}")
+            return messages  # Return original if trimming fails
+    
+    async def _multi_turn_synthesis(self, messages: List[Dict]) -> str:
+        """
+        REQ-CTX-FALLBACK: Tier 3 - Synthesize current findings, start fresh
+        
+        Args:
+            messages: Current message history
+            
+        Returns:
+            Synthesized response from current context
+        """
+        try:
+            logger.info("🔧 Starting multi-turn synthesis")
+            
+            # Extract key findings from current context
+            user_query = self._extract_user_query(messages)
+            tool_findings = []
+            
+            for message in messages:
+                if message.get("role") == "tool":
+                    content = str(message.get("content", ""))
+                    if content and len(content.strip()) > 0:
+                        # Summarize each tool finding
+                        summary = await self._synthesize_tool_finding(content, user_query)
+                        tool_findings.append(summary)
+            
+            # Create synthesis prompt
+            synthesis_prompt = f"""Based on the research I've conducted for: "{user_query}"
+
+Key findings from analysis:
+{chr(10).join(f"- {finding}" for finding in tool_findings)}
+
+Please provide a comprehensive response that synthesizes these findings into a complete answer."""
+            
+            # Make isolated synthesis call
+            synthesis_messages = [{"role": "user", "content": synthesis_prompt}]
+            
+            completion_config = cerebras_config.get_completion_config()
+            api_params = {
+                **completion_config,
+                "messages": synthesis_messages,
+                "max_tokens": 3000
+            }
+            
+            response = self.client.chat.completions.create(**api_params)
+            synthesis_result = response.choices[0].message.content
+            
+            logger.info("✅ Multi-turn synthesis completed successfully")
+            return synthesis_result
+            
+        except Exception as e:
+            logger.error(f"❌ Multi-turn synthesis failed: {e}")
+            return self._partial_response_with_explanation(messages, {"error": str(e)})
+    
+    async def _synthesize_tool_finding(self, tool_content: str, user_query: str) -> str:
+        """
+        REQ-CTX-FALLBACK: Synthesize a single tool finding into key insight
+        
+        Args:
+            tool_content: Content from a tool response
+            user_query: Original user query
+            
+        Returns:
+            Brief synthesis of the tool finding
+        """
+        try:
+            # Quick synthesis for multi-turn - just extract key points
+            lines = tool_content.split('\n')
+            key_lines = []
+            
+            for line in lines:
+                line = line.strip()
+                if line and any(keyword in line.lower() for keyword in [
+                    'key', 'important', 'main', 'primary', 'essential', 'component', 'pattern'
+                ]):
+                    key_lines.append(line)
+                    if len(key_lines) >= 3:  # Limit for synthesis
+                        break
+            
+            if key_lines:
+                return f"Analysis found: {'; '.join(key_lines[:3])}"
+            else:
+                # Fallback: first non-empty line
+                for line in lines:
+                    if line.strip() and len(line.strip()) > 10:
+                        return f"Analysis found: {line.strip()[:100]}..."
+                
+                return "Analysis completed with technical findings"
+                
+        except Exception as e:
+            logger.warning(f"Failed to synthesize tool finding: {e}")
+            return "Analysis completed with mixed results"
+    
+    def _partial_response_with_explanation(self, messages: List[Dict], context_health: Dict[str, Any]) -> str:
+        """
+        REQ-CTX-FALLBACK: Tier 4 - Return best available analysis with clear limitations
+        
+        Args:
+            messages: Message history
+            context_health: Context health metrics
+            
+        Returns:
+            Partial response with explanation of limitations
+        """
+        try:
+            user_query = self._extract_user_query(messages)
+            
+            # Extract key findings from available context
+            findings = []
+            tool_count = 0
+            
+            for message in messages:
+                if message.get("role") == "tool":
+                    tool_count += 1
+                    content = str(message.get("content", ""))
+                    
+                    # Extract first meaningful line
+                    lines = content.split('\n')
+                    for line in lines:
+                        if line.strip() and len(line.strip()) > 20:
+                            findings.append(line.strip()[:150] + "...")
+                            break
+            
+            utilization = context_health.get("utilization_percent", 0)
+            
+            return f"""I've analyzed your query: "{user_query}"
+
+## Analysis Results Found:
+{chr(10).join(f"• {finding}" for finding in findings[:5])}
+
+## Context Limitation Notice:
+Due to the complexity of your query, I've reached the context processing limit ({utilization:.1f}% of available context). This response contains the key findings from {tool_count} analysis operations that were completed successfully.
+
+## Suggestions:
+- For deeper analysis, consider breaking your query into smaller, more specific questions
+- Focus on particular aspects of the architecture you're most interested in
+- Ask follow-up questions about specific components mentioned above
+
+The analysis above represents the most important findings I was able to gather before reaching processing limits."""
+            
+        except Exception as e:
+            logger.error(f"❌ Partial response generation failed: {e}")
+            return self._emergency_fallback(messages)
+    
+    def _emergency_fallback(self, messages: List[Dict]) -> str:
+        """
+        REQ-CTX-FALLBACK: Final emergency fallback when all else fails
+        
+        Args:
+            messages: Message history
+            
+        Returns:
+            Basic response acknowledging the query
+        """
+        try:
+            user_query = self._extract_user_query(messages)
+            return f"""I understand you're asking about: "{user_query}"
+
+I encountered technical limitations while processing your request due to context constraints. However, I successfully initiated the analysis and gathered preliminary information.
+
+To help you better, please consider:
+1. Breaking your question into smaller, more specific parts
+2. Focusing on particular aspects of what you're trying to understand
+3. Asking about specific files, classes, or components
+
+I'm ready to help with a more focused query whenever you're ready."""
+            
+        except Exception as e:
+            logger.error(f"❌ Even emergency fallback failed: {e}")
+            return "I encountered technical difficulties processing your request. Please try rephrasing your question or breaking it into smaller parts."
+    
+    def _get_current_model(self) -> str:
+        """Helper to get the current model being used"""
+        try:
+            return cerebras_config.model
+        except:
+            return "gpt-oss-120b"  # Default fallback
     
     def _get_native_system_prompt(self) -> str:
         """
