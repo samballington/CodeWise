@@ -75,40 +75,66 @@ class MermaidRenderer:
             return self._generate_error_diagram(f"Rendering failed: {str(e)}")
     
     def _render_class_diagram(self, nodes: List[Dict], edges: List[Dict], style_defs: str) -> str:
-        """Render class diagram from structured data"""
+        """
+        Render STRICTLY VALID class diagram from structured data.
+        Fixes all syntax issues identified in the analysis.
+        """
         lines = ["classDiagram"]
         
         if style_defs:
             lines.append(f"    {style_defs}")
         
-        # Add classes
+        # FIX 1: Define all classes first to ensure they exist before relationships
+        all_class_names = {self._sanitize_id(node['id']) for node in nodes}
+        for edge in edges:
+            target = self._sanitize_id(edge['target'])
+            # Only add target if it's not "(none)" or invalid
+            if target.lower() != 'none' and target != '':
+                all_class_names.add(target)
+        
+        # Define all classes first
+        for class_name in sorted(list(all_class_names)):
+            lines.append(f"    class {class_name}")
+        
+        # FIX 2: Apply stereotypes and members correctly
         for node in nodes:
             class_name = self._sanitize_id(node['id'])
+            semantic_role = node.get('semantic_role', '')
+            
+            # FIX: Correct stereotype syntax - stereotype goes BEFORE class name
+            if semantic_role:
+                stereotype = self._infer_stereotype_from_role(semantic_role)
+                if stereotype:
+                    lines.append(f"    <<{stereotype}>> {class_name}")
+            
+            # Add methods/attributes if they exist
             methods = node.get('methods', [])
             attributes = node.get('attributes', [])
             
-            lines.append(f"    class {class_name} {{")
+            if attributes:
+                for attr in attributes[:3]:  # Limit to avoid clutter
+                    lines.append(f"    {class_name} : +{attr}")
             
-            # Add attributes
-            for attr in attributes:
-                lines.append(f"        {attr}")
+            if methods:
+                for method in methods[:5]:  # Limit to avoid clutter
+                    method_name = method.get('name', method) if isinstance(method, dict) else method
+                    lines.append(f"    {class_name} : +{method_name}()")
             
-            # Add methods
-            for method in methods:
-                lines.append(f"        {method}")
-            
-            lines.append("    }")
-            
-            # Apply styling
-            semantic_role = node.get('semantic_role', 'logic')
+            # Apply semantic role styling
             lines.append(f"    class {class_name} {semantic_role}Style")
         
-        # Add relationships
+        # FIX 3: Render relationships correctly, skip invalid targets
         for edge in edges:
-            relationship_type = edge.get('type', '-->')
             source = self._sanitize_id(edge['source'])
             target = self._sanitize_id(edge['target'])
+            label = edge.get('label', '')
+            relationship_type = edge.get('type', 'uses')
             
+            # Skip invalid edges
+            if target.lower() in ['none', '(none)', '', 'null']:
+                continue
+            
+            # Use correct relationship syntax
             if relationship_type == 'inherits':
                 lines.append(f"    {target} <|-- {source}")
             elif relationship_type == 'implements':
@@ -118,9 +144,25 @@ class MermaidRenderer:
             elif relationship_type == 'aggregation':
                 lines.append(f"    {source} o-- {target}")
             else:
-                lines.append(f"    {source} --> {target}")
+                # For "uses" and other associations
+                if label:
+                    lines.append(f"    {source} --> {target} : {label}")
+                else:
+                    lines.append(f"    {source} --> {target}")
         
         return "\n".join(lines)
+    
+    def _infer_stereotype_from_role(self, semantic_role: str) -> str:
+        """Convert semantic role to appropriate stereotype"""
+        role_to_stereotype = {
+            'controller': 'Controller',
+            'service': 'Service', 
+            'model': 'Entity',
+            'interface': 'Interface',
+            'logic': 'Component',
+            'external': 'External'
+        }
+        return role_to_stereotype.get(semantic_role.lower(), '')
     
     def _render_graph_diagram(self, diagram_type: str, nodes: List[Dict], edges: List[Dict], style_defs: str) -> str:
         """Render graph diagram from structured data"""

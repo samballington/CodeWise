@@ -20,8 +20,8 @@ from services import run_startup_kg_population
 import time
 import logging
 
-# Load environment variables
-load_dotenv()
+# Load environment variables with override to pick up changes
+load_dotenv(override=True)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

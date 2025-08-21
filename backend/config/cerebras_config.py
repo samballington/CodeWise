@@ -26,17 +26,18 @@ class CerebrasConfig:
         self._validate_config()
         
     def _get_api_key(self) -> Optional[str]:
-        """Secure API key retrieval with fallback methods"""
-        # Priority order: environment variable, .env file, config file
-        api_key = os.getenv("CEREBRAS_API_KEY")
+        """Secure API key retrieval with explicit .env file loading"""
+        # Always try to load from .env file first for consistency
+        try:
+            from dotenv import load_dotenv
+            # Force reload .env file on every initialization
+            load_dotenv(override=True)
+            logger.debug("🔄 Reloaded .env file for fresh configuration")
+        except ImportError:
+            logger.warning("python-dotenv not available, using direct env vars only")
         
-        if not api_key:
-            try:
-                from dotenv import load_dotenv
-                load_dotenv()
-                api_key = os.getenv("CEREBRAS_API_KEY")
-            except ImportError:
-                logger.warning("python-dotenv not available, using direct env vars only")
+        # Get API key from environment (should be loaded from .env)
+        api_key = os.getenv("CEREBRAS_API_KEY")
         
         if not api_key:
             logger.error("CEREBRAS_API_KEY not found in environment")
@@ -95,7 +96,8 @@ class CerebrasConfig:
         """Check if a model supports reasoning_effort parameter"""
         # Registry of models that support reasoning_effort
         reasoning_supported_models = {
-            "gpt-oss-120b"
+            "gpt-oss-120b",
+            "qwen-3-235b-a22b-thinking-2507"  # Qwen-3 thinking model supports reasoning effort
         }
         return model_name in reasoning_supported_models
 
