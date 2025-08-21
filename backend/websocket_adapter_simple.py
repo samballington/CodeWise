@@ -49,8 +49,9 @@ class SimpleWebSocketAdapter:
             try:
                 from cerebras_agent import get_native_agent
                 agent = get_native_agent()
-                response = await agent.process_query(user_query)
-                logger.info("✅ Used real Cerebras SDK agent")
+                # Pass the selected model to the agent
+                response = await agent.process_query(user_query, selected_model=selected_model)
+                logger.info(f"✅ Used real Cerebras SDK agent with model: {selected_model}")
             except Exception as e:
                 logger.warning(f"⚠️ SDK agent failed, using fallback: {e}")
                 response = f"""I'm running with the Cerebras SDK integration, but encountered an issue with the full SDK agent.

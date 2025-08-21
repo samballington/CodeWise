@@ -89,28 +89,232 @@ async def query_codebase_pure(query: str,
         }
 
 async def _execute_kg_search(query: str, filters: Optional[Dict]) -> tuple[List[Dict], str]:
-    """Pure KG search execution"""
+    """
+    Pure Knowledge Graph search execution using graph traversal and relationship analysis.
+    
+    This implements proper KG search patterns:
+    1. Semantic term extraction from natural language
+    2. Multi-type node discovery with relationship mapping
+    3. Structural hierarchy construction from edges
+    4. Context-aware result enrichment
+    """
     try:
-        # Try to import and use KG
         from storage.database_manager import DatabaseManager
         db = DatabaseManager()
+        cursor = db.connection.cursor()
         
-        # Simple KG query without custom logic
-        results = []
-        nodes = db.get_nodes_by_type("function")  # Basic search
-        for node in nodes[:10]:  # Limit results
-            if query.lower() in node.get("name", "").lower():
-                results.append({
-                    "type": "kg_node",
-                    "data": node,
-                    "source": "knowledge_graph"
-                })
+        # Extract search terms from natural language query
+        query_terms = _extract_semantic_terms(query)
         
-        return results, "kg_direct"
+        # Execute multi-phase KG search
+        nodes = _discover_relevant_nodes(cursor, query_terms, filters)
+        relationships = _discover_relationships(cursor, nodes)
+        enriched_results = _build_structural_context(nodes, relationships)
+        
+        return enriched_results[:50], "kg_direct"
         
     except Exception as e:
         logger.warning(f"KG search failed: {e}")
         return [], "kg_fallback"
+
+def _extract_semantic_terms(query: str) -> Dict[str, List[str]]:
+    """Extract meaningful terms from natural language query"""
+    query_lower = query.lower()
+    
+    # Entity type indicators
+    type_indicators = {
+        'class': ['class', 'classes', 'object', 'entity', 'model'],
+        'function': ['function', 'method', 'operation', 'procedure'],
+        'variable': ['variable', 'field', 'property', 'attribute'],
+        'interface': ['interface', 'contract', 'protocol']
+    }
+    
+    # Relationship indicators  
+    relationship_indicators = {
+        'hierarchy': ['hierarchy', 'inheritance', 'extends', 'inherits', 'parent', 'child'],
+        'dependency': ['depends', 'uses', 'calls', 'imports', 'requires'],
+        'composition': ['contains', 'has', 'owns', 'composed'],
+        'association': ['relates', 'connects', 'links', 'associated']
+    }
+    
+    # Structure indicators
+    structure_indicators = {
+        'diagram': ['diagram', 'chart', 'visualization', 'graph'],
+        'overview': ['overview', 'summary', 'structure', 'architecture'],
+        'detail': ['detail', 'implementation', 'code', 'specific']
+    }
+    
+    # Extract domain terms (anything not a stop word)
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'show', 'get', 'find', 'list'}
+    words = query_lower.split()
+    domain_terms = [w for w in words if len(w) > 2 and w not in stop_words]
+    
+    return {
+        'types': [t for t, indicators in type_indicators.items() if any(ind in query_lower for ind in indicators)],
+        'relationships': [r for r, indicators in relationship_indicators.items() if any(ind in query_lower for ind in indicators)],
+        'structure': [s for s, indicators in structure_indicators.items() if any(ind in query_lower for ind in indicators)],
+        'domain': domain_terms
+    }
+
+def _discover_relevant_nodes(cursor, terms: Dict, filters: Optional[Dict]) -> List[Dict]:
+    """Discover nodes using semantic term matching across multiple dimensions"""
+    
+    # Build base query with proper node selection
+    base_query = """
+        SELECT DISTINCT id, type, name, file_path, line_start, line_end, signature, docstring
+        FROM nodes 
+        WHERE 1=1
+    """
+    params = []
+    conditions = []
+    
+    # Apply type filters from semantic analysis
+    if terms['types']:
+        type_placeholders = ','.join(['?' for _ in terms['types']])
+        conditions.append(f"type IN ({type_placeholders})")
+        params.extend(terms['types'])
+    
+    # Apply domain term matching across name, file_path, and signature
+    if terms['domain']:
+        domain_conditions = []
+        for term in terms['domain']:
+            domain_conditions.append("(name LIKE ? OR file_path LIKE ? OR signature LIKE ?)")
+            pattern = f"%{term}%"
+            params.extend([pattern, pattern, pattern])
+        
+        if domain_conditions:
+            conditions.append(f"({' OR '.join(domain_conditions)})")
+    
+    # Apply user-provided filters
+    if filters:
+        if filters.get('file_type'):
+            conditions.append("file_path LIKE ?")
+            params.append(f"%{filters['file_type']}")
+        if filters.get('directory'):
+            conditions.append("file_path LIKE ?") 
+            params.append(f"%{filters['directory']}%")
+        if filters.get('symbol_type'):
+            conditions.append("type = ?")
+            params.append(filters['symbol_type'])
+    
+    # Construct final query
+    if conditions:
+        query = base_query + " AND " + " AND ".join(conditions)
+    else:
+        query = base_query + " LIMIT 100"  # Fallback: get top nodes
+    
+    query += " ORDER BY type, name LIMIT 100"
+    
+    # Execute and format results
+    rows = cursor.execute(query, params).fetchall()
+    
+    nodes = []
+    for row in rows:
+        node_id, node_type, name, file_path, line_start, line_end, signature, docstring = row
+        nodes.append({
+            'id': node_id,
+            'type': node_type,
+            'name': name,
+            'file_path': file_path,
+            'line_start': line_start,
+            'line_end': line_end,
+            'signature': signature,
+            'docstring': docstring
+        })
+    
+    return nodes
+
+def _discover_relationships(cursor, nodes: List[Dict]) -> List[Dict]:
+    """Discover relationships between nodes using edges table"""
+    if not nodes:
+        return []
+    
+    # Get node IDs for relationship lookup
+    node_ids = [node['id'] for node in nodes]
+    
+    # Query edges table for relationships between discovered nodes
+    if len(node_ids) > 0:
+        placeholders = ','.join(['?' for _ in node_ids])
+        edges_query = f"""
+            SELECT source_id, target_id, type, properties
+            FROM edges 
+            WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+        """
+        params = node_ids + node_ids  # For both source and target lookups
+        
+        try:
+            edges = cursor.execute(edges_query, params).fetchall()
+            
+            relationships = []
+            for edge in edges:
+                source_id, target_id, rel_type, properties = edge
+                relationships.append({
+                    'source_id': source_id,
+                    'target_id': target_id,
+                    'type': rel_type,
+                    'properties': properties
+                })
+            
+            return relationships
+        except Exception as e:
+            logger.warning(f"Edge discovery failed: {e}")
+            return []
+    
+    return []
+
+def _build_structural_context(nodes: List[Dict], relationships: List[Dict]) -> List[Dict]:
+    """Build rich structural context by combining nodes with their relationships"""
+    
+    # Create node lookup for fast access
+    node_lookup = {node['id']: node for node in nodes}
+    
+    # Group relationships by source node
+    relationships_by_source = {}
+    relationships_by_target = {}
+    
+    for rel in relationships:
+        source_id = rel['source_id']
+        target_id = rel['target_id']
+        
+        if source_id not in relationships_by_source:
+            relationships_by_source[source_id] = []
+        relationships_by_source[source_id].append(rel)
+        
+        if target_id not in relationships_by_target:
+            relationships_by_target[target_id] = []
+        relationships_by_target[target_id].append(rel)
+    
+    # Enrich each node with its relationship context
+    enriched_results = []
+    
+    for node in nodes:
+        node_id = node['id']
+        
+        # Build enhanced node representation
+        enhanced_node = {
+            'type': 'kg_structural_node',
+            'node_data': node,
+            'outgoing_relationships': relationships_by_source.get(node_id, []),
+            'incoming_relationships': relationships_by_target.get(node_id, []),
+            'connected_nodes': [],
+            'source': 'knowledge_graph'
+        }
+        
+        # Add connected node information
+        connected_ids = set()
+        for rel in enhanced_node['outgoing_relationships']:
+            connected_ids.add(rel['target_id'])
+        for rel in enhanced_node['incoming_relationships']:
+            connected_ids.add(rel['source_id'])
+        
+        # Lookup connected node details
+        for connected_id in connected_ids:
+            if connected_id in node_lookup:
+                enhanced_node['connected_nodes'].append(node_lookup[connected_id])
+        
+        enriched_results.append(enhanced_node)
+    
+    return enriched_results
 
 async def _execute_semantic_search(query: str, filters: Optional[Dict]) -> tuple[List[Dict], str]:
     """Pure semantic search execution"""
