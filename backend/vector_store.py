@@ -450,7 +450,7 @@ class VectorStore:
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
     
-    async def similarity_search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+    async def similarity_search(self, query: str, k: int = 10, filters: Optional[Dict] = None) -> List[Dict[str, Any]]:
         """
         Compatibility method for similarity search.
         
@@ -465,8 +465,14 @@ class VectorStore:
             List of dictionaries with search results
         """
         try:
+            # Extract project filter if provided
+            allowed_projects = None
+            if filters and 'project' in filters:
+                allowed_projects = [filters['project']]
+                logger.info(f"🎯 Vector search filtering to project: {filters['project']}")
+            
             # Use existing query method with scores enabled
-            raw_results = self.query(query, k=k, return_scores=True)
+            raw_results = self.query(query, k=k, return_scores=True, allowed_projects=allowed_projects)
             
             # Convert to expected format for unified_query_pure
             formatted_results = []

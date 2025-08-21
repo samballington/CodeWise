@@ -16,7 +16,8 @@ FILESYSTEM_TOOL_SCHEMA = [
                 "Your primary tool for listing files, finding files, and exploring the project's "
                 "directory structure. Use this for any questions about file locations, directory "
                 "contents, or project organization. This tool queries the Knowledge Graph for "
-                "instant, accurate results."
+                "instant, accurate results. IMPORTANT: Always check if a path exists before "
+                "exploring subdirectories. Use 'find' with patterns instead of guessing paths."
             ),
             "parameters": {
                 "type": "object",
