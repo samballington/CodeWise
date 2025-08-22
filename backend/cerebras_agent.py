@@ -455,17 +455,16 @@ class CerebrasNativeAgent:
                     logger.info("🎨 Auto-generating diagram from structural data...")
                     
                     # Step 3: Transform KG data to standard graph format
-                    graph_data = self._transform_kg_to_graph_data(result.get("results", []), query)
+                    graph_data = await self._transform_kg_to_graph_data(result.get("results", []), query)
                     
                     # Step 4: Determine diagram type from query
                     diagram_type = self._infer_diagram_type(query)
                     
                     # Step 5: Generate Mermaid diagram
-                    mermaid_code = self.mermaid_renderer.render_diagram(
+                    mermaid_code = self.mermaid_renderer.generate(
                         diagram_type=diagram_type,
-                        data=graph_data,
-                        title=f"Diagram: {query}",
-                        theme="default"
+                        graph_data=graph_data,
+                        theme_name="dark_professional"
                     )
                     
                     # Add diagram to response
@@ -519,7 +518,7 @@ class CerebrasNativeAgent:
         else:
             return "graph"  # Default fallback
     
-    def _transform_kg_to_graph_data(self, kg_results: List[Dict], query: str) -> Dict[str, Any]:
+    async def _transform_kg_to_graph_data(self, kg_results: List[Dict], query: str) -> Dict[str, Any]:
         """
         Step 3: Transform KG structural data to standard graph format
         
@@ -556,25 +555,46 @@ class CerebrasNativeAgent:
                 
                 # Extract relationships as edges
                 outgoing_rels = kg_item.get("outgoing_relationships", [])
+                incoming_rels = kg_item.get("incoming_relationships", [])
+                connected_nodes = kg_item.get("connected_nodes", [])
+                
+                # Create lookup for connected nodes
+                connected_lookup = {node.get("id"): node.get("name", "unknown") for node in connected_nodes}
+                
+                # Process outgoing relationships
                 for rel in outgoing_rels:
-                    # Find target node in connected_nodes
-                    target_id = None
-                    connected_nodes = kg_item.get("connected_nodes", [])
-                    for connected in connected_nodes:
-                        if connected.get("id") == rel.get("target_id"):
-                            target_id = connected.get("name")
-                            break
+                    target_node_id = rel.get("target_id")
+                    target_name = connected_lookup.get(target_node_id)
                     
-                    if target_id and target_id.lower() not in ['none', '(none)', '', 'null']:
+                    if target_name and target_name.lower() not in ['none', '(none)', '', 'null']:
                         edges.append({
                             "source": node_id,
-                            "target": target_id,
+                            "target": target_name,
                             "type": rel.get("type", "uses"),
                             "label": rel.get("type", "")
                         })
+                
+                # Process incoming relationships (for completeness)
+                for rel in incoming_rels:
+                    source_node_id = rel.get("source_id")
+                    source_name = connected_lookup.get(source_node_id)
+                    
+                    if source_name and source_name.lower() not in ['none', '(none)', '', 'null']:
+                        # Only add if we haven't already added this edge from the other direction
+                        edge_exists = any(
+                            e["source"] == source_name and e["target"] == node_id 
+                            for e in edges
+                        )
+                        if not edge_exists:
+                            edges.append({
+                                "source": source_name,
+                                "target": node_id,
+                                "type": rel.get("type", "uses"),
+                                "label": rel.get("type", "")
+                            })
         
-        # Infer additional relationships from file analysis
-        additional_edges = self._infer_relationships_from_files(nodes)
+        # Infer additional relationships from file analysis using universal engine
+        additional_edges = await self._infer_relationships_from_files(nodes)
         edges.extend(additional_edges)
         
         return {
@@ -669,17 +689,64 @@ class CerebrasNativeAgent:
         
         return list(set(methods)), list(set(attributes))  # Remove duplicates
     
-    def _infer_relationships_from_files(self, nodes: List[Dict]) -> List[Dict]:
+    async def _infer_relationships_from_files(self, nodes: List[Dict]) -> List[Dict]:
         """
-        Infer additional relationships by analyzing file content.
-        This goes beyond KG data to find actual usage patterns.
+        Universal relationship inference using the Universal Pattern Recognition Engine.
+        Works across all programming languages and frameworks.
+        """
+        additional_edges = []
+        
+        try:
+            from tools.universal_relationship_engine import UniversalRelationshipEngine
+            
+            # Initialize universal relationship engine
+            relationship_engine = UniversalRelationshipEngine()
+            
+            # Convert nodes to components format for universal engine
+            components = []
+            for node in nodes:
+                components.append({
+                    'node_data': node,
+                    'type': 'kg_structural_node',
+                    'source': 'knowledge_graph'
+                })
+            
+            # Infer relationships using universal engine
+            detected_relationships = await relationship_engine.infer_relationships_from_components(
+                components, query_context="diagram generation")
+            
+            # Convert to diagram edge format
+            for rel in detected_relationships:
+                additional_edges.append({
+                    "source": rel.source_component,
+                    "target": rel.target_component,
+                    "type": rel.relationship_type.value,
+                    "label": relationship_engine._get_relationship_label(rel.relationship_type),
+                    "confidence": rel.confidence,
+                    "evidence": rel.evidence,
+                    "language": rel.source_language
+                })
+            
+            logger.info(f"🔗 Universal relationship engine found {len(additional_edges)} relationships")
+            
+        except Exception as e:
+            logger.warning(f"Universal relationship inference failed, falling back to basic analysis: {e}")
+            # Fallback to basic file analysis if universal engine fails
+            additional_edges = await self._basic_file_analysis_fallback(nodes)
+        
+        return additional_edges
+    
+    async def _basic_file_analysis_fallback(self, nodes: List[Dict]) -> List[Dict]:
+        """
+        Basic fallback file analysis when universal engine is not available.
+        This provides minimal relationship detection for backward compatibility.
         """
         additional_edges = []
         
         try:
             for node in nodes:
                 file_path = node.get("file_path", "")
-                if not file_path or not file_path.startswith("/workspace"):
+                if not file_path:
                     continue
                 
                 from pathlib import Path
@@ -688,7 +755,7 @@ class CerebrasNativeAgent:
                 if actual_file.exists():
                     content = actual_file.read_text(encoding='utf-8', errors='ignore')
                     
-                    # Look for service dependencies in controllers
+                    # Basic pattern detection for common frameworks
                     if "controller" in file_path.lower():
                         service_deps = self._find_service_dependencies(content, nodes)
                         for dep in service_deps:
@@ -700,7 +767,7 @@ class CerebrasNativeAgent:
                             })
                             
         except Exception as e:
-            logger.debug(f"Could not infer relationships from files: {e}")
+            logger.debug(f"Basic file analysis fallback failed: {e}")
         
         return additional_edges
     
@@ -795,11 +862,10 @@ class CerebrasNativeAgent:
                 data = structural_data
             
             # Use our Phase 2 pure renderer
-            mermaid_code = self.mermaid_renderer.render_diagram(
+            mermaid_code = self.mermaid_renderer.generate(
                 diagram_type=diagram_type,
-                data=data,
-                title=title,
-                theme=theme
+                graph_data=data,
+                theme_name=theme or "dark_professional"
             )
             
             response = {

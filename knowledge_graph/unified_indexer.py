@@ -133,7 +133,7 @@ class UnifiedIndexer:
         logger.info(f"Unified indexer initialized with database: {db_path}")
         logger.info(f"BGE model: {vector_model}")
     
-    def index_codebase(self, codebase_path: Path, 
+    async def index_codebase(self, codebase_path: Path, 
                       force_reindex: bool = False,
                       file_patterns: List[str] = None) -> IndexingResult:
         """
@@ -197,11 +197,9 @@ class UnifiedIndexer:
             logger.info(f"  Files processed: {symbol_stats['files_processed']}")
             logger.info(f"  Symbols discovered: {symbol_stats['symbols_discovered']}")
             
-            # PASS 2: Relationship Extraction (populates edges table)
-            logger.info("=== PASS 2: Relationship Extraction ===")
-            self.relationship_extractor = RelationshipExtractor(self.db_manager, symbol_table)
-            self.relationship_extractor.extract_relationships(file_paths)
-            relationship_stats = self.relationship_extractor.get_extraction_statistics()
+            # PASS 2: Universal Relationship Extraction (populates edges table)
+            logger.info("=== PASS 2: Universal Relationship Extraction ===")
+            relationship_stats = await self._extract_universal_relationships(file_paths, symbol_table)
             
             logger.info(f"Relationship extraction completed:")
             logger.info(f"  Files processed: {relationship_stats['files_processed']}")
@@ -551,6 +549,164 @@ class UnifiedIndexer:
         file_stem = file_path.stem.replace(' ', '_')
         
         return f"{file_stem}_{line_start}_{line_end}_{content_hash}"
+    
+    async def _extract_universal_relationships(self, file_paths: List[Path], symbol_table: Dict) -> Dict[str, Any]:
+        """
+        Extract relationships using the Universal Dependency Indexer.
+        
+        This replaces the old RelationshipExtractor with our new universal system
+        that can detect architectural patterns across all programming languages.
+        """
+        try:
+            # Import the universal indexer
+            from backend.indexer.universal_dependency_indexer import UniversalDependencyExtractor
+            
+            logger.info("🔗 Starting universal relationship extraction")
+            
+            # Initialize universal dependency indexer
+            universal_indexer = UniversalDependencyExtractor()
+            
+            # Track statistics
+            files_processed = 0
+            files_failed = 0
+            relationships_found = 0
+            processing_errors = []
+            
+            for file_path in file_paths:
+                try:
+                    logger.debug(f"Processing relationships for: {file_path}")
+                    
+                    # Read file content
+                    if not file_path.exists():
+                        continue
+                        
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    
+                    # Extract dependencies using universal indexer
+                    language = universal_indexer.detect_language(str(file_path))
+                    if language:
+                        imports = universal_indexer.extract_imports_for_language(content, language, str(file_path))
+                        # Get available components from symbol table
+                        available_components = list(symbol_table.keys()) if symbol_table else []
+                        calls = universal_indexer.extract_call_relationships(content, language, str(file_path), available_components)
+                        file_dependencies = {
+                            'imports': imports,
+                            'calls': calls
+                        }
+                    else:
+                        file_dependencies = {'imports': [], 'calls': []}
+                    
+                    # Convert universal dependencies to KG format and store
+                    file_relationships = self._store_universal_dependencies_as_kg_relationships(
+                        file_dependencies, file_path, symbol_table)
+                    
+                    relationships_found += len(file_relationships)
+                    files_processed += 1
+                    
+                    if files_processed % 10 == 0:
+                        logger.info(f"Processed {files_processed}/{len(file_paths)} files, found {relationships_found} relationships")
+                    
+                except Exception as e:
+                    files_failed += 1
+                    error_msg = f"Failed to extract relationships from {file_path}: {e}"
+                    logger.warning(error_msg)
+                    processing_errors.append(error_msg)
+            
+            logger.info(f"✅ Universal relationship extraction completed")
+            logger.info(f"   Files processed: {files_processed}")
+            logger.info(f"   Files failed: {files_failed}")
+            logger.info(f"   Relationships found: {relationships_found}")
+            
+            return {
+                'files_processed': files_processed,
+                'files_failed': files_failed,
+                'relationships_found': relationships_found,
+                'processing_errors': processing_errors
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Universal relationship extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback to old system if universal system fails
+            logger.info("Falling back to legacy relationship extractor")
+            return await self._fallback_relationship_extraction(file_paths, symbol_table)
+    
+    def _store_universal_dependencies_as_kg_relationships(self, dependencies: Dict, file_path: Path, symbol_table: Dict) -> List[Dict]:
+        """
+        Convert universal dependencies to KG relationships and store in database.
+        """
+        relationships = []
+        
+        try:
+            cursor = self.db_manager.connection.cursor()
+            
+            # Process different types of dependencies
+            for dep_type, deps in dependencies.items():
+                for dep in deps:
+                    if isinstance(dep, dict):
+                        source_name = dep.get('source', file_path.stem)
+                        target_name = dep.get('target', 'unknown')
+                        relationship_type = dep.get('type', dep_type)
+                        confidence = dep.get('confidence', 0.8)
+                        
+                        # Create relationship entry
+                        relationship = {
+                            'source_id': f"{source_name}::{source_name}::1",
+                            'target_id': f"{target_name}::{target_name}::1", 
+                            'type': relationship_type,
+                            'properties': {
+                                'confidence': confidence,
+                                'source_file': str(file_path),
+                                'detection_method': 'universal_dependency_indexer',
+                                'language': dep.get('language', 'unknown')
+                            }
+                        }
+                        
+                        # Store in database
+                        try:
+                            cursor.execute("""
+                                INSERT OR REPLACE INTO edges (source_id, target_id, type, properties)
+                                VALUES (?, ?, ?, ?)
+                            """, (
+                                relationship['source_id'],
+                                relationship['target_id'], 
+                                relationship['type'],
+                                str(relationship['properties'])
+                            ))
+                            
+                            relationships.append(relationship)
+                            
+                        except Exception as e:
+                            logger.debug(f"Failed to store relationship {source_name}->{target_name}: {e}")
+            
+            # Commit changes
+            self.db_manager.connection.commit()
+            
+        except Exception as e:
+            logger.warning(f"Failed to store universal dependencies for {file_path}: {e}")
+        
+        return relationships
+    
+    async def _fallback_relationship_extraction(self, file_paths: List[Path], symbol_table: Dict) -> Dict[str, Any]:
+        """Fallback to legacy relationship extractor if universal system fails."""
+        try:
+            from knowledge_graph.relationship_extractor import RelationshipExtractor
+            
+            logger.info("Using legacy relationship extractor")
+            self.relationship_extractor = RelationshipExtractor(self.db_manager, symbol_table)
+            self.relationship_extractor.extract_relationships(file_paths)
+            return self.relationship_extractor.get_extraction_statistics()
+            
+        except Exception as e:
+            logger.error(f"Legacy relationship extraction also failed: {e}")
+            return {
+                'files_processed': 0,
+                'files_failed': len(file_paths),
+                'relationships_found': 0,
+                'processing_errors': [f"All relationship extraction methods failed: {e}"]
+            }
     
     def _update_global_statistics(self, result: IndexingResult):
         """Update global indexing statistics."""
