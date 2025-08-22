@@ -73,3 +73,4 @@ docs/*
 backend/test_*.py
 indexer/test_*.py
 **/test_*.py
+storage/codewise.db
