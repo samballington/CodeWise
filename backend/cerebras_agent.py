@@ -357,17 +357,8 @@ class CerebrasNativeAgent:
                 else:
                     logger.info(f"⏭️ Skipping reasoning_effort for synthesis with {selected_model} (not supported)")
                 
-                synthesis_response = self.client.chat.completions.create(**synthesis_params)
-                
-                synthesis_result = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
-                
-                # Log full synthesis response for debugging/monitoring
-                synthesis_length = len(synthesis_result) if synthesis_result else 0
-                logger.info(f"✅ Successfully synthesized response from gathered context")
-                logger.info(f"📄 Synthesis Response Details - Length: {synthesis_length} chars, Model: {selected_model}")
-                logger.info(f"📝 Full Synthesis Response:\n{'='*50}\n{synthesis_result}\n{'='*50}")
-                
-                return synthesis_result
+                # REQ-UI-UNIFIED-4: Implement validation and self-correction with retry loop
+                return await self._validate_and_correct_response(synthesis_params, selected_model)
                 
             except Exception as e:
                 logger.error(f"❌ Synthesis failed: {e}")
@@ -380,6 +371,293 @@ class CerebrasNativeAgent:
                 )
         else:
             return "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
+    
+    async def _validate_and_correct_response(self, synthesis_params: Dict[str, Any], selected_model: str) -> str:
+        """
+        REQ-UI-UNIFIED-4: Implement Backend Validation and Self-Correction
+        
+        Validates LLM response against UnifiedAgentResponse schema with retry loop.
+        Implements robust error handling and progressive correction prompts.
+        """
+        max_retries = 2
+        
+        for attempt in range(max_retries + 1):  # 0, 1, 2 (3 total attempts)
+            try:
+                logger.info(f"🔄 Response validation attempt {attempt + 1}/{max_retries + 1}")
+                
+                # Make API call
+                synthesis_response = self.client.chat.completions.create(**synthesis_params)
+                raw_response = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
+                
+                # Log raw response for debugging
+                response_length = len(raw_response) if raw_response else 0
+                logger.info(f"📝 Raw response received ({response_length} chars)")
+                logger.debug(f"📄 Full Raw Response:\n{'='*50}\n{raw_response}\n{'='*50}")
+                
+                # Attempt validation
+                validated_response = await self._validate_response_structure(raw_response, attempt)
+                
+                if validated_response:
+                    logger.info(f"✅ Response validation successful on attempt {attempt + 1}")
+                    return validated_response
+                    
+                # Validation failed - prepare correction prompt for retry
+                if attempt < max_retries:
+                    correction_prompt = self._generate_correction_prompt(raw_response, attempt)
+                    synthesis_params["messages"].append({
+                        "role": "user", 
+                        "content": correction_prompt
+                    })
+                    logger.warning(f"⚠️ Validation failed, retrying with correction prompt (attempt {attempt + 2})")
+                
+            except Exception as e:
+                logger.error(f"❌ Synthesis attempt {attempt + 1} failed: {e}")
+                
+                if attempt < max_retries:
+                    # Add error recovery prompt
+                    error_prompt = f"The previous response caused an error: {str(e)}. Please provide a valid JSON response following the UnifiedAgentResponse schema format."
+                    synthesis_params["messages"].append({
+                        "role": "user",
+                        "content": error_prompt 
+                    })
+                    continue
+        
+        # All attempts failed - return structured error response
+        logger.error("💥 All validation attempts failed - generating fallback error response")
+        return await self._generate_structured_error_response("Failed to generate a valid structured response after multiple attempts")
+    
+    async def _validate_response_structure(self, raw_response: str, attempt: int) -> Optional[str]:
+        """
+        Validate response against UnifiedAgentResponse schema.
+        
+        Args:
+            raw_response: Raw LLM response text
+            attempt: Current attempt number for logging
+            
+        Returns:
+            Validated JSON string if valid, None if invalid
+        """
+        try:
+            # Import schema validation utilities
+            from schemas.ui_schemas import validate_response_structure
+            import json
+            
+            # Clean and extract JSON from response
+            json_content = self._extract_json_from_response(raw_response)
+            if not json_content:
+                logger.warning(f"🔍 Attempt {attempt + 1}: No valid JSON found in response")
+                return None
+            
+            # Parse JSON
+            try:
+                parsed_data = json.loads(json_content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"🔍 Attempt {attempt + 1}: JSON parsing failed: {e}")
+                return None
+            
+            # Validate against schema
+            validated_response = validate_response_structure(parsed_data)
+            
+            # Additional validation - ensure minimum requirements
+            if not isinstance(parsed_data.get('response'), list):
+                raise ValueError("Response must contain an array of content blocks")
+            
+            if len(parsed_data['response']) == 0:
+                raise ValueError("Response array cannot be empty")
+            
+            # Check each block has required fields
+            for i, block in enumerate(parsed_data['response']):
+                if not isinstance(block, dict):
+                    raise ValueError(f"Block {i} must be an object")
+                if 'block_type' not in block:
+                    raise ValueError(f"Block {i} missing required 'block_type' field")
+            
+            # Additional quality checks
+            quality_check = validated_response.validate_content_quality()
+            if quality_check["warnings"]:
+                logger.info(f"⚠️ Content quality warnings: {quality_check['warnings']}")
+            if quality_check["suggestions"]:
+                logger.info(f"💡 Content quality suggestions: {quality_check['suggestions']}")
+            
+            # Return the original JSON string (not the validated object)
+            return json_content
+            
+        except Exception as e:
+            logger.warning(f"🔍 Attempt {attempt + 1}: Validation failed: {e}")
+            return None
+    
+    def _extract_json_from_response(self, response: str) -> Optional[str]:
+        """
+        Extract JSON content from LLM response, handling various formats.
+        
+        Returns:
+            Clean JSON string or None if no valid JSON found
+        """
+        import re
+        import json
+        
+        # Remove any markdown formatting
+        response = response.strip()
+        
+        # Try direct JSON parse first
+        if response.startswith('{') and response.endswith('}'):
+            try:
+                json.loads(response)  # Test if valid
+                return response
+            except:
+                pass
+        
+        # Look for JSON in code blocks
+        json_block_patterns = [
+            r'```json\s*(\{[\s\S]*?\})\s*```',
+            r'```\s*(\{[\s\S]*?\})\s*```',
+            r'`(\{[\s\S]*?\})`'
+        ]
+        
+        for pattern in json_block_patterns:
+            matches = re.findall(pattern, response, re.MULTILINE | re.DOTALL)
+            for match in matches:
+                try:
+                    json.loads(match.strip())  # Test if valid
+                    return match.strip()
+                except:
+                    continue
+        
+        # Look for JSON objects in the text
+        brace_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        potential_jsons = re.findall(brace_pattern, response, re.DOTALL)
+        
+        for potential in potential_jsons:
+            try:
+                json.loads(potential)  # Test if valid
+                return potential.strip()
+            except:
+                continue
+        
+        # Last resort: try to find the largest JSON-like structure
+        start_brace = response.find('{')
+        if start_brace != -1:
+            # Find matching closing brace
+            brace_count = 0
+            for i, char in enumerate(response[start_brace:], start_brace):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        candidate = response[start_brace:i+1]
+                        try:
+                            json.loads(candidate)  # Test if valid
+                            return candidate
+                        except:
+                            break
+        
+        return None
+    
+    def _generate_correction_prompt(self, failed_response: str, attempt: int) -> str:
+        """
+        Generate progressive correction prompts based on attempt number.
+        
+        Args:
+            failed_response: The response that failed validation
+            attempt: Current attempt number (0-based)
+            
+        Returns:
+            Correction prompt string
+        """
+        base_correction = """Your previous response did not conform to the required UnifiedAgentResponse schema format. You MUST respond with valid JSON only.
+
+CRITICAL REQUIREMENTS:
+1. Response must be a single JSON object starting with {"response": [
+2. No text before or after the JSON
+3. Each block must have the correct block_type field
+4. All required fields must be present
+
+"""
+        
+        if attempt == 0:
+            # First retry - gentle correction
+            return base_correction + """Please fix the format and provide a valid JSON response following this structure:
+
+{
+  "response": [
+    {
+      "block_type": "text",
+      "content": "Your analysis here..."
+    }
+  ]
+}"""
+        
+        elif attempt == 1:
+            # Second retry - more specific correction
+            error_analysis = self._analyze_response_errors(failed_response)
+            return base_correction + f"""The specific issues detected were: {error_analysis}
+
+You must provide ONLY a JSON object with no additional text. Example format:
+
+{{"response": [
+  {{"block_type": "text", "content": "Analysis introduction"}},
+  {{"block_type": "component_analysis", "title": "Key Components", "components": [...]}}
+]}}
+
+Respond with valid JSON now."""
+        
+        else:
+            # Final retry - very explicit
+            return """FINAL ATTEMPT: You must respond with ONLY valid JSON in this exact format:
+
+{"response": [{"block_type": "text", "content": "Based on my analysis of the codebase, here are the key findings..."}]}
+
+NO other text. NO markdown. NO explanations. ONLY the JSON object."""
+    
+    def _analyze_response_errors(self, response: str) -> str:
+        """Analyze what went wrong with the response format."""
+        errors = []
+        
+        if not response.strip().startswith('{'):
+            errors.append("Response doesn't start with JSON object")
+        
+        if '```' in response:
+            errors.append("Response contains markdown code blocks")
+            
+        if response.count('{') != response.count('}'):
+            errors.append("Unmatched braces in JSON")
+            
+        if '"response"' not in response:
+            errors.append("Missing required 'response' key")
+            
+        if '"block_type"' not in response:
+            errors.append("Missing required 'block_type' fields")
+            
+        return "; ".join(errors) if errors else "JSON parsing or validation errors"
+    
+    async def _generate_structured_error_response(self, error_message: str) -> str:
+        """
+        Generate a valid UnifiedAgentResponse for error cases.
+        
+        Args:
+            error_message: Error description for user
+            
+        Returns:
+            Valid JSON string conforming to schema
+        """
+        from schemas.ui_schemas import create_error_response
+        import json
+        
+        try:
+            error_response = create_error_response(error_message, include_debug=False)
+            return json.dumps(error_response.model_dump(), indent=2)
+        except Exception as e:
+            logger.error(f"❌ Failed to generate structured error response: {e}")
+            # Absolute fallback - minimal valid JSON
+            return json.dumps({
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": f"## System Error\n\n{error_message}\n\nPlease try your request again or contact support if the issue persists."
+                    }
+                ]
+            })
     
     async def _execute_pure_tool_call(self, tool_call) -> Dict[str, Any]:
         """
