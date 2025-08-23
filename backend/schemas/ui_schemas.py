@@ -19,7 +19,7 @@ Architecture:
 
 from __future__ import annotations
 from pydantic import BaseModel, Field, validator
-from typing import List, Dict, Union, Literal, Optional
+from typing import List, Dict, Union, Literal, Optional, Annotated
 from enum import Enum
 
 
@@ -49,6 +49,7 @@ class CodeComponent(BaseModel):
     This model captures the essential information about a code component
     that enables both display and navigation in the UI.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
     name: str = Field(
         ..., 
         description="The name of the class, function, or component",
@@ -102,6 +103,8 @@ class TextBlock(BaseModel):
     Used for introductions, conclusions, explanations, and any content
     that doesn't require specialized formatting or interaction.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     block_type: Literal["text"] = "text"
     content: str = Field(
         ..., 
@@ -117,6 +120,8 @@ class ComponentAnalysisBlock(BaseModel):
     Renders as an interactive table or card layout showing component
     metadata with navigation capabilities to source code.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     block_type: Literal["component_analysis"] = "component_analysis"
     title: str = Field(
         default="Key Components Analysis",
@@ -144,6 +149,8 @@ class MermaidDiagramBlock(BaseModel):
     Renders interactive diagrams with zoom, pan, and export capabilities.
     Integrates with existing mermaid rendering infrastructure.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     block_type: Literal["mermaid_diagram"] = "mermaid_diagram"
     title: str = Field(
         default="Architecture Diagram",
@@ -179,6 +186,8 @@ class MarkdownTableBlock(BaseModel):
     Provides sorting, filtering, and export capabilities for structured data.
     Automatically handles responsive design and large datasets.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     block_type: Literal["markdown_table"] = "markdown_table"
     title: str = Field(
         default="Data Table",
@@ -221,6 +230,8 @@ class CodeSnippetBlock(BaseModel):
     Supports multiple programming languages, copy-to-clipboard,
     and optional line highlighting for specific code sections.
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     block_type: Literal["code_snippet"] = "code_snippet"
     title: str = Field(
         ...,
@@ -263,12 +274,16 @@ class CodeSnippetBlock(BaseModel):
 
 # === Union Type for All Content Blocks ===
 
-ContentBlock = Union[
-    TextBlock,
-    ComponentAnalysisBlock,
-    MermaidDiagramBlock,
-    MarkdownTableBlock,
-    CodeSnippetBlock
+# Use discriminated union for proper validation
+ContentBlock = Annotated[
+    Union[
+        TextBlock,
+        ComponentAnalysisBlock,
+        MermaidDiagramBlock,
+        MarkdownTableBlock,
+        CodeSnippetBlock
+    ],
+    Field(discriminator='block_type')
 ]
 
 
@@ -288,6 +303,8 @@ class UnifiedAgentResponse(BaseModel):
     - UI flexibility (presentation logic stays in frontend)
     - Extensibility (new block types can be added)
     """
+    model_config = {"extra": "forbid"}  # Reject unknown fields
+    
     response: List[ContentBlock] = Field(
         ...,
         description="Ordered list of content blocks to render",
