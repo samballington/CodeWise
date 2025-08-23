@@ -185,7 +185,8 @@ class CerebrasNativeAgent:
             
         except Exception as e:
             logger.error(f"❌ Native agent processing failed: {e}")
-            return f"I encountered a system error while processing your request: {str(e)}"
+            error_message = f"I encountered a system error while processing your request: {str(e)}"
+            return await self._ensure_structured_response(error_message, "processing_error")
     
     async def _sdk_native_loop(self, messages: List[Dict], selected_model: str) -> str:
         """
@@ -269,7 +270,9 @@ class CerebrasNativeAgent:
                     logger.info(f"📄 LLM Response Details - Length: {response_length} chars, Model: {self.model}")
                     logger.info(f"📝 Full LLM Response:\n{'='*50}\n{response_content}\n{'='*50}")
                     
-                    return response_content
+                    # CRITICAL FIX: Apply unified validation to ALL response paths
+                    # This ensures the UI always receives structured JSON, not raw LLM content
+                    return await self._ensure_structured_response(response_content, "sdk_success")
                     
             except Exception as e:
                 logger.error(f"❌ SDK iteration {self.current_iteration} failed: {e}")
@@ -277,14 +280,17 @@ class CerebrasNativeAgent:
                 # If we had successful iterations, try to provide a helpful response
                 if successful_iterations > 0:
                     logger.info(f"⚠️ Partial success: {successful_iterations} iterations completed before error")
-                    return (
+                    error_message = (
                         f"I've gathered information about your query but encountered a technical issue "
                         f"in the final processing step. Based on the data I found, I can provide you with "
                         f"relevant information, though the response formatting may be affected. "
                         f"The technical error was: {str(e)}"
                     )
+                    # CRITICAL FIX: Return structured error response instead of plain text
+                    return await self._ensure_structured_response(error_message, "sdk_error")
                 else:
-                    return f"I encountered a technical error during processing: {str(e)}"
+                    error_message = f"I encountered a technical error during processing: {str(e)}"
+                    return await self._ensure_structured_response(error_message, "system_error")
         
         logger.warning(f"⚠️ Reached maximum iterations ({self.max_iterations})")
         
@@ -362,15 +368,18 @@ class CerebrasNativeAgent:
                 
             except Exception as e:
                 logger.error(f"❌ Synthesis failed: {e}")
-                return (
+                error_message = (
                     f"I gathered substantial information about your query through {successful_iterations} "
                     f"research steps, but reached the processing limit while organizing the final response. "
                     f"The system found relevant information but encountered a technical limitation in "
                     f"synthesizing the complete answer. Please try rephrasing your question or breaking "
                     f"it into smaller parts."
                 )
+                # CRITICAL FIX: Structure synthesis error response
+                return await self._ensure_structured_response(error_message, "synthesis_error")
         else:
-            return "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
+            error_message = "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
+            return await self._ensure_structured_response(error_message, "max_iterations_error")
     
     async def _validate_and_correct_response(self, synthesis_params: Dict[str, Any], selected_model: str) -> str:
         """
@@ -425,6 +434,194 @@ class CerebrasNativeAgent:
         # All attempts failed - return structured error response
         logger.error("💥 All validation attempts failed - generating fallback error response")
         return await self._generate_structured_error_response("Failed to generate a valid structured response after multiple attempts")
+    
+    def _safe_serialize_tool_result(self, tool_result: Dict[str, Any], tool_name: str) -> str:
+        """
+        Safely serialize tool results with content isolation to prevent corruption.
+        
+        This method ensures that complex tool results are properly bounded and that
+        content from different sources doesn't bleed together during serialization.
+        
+        Args:
+            tool_result: Raw tool execution result
+            tool_name: Name of the tool for context
+            
+        Returns:
+            Clean, isolated string representation of the tool result
+        """
+        try:
+            # Create a bounded container for the tool result
+            bounded_result = {
+                "tool_name": tool_name,
+                "timestamp": time.time(),
+                "content": tool_result,
+                "content_hash": hash(str(tool_result))  # For integrity verification
+            }
+            
+            # Use safe JSON serialization with content isolation
+            serialized = json.dumps(bounded_result, indent=2, ensure_ascii=False, separators=(',', ': '))
+            
+            # Verify serialization integrity
+            try:
+                verification = json.loads(serialized)
+                if verification.get("content_hash") != hash(str(tool_result)):
+                    logger.warning(f"⚠️ Content integrity check failed for {tool_name} - using fallback")
+                    return self._fallback_serialize_tool_result(tool_result, tool_name)
+            except (json.JSONDecodeError, KeyError):
+                logger.warning(f"⚠️ Serialization verification failed for {tool_name} - using fallback")
+                return self._fallback_serialize_tool_result(tool_result, tool_name)
+            
+            logger.debug(f"✅ Safe serialization successful for {tool_name} ({len(serialized)} chars)")
+            return serialized
+            
+        except Exception as e:
+            logger.error(f"❌ Safe serialization failed for {tool_name}: {e}")
+            return self._fallback_serialize_tool_result(tool_result, tool_name)
+    
+    def _fallback_serialize_tool_result(self, tool_result: Dict[str, Any], tool_name: str) -> str:
+        """
+        Fallback serialization method for problematic tool results.
+        
+        When safe serialization fails, this method provides a basic but reliable
+        string representation that maintains content boundaries.
+        """
+        try:
+            # Simple string conversion with clear boundaries
+            if isinstance(tool_result, dict):
+                content_parts = []
+                for key, value in tool_result.items():
+                    content_parts.append(f"{key}: {str(value)[:1000]}...")  # Truncate long values
+                return f"=== {tool_name.upper()} RESULT ===\n" + "\n".join(content_parts) + f"\n=== END {tool_name.upper()} ==="
+            else:
+                return f"=== {tool_name.upper()} RESULT ===\n{str(tool_result)[:2000]}...\n=== END {tool_name.upper()} ==="
+        except Exception as e:
+            logger.error(f"❌ Fallback serialization failed for {tool_name}: {e}")
+            return f"=== {tool_name.upper()} RESULT ===\nERROR: Could not serialize result\n=== END {tool_name.upper()} ==="
+    
+    async def _ensure_structured_response(self, raw_response: str, context: str) -> str:
+        """
+        Master response wrapper ensuring ALL responses conform to UnifiedAgentResponse schema.
+        
+        This is the architectural fix that guarantees the unified UI system works correctly
+        by ensuring every code path returns structured JSON, never plain text.
+        
+        Args:
+            raw_response: Raw response content (may be JSON, plain text, or error message)
+            context: Context of the response (sdk_success, sdk_error, system_error, etc.)
+            
+        Returns:
+            Valid UnifiedAgentResponse JSON string
+        """
+        try:
+            logger.info(f"🔄 Ensuring structured response for context: {context}")
+            
+            # First, try to validate if it's already a valid UnifiedAgentResponse
+            try:
+                validated = await self._validate_response_structure(raw_response, 0)
+                if validated:
+                    logger.info(f"✅ Response already structured for {context}")
+                    return validated
+            except Exception:
+                pass  # Continue to structure the response
+            
+            # If not valid JSON or not conforming to schema, wrap it appropriately
+            if context == "sdk_success":
+                # Raw LLM content needs to be structured - this is likely already JSON but needs validation
+                return await self._structure_llm_response(raw_response)
+            
+            elif context in ["sdk_error", "system_error", "synthesis_error", "max_iterations_error", "processing_error"]:
+                # Error messages need to be wrapped in TextBlock structure
+                return await self._structure_error_response(raw_response, context)
+            
+            else:
+                # Unknown context - default to text block wrapping
+                logger.warning(f"⚠️ Unknown context '{context}' - defaulting to text block")
+                return await self._structure_as_text_block(raw_response)
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to ensure structured response for {context}: {e}")
+            # Absolute fallback - return minimal valid structure
+            return await self._generate_structured_error_response(f"Response structuring failed: {str(e)}")
+    
+    async def _structure_llm_response(self, raw_response: str) -> str:
+        """
+        Structure raw LLM response content into UnifiedAgentResponse format.
+        
+        This handles the case where the LLM provided content but it may not be
+        properly structured according to our schema.
+        """
+        # Try to apply the full validation and correction process
+        try:
+            # Create minimal synthesis params for validation
+            synthesis_params = {
+                "messages": [{"role": "system", "content": ""}],  # Dummy for validation
+            }
+            # Use existing validation system but with the raw response
+            return await self._validate_and_correct_single_response(raw_response)
+        except Exception as e:
+            logger.warning(f"⚠️ LLM response structuring failed, wrapping as text: {e}")
+            return await self._structure_as_text_block(raw_response)
+    
+    async def _validate_and_correct_single_response(self, raw_response: str) -> str:
+        """
+        Apply validation to a single response without the full retry loop.
+        
+        This is a streamlined version of the validation process for responses
+        that don't need the full correction cycle.
+        """
+        # Attempt validation
+        validated_response = await self._validate_response_structure(raw_response, 0)
+        
+        if validated_response:
+            return validated_response
+        else:
+            # If validation fails, wrap the content as a text block
+            return await self._structure_as_text_block(raw_response)
+    
+    async def _structure_error_response(self, error_message: str, context: str) -> str:
+        """
+        Structure error messages into proper UnifiedAgentResponse format.
+        """
+        from schemas.ui_schemas import create_error_response
+        import json
+        
+        try:
+            error_response = create_error_response(f"**{context.replace('_', ' ').title()}**\n\n{error_message}", include_debug=False)
+            return json.dumps(error_response.model_dump(), indent=2)
+        except Exception as e:
+            logger.error(f"❌ Error response structuring failed: {e}")
+            # Absolute fallback
+            return json.dumps({
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": f"## System Error ({context})\n\n{error_message}"
+                    }
+                ]
+            })
+    
+    async def _structure_as_text_block(self, content: str) -> str:
+        """
+        Wrap any content as a simple TextBlock within UnifiedAgentResponse structure.
+        
+        This is the fallback method that ensures we always return valid structure.
+        """
+        import json
+        
+        try:
+            structured_response = {
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": content
+                    }
+                ]
+            }
+            return json.dumps(structured_response, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"❌ Text block structuring failed: {e}")
+            # Ultra-minimal fallback
+            return '{"response": [{"block_type": "text", "content": "Response formatting error"}]}'
     
     async def _validate_response_structure(self, raw_response: str, attempt: int) -> Optional[str]:
         """
@@ -1367,8 +1564,8 @@ NO other text. NO markdown. NO explanations. ONLY the JSON object."""
             Either raw tool result (if small) or intelligent summary (if large)
         """
         try:
-            # Convert result to string for size analysis
-            raw_result_str = json.dumps(tool_result, indent=2)
+            # Convert result to string with safe content isolation
+            raw_result_str = self._safe_serialize_tool_result(tool_result, tool_name)
             raw_size_chars = len(raw_result_str)
             
             # Character threshold: 20,000 chars ≈ 5,000 tokens
