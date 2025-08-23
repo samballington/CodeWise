@@ -306,8 +306,8 @@ class KGStartupService:
             indexer = UnifiedIndexer(db_path=self.db_path)
             
             # Execute indexing - force reindex on startup to ensure KG is populated
-            self.logger.info(f"🔄 Starting indexing of {project_path.name} with force_reindex=True")
-            result = indexer.index_codebase(
+            self.logger.info(f"🔄 Starting indexing of {project_path.name} with Universal Dependency Indexer")
+            result = await indexer.index_codebase(
                 codebase_path=project_path,
                 force_reindex=True,  # Force reindex during startup to ensure KG population
                 file_patterns=self.supported_patterns

@@ -227,6 +227,25 @@ class CerebrasNativeAgent:
                 else:
                     logger.info(f"⏭️ Skipping reasoning_effort for {selected_model} (not supported)")
                 
+                # DIAGNOSTIC LOGGING: Log exact API request parameters
+                logger.info(f"🔧 DIAGNOSTIC: API Request Parameters for iteration {self.current_iteration}")
+                logger.info(f"🔧 Model: {api_params.get('model')}")
+                logger.info(f"🔧 Max tokens: {api_params.get('max_tokens')}")
+                logger.info(f"🔧 Tools count: {len(api_params.get('tools', []))}")
+                logger.info(f"🔧 Tools schema: {json.dumps(api_params.get('tools', []), indent=2)}")
+                logger.info(f"🔧 Messages count: {len(api_params.get('messages', []))}")
+                
+                # Log last few messages to see conversation context
+                messages_to_log = api_params.get('messages', [])[-3:]  # Last 3 messages
+                for i, msg in enumerate(messages_to_log):
+                    try:
+                        role = msg.get('role', 'unknown') if isinstance(msg, dict) else getattr(msg, 'role', 'unknown')
+                        content_preview = str(msg.get('content', '') if isinstance(msg, dict) else getattr(msg, 'content', ''))[:200] + "..."
+                        tool_calls = msg.get('tool_calls', []) if isinstance(msg, dict) else getattr(msg, 'tool_calls', [])
+                        logger.info(f"🔧 Message {i}: Role={role}, Content={content_preview}, ToolCalls={len(tool_calls)}")
+                    except Exception as log_err:
+                        logger.info(f"🔧 Message {i}: [Error logging message: {log_err}]")
+                
                 response = self.client.chat.completions.create(**api_params)
                 
                 message = response.choices[0].message
@@ -276,6 +295,27 @@ class CerebrasNativeAgent:
                     
             except Exception as e:
                 logger.error(f"❌ SDK iteration {self.current_iteration} failed: {e}")
+                
+                # DIAGNOSTIC LOGGING: Capture the exact error details
+                if "400" in str(e) and "tool call" in str(e):
+                    logger.error("🔍 DIAGNOSTIC: 400 Tool Call Error Details")
+                    logger.error(f"🔍 Error: {str(e)}")
+                    logger.error(f"🔍 Exception type: {type(e)}")
+                    
+                    # Log the exact API parameters that caused the failure
+                    logger.error(f"🔍 Failed API params - Model: {api_params.get('model')}")
+                    logger.error(f"🔍 Failed API params - Tools: {json.dumps(api_params.get('tools', []), indent=2)}")
+                    
+                    # Log the conversation state at failure
+                    logger.error(f"🔍 Conversation length at failure: {len(messages)} messages")
+                    for i, msg in enumerate(messages[-5:]):  # Last 5 messages
+                        try:
+                            role = msg.get('role', 'unknown') if isinstance(msg, dict) else getattr(msg, 'role', 'unknown')
+                            content = str(msg.get('content', ''))[:300] if isinstance(msg, dict) else str(getattr(msg, 'content', ''))[:300]
+                            tool_calls = msg.get('tool_calls', []) if isinstance(msg, dict) else getattr(msg, 'tool_calls', [])
+                            logger.error(f"🔍 Message {i}: {role} - {content}... (ToolCalls: {len(tool_calls) if tool_calls else 0})")
+                        except Exception as log_err:
+                            logger.error(f"🔍 Message {i}: [Error logging message: {log_err}]")
                 
                 # If we had successful iterations, try to provide a helpful response
                 if successful_iterations > 0:
@@ -2407,198 +2447,7 @@ For comprehensive analysis: `navigate_filesystem` → `query_codebase` → combi
 - Never fabricate information to fill gaps
 - Guide users toward successful discovery patterns
 
-Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding.
-
----
-
-## 8. Unified Response Format (MANDATORY)
-
-### Critical Output Requirement
-**EVERY response MUST be a single, valid JSON object conforming to the UnifiedAgentResponse schema.**
-
-Your entire output must be structured JSON - no preamble, no postamble, no explanatory text outside the JSON. The frontend UI system depends on this strict format for proper rendering.
-
-### Response Schema Structure
-```json
-{
-  "response": [
-    // Array of content blocks - each block maps to a UI component
-    {
-      "block_type": "text|component_analysis|mermaid_diagram|markdown_table|code_snippet",
-      // Additional fields specific to each block type
-    }
-  ]
-}
-```
-
-### Available Content Block Types
-
-**TextBlock** - For explanations and narrative content
-```json
-{
-  "block_type": "text",
-  "content": "Markdown-formatted explanation text"
-}
-```
-
-**ComponentAnalysisBlock** - For structured display of code components
-```json
-{
-  "block_type": "component_analysis", 
-  "title": "Key Components Analysis",
-  "components": [
-    {
-      "name": "UserService",
-      "path": "services/user.py",
-      "component_type": "service",
-      "purpose": "Handles user authentication and profile management",
-      "key_methods": ["authenticate", "get_profile"],
-      "line_start": 15,
-      "line_end": 145
-    }
-  ]
-}
-```
-
-**MermaidDiagramBlock** - For architectural visualizations
-```json
-{
-  "block_type": "mermaid_diagram",
-  "title": "System Architecture", 
-  "mermaid_code": "graph TD\\n    A[User] --> B[Controller]\\n    B --> C[Service]"
-}
-```
-
-**CodeSnippetBlock** - For syntax-highlighted code examples
-```json
-{
-  "block_type": "code_snippet",
-  "title": "Authentication Function",
-  "language": "python", 
-  "code": "def authenticate_user(username, password):\\n    return verify_password(username, password)"
-}
-```
-
-**MarkdownTableBlock** - For tabular data
-```json
-{
-  "block_type": "markdown_table",
-  "title": "Component Summary",
-  "headers": ["Component", "Type", "Purpose"],
-  "rows": [
-    ["UserService", "Service", "User management"],
-    ["AuthController", "Controller", "Authentication endpoints"]
-  ]
-}
-```
-
-### Logical Block Ordering Principles
-
-1. **Start with Introduction**: Begin with a TextBlock introducing your analysis
-2. **Present Data**: Follow with structured blocks (ComponentAnalysisBlock, tables, diagrams)
-3. **Provide Examples**: Include CodeSnippetBlocks for key implementations
-4. **Conclude**: End with a TextBlock summarizing insights
-
-### Chain-of-Thought Example
-
-**User Query**: "Explain the authentication system and show me the key components"
-
-**Your Internal Process**:
-1. "The user wants to understand authentication - this is Workflow B (broad exploratory)"  
-2. "I'll first get project structure, then query for auth components"
-3. "For output: TextBlock intro → ComponentAnalysisBlock → CodeSnippetBlock → TextBlock conclusion"
-
-**Your JSON Response**:
-```json
-{
-  "response": [
-    {
-      "block_type": "text",
-      "content": "# Authentication System Analysis\\n\\nI've analyzed the authentication system in your codebase. Here's a comprehensive breakdown of the key components and their interactions."
-    },
-    {
-      "block_type": "component_analysis",
-      "title": "Authentication Components",
-      "components": [
-        {
-          "name": "AuthController", 
-          "path": "controllers/auth.py",
-          "component_type": "controller",
-          "purpose": "Handles HTTP authentication endpoints for login and registration",
-          "key_methods": ["login", "register", "logout"],
-          "line_start": 12,
-          "line_end": 87
-        },
-        {
-          "name": "UserService",
-          "path": "services/user_service.py", 
-          "component_type": "service",
-          "purpose": "Business logic for user management and credential validation",
-          "key_methods": ["authenticate_user", "hash_password", "validate_token"]
-        }
-      ]
-    },
-    {
-      "block_type": "code_snippet",
-      "title": "Core Authentication Logic",
-      "language": "python",
-      "code": "def authenticate_user(username: str, password: str) -> Optional[User]:\\n    user = User.get_by_username(username)\\n    if user and verify_password(password, user.password_hash):\\n        return user\\n    return None"
-    },
-    {
-      "block_type": "text", 
-      "content": "The authentication system follows a clean MVC pattern with clear separation between HTTP handling (AuthController) and business logic (UserService). The system uses secure password hashing and token-based session management."
-    }
-  ]
-}
-```
-
-### Critical Rules for Block Selection
-
-**Use TextBlock for**:
-- Introductions and explanations
-- Conceptual analysis and conclusions  
-- Bridging content between technical blocks
-
-**Use ComponentAnalysisBlock for**:
-- Lists of classes, functions, or modules
-- Architectural component overviews
-- When you have structured component metadata
-
-**Use MermaidDiagramBlock for**:
-- System architecture visualizations
-- Data flow diagrams  
-- Class hierarchy or dependency graphs
-- Any visual representation request
-
-**Use CodeSnippetBlock for**:
-- Specific code examples
-- Implementation details
-- Key algorithms or functions
-- Configuration examples
-
-**Use MarkdownTableBlock for**:
-- Comparative data (features, metrics, configurations)
-- Structured lists with multiple attributes
-- Summary information in tabular format
-
-### Quality Requirements
-
-- **Minimum 2 blocks**: Never use just one block - always provide structured breakdown
-- **Logical flow**: Blocks should build understanding progressively  
-- **Rich metadata**: Include file paths, line numbers, and detailed component information when available
-- **Actionable content**: Each block should provide concrete, useful information
-
-### Validation Checkpoint
-
-Before sending your response, verify:
-- [ ] Response is valid JSON starting with `{"response": [`
-- [ ] Contains 2+ content blocks with logical ordering
-- [ ] TextBlock introduces the analysis topic
-- [ ] Technical blocks contain rich, specific information
-- [ ] All file paths and component names are accurate
-- [ ] Response ends with concluding insights
-
-**Remember: The UI depends on this exact JSON format. Any deviation will break the user interface.**"""
+Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding."""
     
     def _detect_sdk_version(self) -> str:
         """Detect SDK version for future-proofing"""

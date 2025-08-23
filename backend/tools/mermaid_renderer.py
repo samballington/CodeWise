@@ -40,7 +40,7 @@ class MermaidRenderer:
         self.theme_manager = theme_manager or ThemeManager()
         logger.info("MermaidRenderer initialized (pure rendering mode)")
     
-    def generate(self, diagram_type: str, graph_data: dict, theme_name: str = 'dark_professional') -> str:
+    def generate(self, diagram_type: str, graph_data: dict, theme_name: str = 'dark_professional', title: str = None) -> str:
         """
         Generates a Mermaid diagram from pre-defined set of nodes and edges.
         
@@ -48,10 +48,16 @@ class MermaidRenderer:
             diagram_type: Type of diagram ('graph TD', 'classDiagram', etc.)
             graph_data: Dict with 'nodes' and 'edges' lists
             theme_name: Theme to apply
+            title: Optional title for the diagram
             
         Returns:
             Complete Mermaid diagram syntax
         """
+        # Validate theme
+        if not self._validate_theme(theme_name):
+            logger.warning(f"Invalid theme '{theme_name}', falling back to default")
+            theme_name = 'dark_professional'
+        
         nodes = graph_data.get('nodes', [])
         edges = graph_data.get('edges', [])
         
@@ -64,12 +70,20 @@ class MermaidRenderer:
         try:
             style_definitions = self.theme_manager.get_definitions(theme_name)
             
+            # Generate the diagram content
             if diagram_type == 'classDiagram':
-                return self._render_class_diagram(nodes, edges, style_definitions)
+                diagram_content = self._render_class_diagram(nodes, edges, style_definitions)
             elif diagram_type.startswith('graph'):
-                return self._render_graph_diagram(diagram_type, nodes, edges, style_definitions)
+                diagram_content = self._render_graph_diagram(diagram_type, nodes, edges, style_definitions)
             else:
-                return self._render_generic_diagram(diagram_type, nodes, edges, style_definitions)
+                diagram_content = self._render_generic_diagram(diagram_type, nodes, edges, style_definitions)
+            
+            # Add title if provided
+            if title:
+                return self._add_title_to_diagram(diagram_content, title)
+            else:
+                return diagram_content
+                
         except Exception as e:
             logger.error(f"Rendering failed: {e}")
             return self._generate_error_diagram(f"Rendering failed: {str(e)}")
@@ -165,13 +179,83 @@ class MermaidRenderer:
         return role_to_stereotype.get(semantic_role.lower(), '')
     
     def _render_graph_diagram(self, diagram_type: str, nodes: List[Dict], edges: List[Dict], style_defs: str) -> str:
-        """Render graph diagram from structured data"""
+        """Render graph diagram with intelligent subgraph organization"""
         lines = [diagram_type]
         
         if style_defs:
             lines.append(f"    {style_defs}")
         
-        # Add nodes
+        # Group nodes by semantic role for subgraph organization
+        grouped_nodes = self._group_nodes_by_role(nodes)
+        
+        # Render subgraphs if we have meaningful groups
+        if len(grouped_nodes) > 1 and any(len(group) > 1 for group in grouped_nodes.values()):
+            lines.extend(self._render_subgraphs(grouped_nodes))
+        else:
+            # Fall back to flat structure for simple diagrams
+            lines.extend(self._render_flat_nodes(nodes))
+        
+        # Add empty line before edges for readability
+        if edges:
+            lines.append("")
+        
+        # Group and render edges by type
+        lines.extend(self._render_organized_edges(edges, grouped_nodes))
+        
+        # Add styling at the end
+        lines.extend(self._render_node_styling(nodes))
+        
+        return "\n".join(lines)
+    
+    def _group_nodes_by_role(self, nodes: List[Dict]) -> Dict[str, List[Dict]]:
+        """Group nodes by semantic role for subgraph organization"""
+        groups = {}
+        role_mappings = {
+            'controller': 'Controllers',
+            'service': 'Services', 
+            'repository': 'Repositories',
+            'model': 'Models',
+            'interface': 'Interfaces',
+            'external': 'External Systems',
+            'config': 'Configuration',
+            'logic': 'Business Logic'
+        }
+        
+        for node in nodes:
+            role = node.get('semantic_role', 'logic').lower()
+            group_name = role_mappings.get(role, 'Components')
+            
+            if group_name not in groups:
+                groups[group_name] = []
+            groups[group_name].append(node)
+        
+        return groups
+    
+    def _render_subgraphs(self, grouped_nodes: Dict[str, List[Dict]]) -> List[str]:
+        """Render nodes organized in subgraphs"""
+        lines = []
+        
+        for group_name, group_nodes in grouped_nodes.items():
+            if not group_nodes:
+                continue
+                
+            lines.append("")
+            lines.append(f'    subgraph "{group_name}"')
+            lines.append("        direction TB")
+            
+            for node in group_nodes:
+                node_id = self._sanitize_id(node['id'])
+                label = self._escape_label(node.get('label', node['id']))
+                lines.append(f"        {node_id}[\"{label}\"]")
+            
+            lines.append("    end")
+        
+        return lines
+    
+    def _render_flat_nodes(self, nodes: List[Dict]) -> List[str]:
+        """Render nodes in flat structure when subgraphs aren't beneficial"""
+        lines = []
+        
         for node in nodes:
             node_id = self._sanitize_id(node['id'])
             label = self._escape_label(node.get('label', node['id']))
@@ -190,32 +274,82 @@ class MermaidRenderer:
                 lines.append(f"    {node_id}([\"{label}\"])")
             else:
                 lines.append(f"    {node_id}[\"{label}\"]")
-            
-            # Apply styling
-            semantic_role = node.get('semantic_role', 'logic')
-            lines.append(f"    class {node_id} {semantic_role}Style")
         
-        # Add edges
+        return lines
+    
+    def _render_organized_edges(self, edges: List[Dict], grouped_nodes: Dict[str, List[Dict]]) -> List[str]:
+        """Render edges with comments for organization"""
+        lines = []
+        
+        # Group edges by type for better organization
+        edge_groups = {}
         for edge in edges:
-            source = self._sanitize_id(edge['source'])
-            target = self._sanitize_id(edge['target'])
-            edge_label = edge.get('label', '')
             edge_type = edge.get('type', '-->')
-            
-            if edge_label:
-                label_escaped = self._escape_label(edge_label)
-                if edge_type == '-->':
-                    lines.append(f"    {source} -->|{label_escaped}| {target}")
-                elif edge_type == '-.->':
-                    lines.append(f"    {source} -.->|{label_escaped}| {target}")
-                elif edge_type == '==>':
-                    lines.append(f"    {source} ==>|{label_escaped}| {target}")
-                else:
-                    lines.append(f"    {source} {edge_type}|{label_escaped}| {target}")
-            else:
-                lines.append(f"    {source} {edge_type} {target}")
+            if edge_type not in edge_groups:
+                edge_groups[edge_type] = []
+            edge_groups[edge_type].append(edge)
         
-        return "\n".join(lines)
+        # Render edges by type with comments
+        for edge_type, type_edges in edge_groups.items():
+            if not type_edges:
+                continue
+                
+            # Add comment for edge type
+            type_name = {
+                '-->': 'Dependencies',
+                '-.->': 'Optional Dependencies', 
+                '==>': 'Strong Dependencies',
+                'inherits': 'Inheritance',
+                'implements': 'Implementation'
+            }.get(edge_type, 'Relationships')
+            
+            lines.append(f"    %% {type_name}")
+            
+            for edge in type_edges:
+                source = self._sanitize_id(edge['source'])
+                target = self._sanitize_id(edge['target'])
+                edge_label = edge.get('label', '')
+                
+                if edge_label:
+                    label_escaped = self._escape_label(edge_label)
+                    if edge_type == '-->':
+                        lines.append(f"    {source} -->|{label_escaped}| {target}")
+                    elif edge_type == '-.->':
+                        lines.append(f"    {source} -.->|{label_escaped}| {target}")
+                    elif edge_type == '==>':
+                        lines.append(f"    {source} ==>|{label_escaped}| {target}")
+                    else:
+                        lines.append(f"    {source} {edge_type}|{label_escaped}| {target}")
+                else:
+                    lines.append(f"    {source} {edge_type} {target}")
+            
+            lines.append("")  # Empty line between edge groups
+        
+        return lines
+    
+    def _render_node_styling(self, nodes: List[Dict]) -> List[str]:
+        """Render node styling definitions"""
+        lines = []
+        
+        # Group nodes by role for styling
+        role_styles = {}
+        for node in nodes:
+            semantic_role = node.get('semantic_role', 'logic')
+            node_id = self._sanitize_id(node['id'])
+            
+            if semantic_role not in role_styles:
+                role_styles[semantic_role] = []
+            role_styles[semantic_role].append(node_id)
+        
+        # Apply styling by role
+        if role_styles:
+            lines.append("    %% Styling")
+            for role, node_ids in role_styles.items():
+                style_class = f"{role}Style"
+                for node_id in node_ids:
+                    lines.append(f"    class {node_id} {style_class}")
+        
+        return lines
     
     def _render_generic_diagram(self, diagram_type: str, nodes: List[Dict], edges: List[Dict], style_defs: str) -> str:
         """Fallback renderer for any diagram type"""
@@ -246,6 +380,30 @@ class MermaidRenderer:
         # Escape quotes and other problematic characters
         escaped = str(label).replace('"', '\\"').replace('\\', '\\\\')
         return escaped
+    
+    def _validate_theme(self, theme_name: str) -> bool:
+        """Validate that theme exists in theme manager"""
+        try:
+            # Try to get theme definitions - if it fails, theme is invalid
+            self.theme_manager.get_definitions(theme_name)
+            return True
+        except Exception:
+            return False
+    
+    def _add_title_to_diagram(self, diagram_content: str, title: str) -> str:
+        """Add title to diagram using Mermaid title syntax"""
+        lines = diagram_content.split('\n')
+        
+        # Find the first non-empty line (should be diagram type)
+        for i, line in enumerate(lines):
+            if line.strip():
+                # Insert title after the diagram type declaration
+                safe_title = self._escape_label(title)
+                title_line = f"    title {safe_title}"
+                lines.insert(i + 1, title_line)
+                break
+        
+        return '\n'.join(lines)
 
 
 class KGDiagramGenerator:
