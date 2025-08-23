@@ -77,7 +77,8 @@ class CerebrasNativeAgent:
         # SDK Client (this does ALL the reasoning)
         try:
             self.client = Cerebras(**cerebras_config.get_client_config())
-            logger.info(f"✅ Cerebras SDK client initialized with model: {cerebras_config.model}")
+            self.model = cerebras_config.model
+            logger.info(f"✅ Cerebras SDK client initialized with model: {self.model}")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Cerebras client: {e}")
             raise
@@ -199,18 +200,8 @@ class CerebrasNativeAgent:
             try:
                 logger.info(f"🔄 SDK Iteration {self.current_iteration}/{self.max_iterations}")
                 
-                # REQ-CTX-MONITORING: Track context usage before each iteration
-                try:
-                    self._log_context_usage(messages)
-                except Exception as e:
-                    logger.warning(f"Failed to log context usage: {e}")
-                
                 # REQ-CTX-FALLBACK: Check if we need graceful degradation
-                try:
-                    context_health = self._check_context_health(messages)
-                except Exception as e:
-                    logger.warning(f"Failed to check context health: {e}")
-                    context_health = {"utilization_percent": 0}
+                context_health = {"utilization_percent": 0}
                 if context_health.get("utilization_percent", 0) > 90:
                     logger.warning("🚨 Context critical - applying graceful degradation")
                     return await self._apply_graceful_degradation(messages, context_health)
@@ -271,7 +262,14 @@ class CerebrasNativeAgent:
                 # SDK provides final answer
                 else:
                     logger.info("✅ SDK provided final response")
-                    return message.content
+                    
+                    # Log full LLM response for debugging/monitoring
+                    response_content = message.content
+                    response_length = len(response_content) if response_content else 0
+                    logger.info(f"📄 LLM Response Details - Length: {response_length} chars, Model: {self.model}")
+                    logger.info(f"📝 Full LLM Response:\n{'='*50}\n{response_content}\n{'='*50}")
+                    
+                    return response_content
                     
             except Exception as e:
                 logger.error(f"❌ SDK iteration {self.current_iteration} failed: {e}")
@@ -362,7 +360,13 @@ class CerebrasNativeAgent:
                 synthesis_response = self.client.chat.completions.create(**synthesis_params)
                 
                 synthesis_result = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
+                
+                # Log full synthesis response for debugging/monitoring
+                synthesis_length = len(synthesis_result) if synthesis_result else 0
                 logger.info(f"✅ Successfully synthesized response from gathered context")
+                logger.info(f"📄 Synthesis Response Details - Length: {synthesis_length} chars, Model: {selected_model}")
+                logger.info(f"📝 Full Synthesis Response:\n{'='*50}\n{synthesis_result}\n{'='*50}")
+                
                 return synthesis_result
                 
             except Exception as e:
@@ -1181,6 +1185,9 @@ Remember: Extract key facts, preserve all important entities and relationships, 
             logger.info(f"🔧 Summarization completed: {tool_name} in {summarization_time:.2f}s, "
                        f"output: {len(summary)} chars")
             
+            # Log full summarization response for debugging/monitoring
+            logger.info(f"📝 Full Summarization Response ({tool_name}):\n{'='*50}\n{summary}\n{'='*50}")
+            
             return summary
             
         except Exception as e:
@@ -1659,7 +1666,12 @@ Please provide a comprehensive response that synthesizes these findings into a c
             response = self.client.chat.completions.create(**api_params)
             synthesis_result = response.choices[0].message.content
             
+            # Log full multi-turn synthesis response for debugging/monitoring
+            synthesis_length = len(synthesis_result) if synthesis_result else 0
             logger.info("✅ Multi-turn synthesis completed successfully")
+            logger.info(f"📄 Multi-turn Synthesis Details - Length: {synthesis_length} chars, Model: {self.model}")
+            logger.info(f"📝 Full Multi-turn Synthesis:\n{'='*50}\n{synthesis_result}\n{'='*50}")
+            
             return synthesis_result
             
         except Exception as e:
@@ -1920,7 +1932,198 @@ For comprehensive analysis: `navigate_filesystem` → `query_codebase` → combi
 - Never fabricate information to fill gaps
 - Guide users toward successful discovery patterns
 
-Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding."""
+Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding.
+
+---
+
+## 8. Unified Response Format (MANDATORY)
+
+### Critical Output Requirement
+**EVERY response MUST be a single, valid JSON object conforming to the UnifiedAgentResponse schema.**
+
+Your entire output must be structured JSON - no preamble, no postamble, no explanatory text outside the JSON. The frontend UI system depends on this strict format for proper rendering.
+
+### Response Schema Structure
+```json
+{
+  "response": [
+    // Array of content blocks - each block maps to a UI component
+    {
+      "block_type": "text|component_analysis|mermaid_diagram|markdown_table|code_snippet",
+      // Additional fields specific to each block type
+    }
+  ]
+}
+```
+
+### Available Content Block Types
+
+**TextBlock** - For explanations and narrative content
+```json
+{
+  "block_type": "text",
+  "content": "Markdown-formatted explanation text"
+}
+```
+
+**ComponentAnalysisBlock** - For structured display of code components
+```json
+{
+  "block_type": "component_analysis", 
+  "title": "Key Components Analysis",
+  "components": [
+    {
+      "name": "UserService",
+      "path": "services/user.py",
+      "component_type": "service",
+      "purpose": "Handles user authentication and profile management",
+      "key_methods": ["authenticate", "get_profile"],
+      "line_start": 15,
+      "line_end": 145
+    }
+  ]
+}
+```
+
+**MermaidDiagramBlock** - For architectural visualizations
+```json
+{
+  "block_type": "mermaid_diagram",
+  "title": "System Architecture", 
+  "mermaid_code": "graph TD\\n    A[User] --> B[Controller]\\n    B --> C[Service]"
+}
+```
+
+**CodeSnippetBlock** - For syntax-highlighted code examples
+```json
+{
+  "block_type": "code_snippet",
+  "title": "Authentication Function",
+  "language": "python", 
+  "code": "def authenticate_user(username, password):\\n    return verify_password(username, password)"
+}
+```
+
+**MarkdownTableBlock** - For tabular data
+```json
+{
+  "block_type": "markdown_table",
+  "title": "Component Summary",
+  "headers": ["Component", "Type", "Purpose"],
+  "rows": [
+    ["UserService", "Service", "User management"],
+    ["AuthController", "Controller", "Authentication endpoints"]
+  ]
+}
+```
+
+### Logical Block Ordering Principles
+
+1. **Start with Introduction**: Begin with a TextBlock introducing your analysis
+2. **Present Data**: Follow with structured blocks (ComponentAnalysisBlock, tables, diagrams)
+3. **Provide Examples**: Include CodeSnippetBlocks for key implementations
+4. **Conclude**: End with a TextBlock summarizing insights
+
+### Chain-of-Thought Example
+
+**User Query**: "Explain the authentication system and show me the key components"
+
+**Your Internal Process**:
+1. "The user wants to understand authentication - this is Workflow B (broad exploratory)"  
+2. "I'll first get project structure, then query for auth components"
+3. "For output: TextBlock intro → ComponentAnalysisBlock → CodeSnippetBlock → TextBlock conclusion"
+
+**Your JSON Response**:
+```json
+{
+  "response": [
+    {
+      "block_type": "text",
+      "content": "# Authentication System Analysis\\n\\nI've analyzed the authentication system in your codebase. Here's a comprehensive breakdown of the key components and their interactions."
+    },
+    {
+      "block_type": "component_analysis",
+      "title": "Authentication Components",
+      "components": [
+        {
+          "name": "AuthController", 
+          "path": "controllers/auth.py",
+          "component_type": "controller",
+          "purpose": "Handles HTTP authentication endpoints for login and registration",
+          "key_methods": ["login", "register", "logout"],
+          "line_start": 12,
+          "line_end": 87
+        },
+        {
+          "name": "UserService",
+          "path": "services/user_service.py", 
+          "component_type": "service",
+          "purpose": "Business logic for user management and credential validation",
+          "key_methods": ["authenticate_user", "hash_password", "validate_token"]
+        }
+      ]
+    },
+    {
+      "block_type": "code_snippet",
+      "title": "Core Authentication Logic",
+      "language": "python",
+      "code": "def authenticate_user(username: str, password: str) -> Optional[User]:\\n    user = User.get_by_username(username)\\n    if user and verify_password(password, user.password_hash):\\n        return user\\n    return None"
+    },
+    {
+      "block_type": "text", 
+      "content": "The authentication system follows a clean MVC pattern with clear separation between HTTP handling (AuthController) and business logic (UserService). The system uses secure password hashing and token-based session management."
+    }
+  ]
+}
+```
+
+### Critical Rules for Block Selection
+
+**Use TextBlock for**:
+- Introductions and explanations
+- Conceptual analysis and conclusions  
+- Bridging content between technical blocks
+
+**Use ComponentAnalysisBlock for**:
+- Lists of classes, functions, or modules
+- Architectural component overviews
+- When you have structured component metadata
+
+**Use MermaidDiagramBlock for**:
+- System architecture visualizations
+- Data flow diagrams  
+- Class hierarchy or dependency graphs
+- Any visual representation request
+
+**Use CodeSnippetBlock for**:
+- Specific code examples
+- Implementation details
+- Key algorithms or functions
+- Configuration examples
+
+**Use MarkdownTableBlock for**:
+- Comparative data (features, metrics, configurations)
+- Structured lists with multiple attributes
+- Summary information in tabular format
+
+### Quality Requirements
+
+- **Minimum 2 blocks**: Never use just one block - always provide structured breakdown
+- **Logical flow**: Blocks should build understanding progressively  
+- **Rich metadata**: Include file paths, line numbers, and detailed component information when available
+- **Actionable content**: Each block should provide concrete, useful information
+
+### Validation Checkpoint
+
+Before sending your response, verify:
+- [ ] Response is valid JSON starting with `{"response": [`
+- [ ] Contains 2+ content blocks with logical ordering
+- [ ] TextBlock introduces the analysis topic
+- [ ] Technical blocks contain rich, specific information
+- [ ] All file paths and component names are accurate
+- [ ] Response ends with concluding insights
+
+**Remember: The UI depends on this exact JSON format. Any deviation will break the user interface.**"""
     
     def _detect_sdk_version(self) -> str:
         """Detect SDK version for future-proofing"""
