@@ -642,13 +642,31 @@ class CerebrasNativeAgent:
     
     async def _structure_as_text_block(self, content: str) -> str:
         """
-        Wrap any content as a simple TextBlock within UnifiedAgentResponse structure.
+        Parse markdown content and structure it into appropriate content blocks.
         
-        This is the fallback method that ensures we always return valid structure.
+        This method analyzes the LLM's markdown response and splits it into:
+        - TextBlock: Regular markdown content
+        - CodeSnippetBlock: Code blocks with language detection
+        - MermaidDiagramBlock: Mermaid diagrams  
+        - MarkdownTableBlock: Tables
         """
         import json
+        import re
         
         try:
+            # Parse the markdown content into structured blocks
+            blocks = self._parse_markdown_content(content)
+            
+            structured_response = {
+                "response": blocks
+            }
+            
+            logger.info(f"✅ Parsed markdown into {len(blocks)} content blocks")
+            return json.dumps(structured_response, indent=2, ensure_ascii=False)
+            
+        except Exception as e:
+            logger.error(f"❌ Markdown parsing failed, falling back to single text block: {e}")
+            # Fallback to single text block
             structured_response = {
                 "response": [
                     {
@@ -658,10 +676,190 @@ class CerebrasNativeAgent:
                 ]
             }
             return json.dumps(structured_response, indent=2, ensure_ascii=False)
+    
+    def _parse_markdown_content(self, content: str) -> list:
+        """
+        Parse markdown content into structured content blocks.
+        
+        Returns:
+            List of content blocks with appropriate block_type
+        """
+        blocks = []
+        current_text = []
+        lines = content.split('\n')
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            # Check for mermaid diagram
+            if line.strip().startswith('```mermaid'):
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text",
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract mermaid diagram
+                i += 1
+                mermaid_lines = []
+                title = "Diagram"  # Default title
+                
+                while i < len(lines) and not lines[i].strip().startswith('```'):
+                    mermaid_lines.append(lines[i])
+                    i += 1
+                
+                mermaid_code = '\n'.join(mermaid_lines).strip()
+                if mermaid_code:
+                    blocks.append({
+                        "block_type": "mermaid_diagram",
+                        "title": title,
+                        "mermaid_code": mermaid_code
+                    })
+                
+            # Check for code blocks
+            elif line.strip().startswith('```') and not line.strip().startswith('```mermaid'):
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text",
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract code block
+                language_match = re.match(r'```(\w+)', line.strip())
+                language = language_match.group(1) if language_match else 'text'
+                
+                i += 1
+                code_lines = []
+                while i < len(lines) and not lines[i].strip().startswith('```'):
+                    code_lines.append(lines[i])
+                    i += 1
+                
+                code_content = '\n'.join(code_lines).strip()
+                if code_content:
+                    # Determine title based on language and context
+                    title = f"{language.title()} Code"
+                    if language == 'java':
+                        title = "Java Implementation"
+                    elif language == 'javascript':
+                        title = "JavaScript Code"
+                    elif language == 'python':
+                        title = "Python Code"
+                    
+                    blocks.append({
+                        "block_type": "code_snippet",
+                        "title": title,
+                        "language": language,
+                        "code": code_content
+                    })
+                
+            # Check for markdown tables
+            elif '|' in line and line.count('|') >= 2:
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text", 
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract table
+                table_lines = [line]
+                i += 1
+                
+                # Get header separator line (if exists)
+                if i < len(lines) and '|' in lines[i] and ('-' in lines[i] or ':' in lines[i]):
+                    table_lines.append(lines[i])
+                    i += 1
+                
+                # Get remaining table rows
+                while i < len(lines) and '|' in lines[i] and lines[i].strip():
+                    table_lines.append(lines[i])
+                    i += 1
+                
+                # Parse table structure
+                table_data = self._parse_table_structure(table_lines)
+                if table_data:
+                    blocks.append(table_data)
+                
+                # Don't increment i here as we've already processed all table lines
+                continue
+                
+            else:
+                # Regular text line
+                current_text.append(line)
+            
+            i += 1
+        
+        # Add any remaining text
+        if current_text:
+            text_content = '\n'.join(current_text).strip()
+            if text_content:
+                blocks.append({
+                    "block_type": "text",
+                    "content": text_content
+                })
+        
+        return blocks if blocks else [{"block_type": "text", "content": content}]
+    
+    def _parse_table_structure(self, table_lines: list) -> dict:
+        """
+        Parse markdown table lines into MarkdownTableBlock structure.
+        
+        Args:
+            table_lines: List of table lines including headers and rows
+            
+        Returns:
+            MarkdownTableBlock dict or None if parsing fails
+        """
+        try:
+            if len(table_lines) < 1:
+                return None
+                
+            # Extract headers from first line
+            header_line = table_lines[0].strip()
+            headers = [h.strip() for h in header_line.split('|') if h.strip()]
+            
+            if not headers:
+                return None
+            
+            # Skip separator line if it exists
+            start_row = 1
+            if len(table_lines) > 1 and ('---' in table_lines[1] or ':--' in table_lines[1]):
+                start_row = 2
+                
+            # Extract data rows
+            rows = []
+            for i in range(start_row, len(table_lines)):
+                row_line = table_lines[i].strip()
+                if row_line:
+                    row_cells = [cell.strip() for cell in row_line.split('|') if cell.strip()]
+                    if row_cells and len(row_cells) >= len(headers):
+                        # Ensure row has same number of cells as headers
+                        rows.append(row_cells[:len(headers)])
+            
+            if rows:
+                return {
+                    "block_type": "markdown_table",
+                    "title": "Data Table",
+                    "headers": headers,
+                    "rows": rows
+                }
+                
         except Exception as e:
-            logger.error(f"❌ Text block structuring failed: {e}")
-            # Ultra-minimal fallback
-            return '{"response": [{"block_type": "text", "content": "Response formatting error"}]}'
+            logger.warning(f"⚠️ Table parsing failed: {e}")
+            
+        return None
     
     async def _validate_response_structure(self, raw_response: str, attempt: int) -> Optional[str]:
         """
