@@ -211,7 +211,33 @@ export const useWebSocket = () => {
         
         console.log('🚨 FINAL_RESULT DEBUG - CLEAN OUTPUT:', cleanOutput)
         
-        const structured = data.structured_response || undefined
+        // FIX: Parse structured JSON from output field (where backend actually sends it)
+        let parsedStructuredResponse = undefined
+        if (cleanOutput) {
+          try {
+            console.log('🚨 PARSING: Attempting to parse cleanOutput as JSON')
+            const parsed = JSON.parse(cleanOutput)
+            console.log('🚨 PARSING: JSON parse successful, checking structure:', parsed)
+            // Check if it's the unified content block format
+            if (parsed.response && Array.isArray(parsed.response)) {
+              parsedStructuredResponse = parsed
+              console.log('🚨 FIXED: Found structured JSON in output field:', parsedStructuredResponse)
+            } else {
+              console.log('🚨 PARSING: JSON structure does not match unified format:', {
+                hasResponse: !!parsed.response,
+                isArray: Array.isArray(parsed.response),
+                keys: Object.keys(parsed)
+              })
+            }
+          } catch (e) {
+            // Not JSON, that's fine - it's markdown content
+            console.log('🚨 FIXED: Output is not JSON, treating as markdown:', e)
+          }
+        } else {
+          console.log('🚨 PARSING: cleanOutput is empty or undefined')
+        }
+        
+        const structured = data.structured_response || parsedStructuredResponse || undefined
         const formatted = data.formatted_response || undefined
         
         console.log('🚨 FINAL_RESULT DEBUG - STRUCTURED:', !!structured)
@@ -224,13 +250,13 @@ export const useWebSocket = () => {
         console.log('🚨 FINAL_RESULT DEBUG - HAS EXISTING STRUCTURED:', hasExistingStructured)
         
         // ALWAYS prioritize structured response over formatted, and never overwrite existing structured
-        const finalStructuredResponse = hasExistingStructured ? currentStructured : (structured || formatted || undefined)
+        const finalStructuredResponse = hasExistingStructured ? currentStructured : (structured || undefined)
         
         console.log('🚨 FINAL_RESULT DEBUG - FINAL STRUCTURED RESPONSE:', finalStructuredResponse)
         
         const messageUpdate = {
-          content: (structured || hasExistingStructured) ? '' : cleanOutput,
-          output: cleanOutput || undefined,  // NEW: Map backend output to frontend output field
+          content: (structured || hasExistingStructured) ? '' : (parsedStructuredResponse ? '' : cleanOutput),
+          output: parsedStructuredResponse ? undefined : cleanOutput,  // Don't pass raw JSON to output field
           isProcessing: false,
           isComplete: true,
           toolCalls: finalLastMessage?.bufferedToolCalls || [],
