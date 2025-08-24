@@ -424,9 +424,10 @@ class CerebrasNativeAgent:
     async def _validate_and_correct_response(self, synthesis_params: Dict[str, Any], selected_model: str) -> str:
         """
         REQ-UI-UNIFIED-4: Implement Backend Validation and Self-Correction
+        REQ-3.4.2: Error Recovery & Self-Correction System
         
         Validates LLM response against UnifiedAgentResponse schema with retry loop.
-        Implements robust error handling and progressive correction prompts.
+        Implements Phase 3 error recovery with Mermaid syntax validation.
         """
         max_retries = 2
         
@@ -442,6 +443,18 @@ class CerebrasNativeAgent:
                 response_length = len(raw_response) if raw_response else 0
                 logger.info(f"📝 Raw response received ({response_length} chars)")
                 logger.debug(f"📄 Full Raw Response:\n{'='*50}\n{raw_response}\n{'='*50}")
+                
+                # REQ-3.4.2: Phase 3 Mermaid validation with error recovery
+                mermaid_validation_errors = await self._validate_mermaid_syntax(raw_response)
+                if mermaid_validation_errors and attempt < max_retries:
+                    # Phase 3: Let LLM learn from syntax errors
+                    correction_prompt = self._generate_mermaid_correction_prompt(mermaid_validation_errors)
+                    synthesis_params["messages"].append({
+                        "role": "user", 
+                        "content": correction_prompt
+                    })
+                    logger.warning(f"⚠️ Mermaid syntax errors found, requesting correction (attempt {attempt + 2})")
+                    continue
                 
                 # Attempt validation
                 validated_response = await self._validate_response_structure(raw_response, attempt)
@@ -589,15 +602,45 @@ class CerebrasNativeAgent:
         
         This handles the case where the LLM provided content but it may not be
         properly structured according to our schema.
+        
+        REQ-3.4.2: Phase 3 - Use full correction loop if Mermaid diagrams need validation.
         """
-        # Try to apply the full validation and correction process
         try:
-            # Create minimal synthesis params for validation
-            synthesis_params = {
-                "messages": [{"role": "system", "content": ""}],  # Dummy for validation
-            }
-            # Use existing validation system but with the raw response
+            # REQ-3.4.2: Check if response contains Mermaid diagrams that might need correction
+            import re
+            has_mermaid = bool(re.search(r'```mermaid', raw_response or '', re.IGNORECASE))
+            
+            if has_mermaid:
+                # Check for Mermaid syntax errors
+                mermaid_errors = await self._validate_mermaid_syntax(raw_response)
+                if mermaid_errors:
+                    logger.info(f"🔄 Phase 3: Mermaid errors detected, using full correction loop for {len(mermaid_errors)} errors")
+                    
+                    # Use full correction loop to allow LLM to learn and fix Mermaid syntax
+                    synthesis_params = {
+                        "model": "gpt-oss-120b",  # Use default model
+                        "messages": [
+                            {
+                                "role": "system", 
+                                "content": "You are a code analyst. Please provide a response that follows proper Mermaid diagram syntax."
+                            },
+                            {
+                                "role": "user",
+                                "content": "Please review and correct any Mermaid diagram syntax errors in the following response, then provide the complete corrected response:"
+                            },
+                            {
+                                "role": "assistant",
+                                "content": raw_response
+                            }
+                        ]
+                    }
+                    
+                    # Use full validation and correction with retry loop
+                    return await self._validate_and_correct_response(synthesis_params, "gpt-oss-120b")
+            
+            # No Mermaid issues, use streamlined single response validation
             return await self._validate_and_correct_single_response(raw_response)
+            
         except Exception as e:
             logger.warning(f"⚠️ LLM response structuring failed, wrapping as text: {e}")
             return await self._structure_as_text_block(raw_response)
@@ -608,7 +651,16 @@ class CerebrasNativeAgent:
         
         This is a streamlined version of the validation process for responses
         that don't need the full correction cycle.
+        
+        REQ-3.4.2: Now includes Mermaid syntax validation for Phase 3 compliance.
         """
+        # REQ-3.4.2: Phase 3 Mermaid validation (but no correction since this is single-shot)
+        mermaid_validation_errors = await self._validate_mermaid_syntax(raw_response)
+        if mermaid_validation_errors:
+            logger.warning(f"⚠️ Mermaid syntax errors detected in single response (cannot auto-correct): {len(mermaid_validation_errors)} errors")
+            for error in mermaid_validation_errors:
+                logger.warning(f"🔍 MERMAID ERROR: {error}")
+        
         # Attempt validation
         validated_response = await self._validate_response_structure(raw_response, 0)
         
@@ -654,14 +706,23 @@ class CerebrasNativeAgent:
         import re
         
         try:
+            logger.info("🔧 PARSER: Starting markdown content parsing")
+            logger.info(f"🔧 PARSER: Input content length: {len(content)}")
+            logger.info(f"🔧 PARSER: Input preview: {content[:200]}...")
+            
             # Parse the markdown content into structured blocks
             blocks = self._parse_markdown_content(content)
+            
+            logger.info(f"🔧 PARSER: Generated {len(blocks)} blocks")
+            for i, block in enumerate(blocks):
+                logger.info(f"🔧 PARSER: Block {i}: {block['block_type']} - {len(str(block.get('content', block.get('code', block.get('mermaid_code', '')))))} chars")
             
             structured_response = {
                 "response": blocks
             }
             
             logger.info(f"✅ Parsed markdown into {len(blocks)} content blocks")
+            logger.info(f"🔧 PARSER: Final JSON size: {len(json.dumps(structured_response))}")
             return json.dumps(structured_response, indent=2, ensure_ascii=False)
             
         except Exception as e:
@@ -684,9 +745,11 @@ class CerebrasNativeAgent:
         Returns:
             List of content blocks with appropriate block_type
         """
+        import re
         blocks = []
         current_text = []
         lines = content.split('\n')
+        logger.info(f"🔧 PARSER: Processing {len(lines)} lines")
         i = 0
         
         while i < len(lines):
@@ -694,6 +757,7 @@ class CerebrasNativeAgent:
             
             # Check for mermaid diagram
             if line.strip().startswith('```mermaid'):
+                logger.info(f"🔧 PARSER: Found mermaid diagram at line {i}")
                 # Save any accumulated text
                 if current_text:
                     text_content = '\n'.join(current_text).strip()
@@ -723,6 +787,7 @@ class CerebrasNativeAgent:
                 
             # Check for code blocks
             elif line.strip().startswith('```') and not line.strip().startswith('```mermaid'):
+                logger.info(f"🔧 PARSER: Found code block at line {i}: {line.strip()}")
                 # Save any accumulated text
                 if current_text:
                     text_content = '\n'.join(current_text).strip()
@@ -763,6 +828,7 @@ class CerebrasNativeAgent:
                 
             # Check for markdown tables
             elif '|' in line and line.count('|') >= 2:
+                logger.info(f"🔧 PARSER: Found table at line {i}: {line.strip()[:50]}...")
                 # Save any accumulated text
                 if current_text:
                     text_content = '\n'.join(current_text).strip()
@@ -860,6 +926,114 @@ class CerebrasNativeAgent:
             logger.warning(f"⚠️ Table parsing failed: {e}")
             
         return None
+    
+    
+    async def _validate_mermaid_syntax(self, raw_response: str) -> List[str]:
+        """
+        REQ-3.4.2: Validate Mermaid syntax and return specific error messages.
+        
+        Returns:
+            List of syntax errors found in Mermaid diagrams, empty list if valid
+        """
+        import re
+        
+        errors = []
+        
+        try:
+            # Find all mermaid code blocks
+            mermaid_blocks = re.findall(r'```mermaid([\s\S]*?)```', raw_response)
+            
+            for i, mermaid_code in enumerate(mermaid_blocks):
+                mermaid_code = mermaid_code.strip()
+                
+                # Check for common syntax issues that break rendering
+                
+                # 1. Invalid curly braces in labels (common UML pattern that breaks Mermaid)
+                if re.search(r'\{[^}]*\}', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Contains curly braces {{}} in labels, which are invalid in Mermaid. Use parentheses () or brackets [] instead.")
+                
+                # 2. Invalid UML-style method signatures
+                if re.search(r'\+\w+\s*\(', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Contains UML-style method signatures with + prefix, which are invalid in Mermaid. Use plain text labels instead.")
+                
+                # 3. Invalid node IDs with special characters
+                invalid_node_ids = re.findall(r'^([^\s\[\-]+)[\[\-]', mermaid_code, re.MULTILINE)
+                for node_id in invalid_node_ids:
+                    if re.search(r'[^a-zA-Z0-9_]', node_id):
+                        errors.append(f"Diagram {i+1}: Node ID '{node_id}' contains special characters. Use only alphanumeric characters and underscores.")
+                
+                # 4. Check for missing diagram type declaration
+                if not re.match(r'\s*(flowchart|graph|classDiagram|sequenceDiagram)', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Missing diagram type declaration. Must start with 'flowchart', 'graph', 'classDiagram', or 'sequenceDiagram'.")
+                
+                # 5. Check for invalid characters in labels
+                bracket_labels = re.findall(r'\[([^\]]+)\]', mermaid_code)
+                for label in bracket_labels:
+                    if re.search(r'[\[\]{}]', label):
+                        errors.append(f"Diagram {i+1}: Label '{label}' contains invalid characters. Avoid nested brackets, braces, and special characters in labels.")
+            
+            if errors:
+                logger.warning(f"🔍 MERMAID VALIDATION: Found {len(errors)} syntax errors")
+                for error in errors:
+                    logger.warning(f"🔍 MERMAID ERROR: {error}")
+            else:
+                logger.info(f"✅ MERMAID VALIDATION: {len(mermaid_blocks)} diagrams validated successfully")
+            
+            return errors
+            
+        except Exception as e:
+            logger.error(f"❌ Mermaid validation failed: {e}")
+            return []  # Don't block on validation errors
+    
+    def _generate_mermaid_correction_prompt(self, errors: List[str]) -> str:
+        """
+        REQ-3.4.2: Generate correction prompt for Mermaid syntax errors.
+        
+        This enables the LLM to learn proper Mermaid syntax through error feedback.
+        """
+        error_list = "\n".join([f"- {error}" for error in errors])
+        
+        return f"""The Mermaid diagrams in your response contain syntax errors that will prevent them from rendering:
+
+{error_list}
+
+Please fix these syntax errors and regenerate your response. Remember:
+- Use parentheses () or brackets [] for labels, never curly braces {{}}
+- Avoid UML-style + prefixes for methods
+- Use only alphanumeric characters and underscores for node IDs
+- Always start diagrams with a valid type: flowchart, graph, classDiagram, or sequenceDiagram
+- Don't nest special characters inside labels
+- When generating structured JSON, use "block_type": "mermaid_diagram" (not "mermaid")
+
+Correct Mermaid examples:
+```mermaid
+flowchart TD
+    A[User Request] --> B[Process Data]
+    B --> C[Return Response]
+```
+
+```mermaid
+classDiagram
+    class User {{
+        +String name
+        +login()
+    }}
+```
+
+For structured JSON responses, use this format:
+```json
+{{
+  "response": [
+    {{
+      "block_type": "mermaid_diagram",
+      "title": "System Architecture",
+      "mermaid_code": "flowchart TD\\n    A[Component] --> B[Process]"
+    }}
+  ]
+}}
+```
+
+Please regenerate your complete response with properly formatted Mermaid diagrams."""
     
     async def _validate_response_structure(self, raw_response: str, attempt: int) -> Optional[str]:
         """
