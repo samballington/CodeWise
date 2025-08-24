@@ -118,7 +118,188 @@ function ToolOutput({ tool, input, output, status }: ToolOutputProps) {
   )
 }
 
-// STRUCTURED RESPONSE RENDERER COMPONENT
+// INDIVIDUAL CONTENT BLOCK RENDERERS
+function TextBlockRenderer({ block }: { block: any }) {
+  return (
+    <div className="prose prose-sm max-w-none dark:prose-invert mb-4">
+      <ReactMarkdown
+        components={{
+          code({ className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '')
+            return match ? (
+              <div className="relative">
+                <SyntaxHighlighter
+                  style={vscDarkPlus}
+                  language={match[1]}
+                  PreTag="div"
+                  customStyle={{
+                    margin: '0.5rem 0',
+                    borderRadius: '8px',
+                    fontSize: '0.875rem',
+                  }}
+                  {...props}
+                >
+                  {String(children).replace(/\n$/, '')}
+                </SyntaxHighlighter>
+                <CopyButton text={String(children)} />
+              </div>
+            ) : (
+              <code className="bg-background-primary px-1.5 py-0.5 rounded text-sm border border-border" {...props}>
+                {children}
+              </code>
+            )
+          }
+        }}
+      >
+        {block.content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+function ComponentAnalysisRenderer({ block }: { block: any }) {
+  return (
+    <div className="border border-border rounded-lg p-4 mb-4">
+      <h3 className="font-semibold text-lg mb-3 text-text-primary">{block.title}</h3>
+      <div className="grid gap-3">
+        {block.components.map((component: any, cidx: number) => (
+          <div key={cidx} className="border-l-4 border-accent pl-4 hover:bg-background-secondary/30 transition-colors rounded-r-md py-2">
+            <div className="font-medium text-base text-text-primary mb-1">{component.name}</div>
+            <div className="text-sm text-accent font-mono mb-1">{component.path}</div>
+            <div className="text-sm text-text-secondary mb-2">{component.purpose}</div>
+            
+            {component.key_methods && component.key_methods.length > 0 && (
+              <div className="text-xs text-accent mb-1">
+                <span className="font-medium">Methods:</span> {component.key_methods.join(', ')}
+              </div>
+            )}
+            
+            {component.line_start && component.line_end && (
+              <div className="text-xs text-text-secondary">
+                <span className="font-medium">Lines:</span> {component.line_start}-{component.line_end}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function CodeSnippetRenderer({ block }: { block: any }) {
+  return (
+    <div className="border border-border rounded-lg overflow-hidden mb-4">
+      <div className="bg-background-secondary px-4 py-2 border-b border-border">
+        <h4 className="font-medium text-text-primary">{block.title}</h4>
+      </div>
+      <div className="relative">
+        <SyntaxHighlighter
+          style={vscDarkPlus}
+          language={block.language || 'text'}
+          PreTag="div"
+          customStyle={{
+            margin: 0,
+            borderRadius: 0,
+            background: '#0f1419',
+            fontSize: '0.875rem'
+          }}
+        >
+          {block.code}
+        </SyntaxHighlighter>
+        <CopyButton text={block.code} />
+      </div>
+    </div>
+  )
+}
+
+function MermaidDiagramRenderer({ block }: { block: any }) {
+  return (
+    <div className="border border-border rounded-lg p-4 mb-4">
+      <h3 className="font-semibold text-lg mb-3 text-text-primary">{block.title}</h3>
+      <div className="flex justify-center">
+        <Mermaid code={block.mermaid_code} title={block.title} />
+      </div>
+    </div>
+  )
+}
+
+function MarkdownTableRenderer({ block }: { block: any }) {
+  return (
+    <div className="border border-border rounded-lg overflow-hidden mb-4">
+      <div className="bg-background-secondary px-4 py-2 border-b border-border">
+        <h4 className="font-medium text-text-primary">{block.title}</h4>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full">
+          <thead className="bg-background-primary border-b border-border">
+            <tr>
+              {block.headers.map((header: string, hidx: number) => (
+                <th key={hidx} className="px-4 py-3 text-left font-semibold text-text-primary border-r border-border last:border-r-0">
+                  {header}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {block.rows.map((row: string[], ridx: number) => (
+              <tr key={ridx} className="border-b border-border hover:bg-background-secondary/30">
+                {row.map((cell: string, cidx: number) => (
+                  <td key={cidx} className="px-4 py-3 text-text-primary border-r border-border last:border-r-0 align-top">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// UNIFIED CONTENT BLOCK RENDERER
+function UnifiedContentBlockRenderer({ blocks }: { blocks: any[] }) {
+  return (
+    <div className="space-y-0 w-full">
+      {blocks.map((block, idx) => {
+        if (!block || typeof block !== 'object' || !block.block_type) {
+          console.warn(`Invalid content block at index ${idx}:`, block)
+          return (
+            <div key={idx} className="text-red-500 text-sm border border-red-500/30 rounded p-2 mb-4">
+              Invalid content block: {JSON.stringify(block)}
+            </div>
+          )
+        }
+
+        switch (block.block_type) {
+          case 'text':
+            return <TextBlockRenderer key={idx} block={block} />
+          case 'component_analysis':
+            return <ComponentAnalysisRenderer key={idx} block={block} />
+          case 'code_snippet':
+            return <CodeSnippetRenderer key={idx} block={block} />
+          case 'mermaid_diagram':
+            return <MermaidDiagramRenderer key={idx} block={block} />
+          case 'markdown_table':
+            return <MarkdownTableRenderer key={idx} block={block} />
+          default:
+            console.warn(`Unknown block type: ${block.block_type}`)
+            return (
+              <div key={idx} className="text-yellow-500 text-sm border border-yellow-500/30 rounded p-2 mb-4">
+                Unknown block type: <code>{block.block_type}</code>
+                <details className="mt-2">
+                  <summary className="cursor-pointer">Block details</summary>
+                  <pre className="mt-2 text-xs">{JSON.stringify(block, null, 2)}</pre>
+                </details>
+              </div>
+            )
+        }
+      })}
+    </div>
+  )
+}
+
+// STRUCTURED RESPONSE RENDERER COMPONENT (LEGACY)
 function StructuredResponseRenderer({ response }: { response: any }) {
   const renderTree = (node: any, indent: string = ''): string => {
     try {
@@ -275,14 +456,21 @@ function MarkdownRenderer({ content }: { content: string }) {
 export default function MessageItem({ message }: MessageItemProps) {
   const isUser = message.role === 'user'
   
-  // DEFENSIVE RENDERING: Check for renderable structured data
-  const hasRenderableStructuredData = message.structuredResponse?.response?.sections && 
-    Array.isArray(message.structuredResponse.response.sections) && 
-    message.structuredResponse.response.sections.length > 0 &&
-    message.structuredResponse.response.sections.some((section: any) => 
-      section && typeof section === 'object' && section.content && 
-      String(section.content).trim() !== ''
-    )
+  // UNIFIED SCHEMA DETECTION: Check for both new and legacy structured data formats
+  const hasRenderableStructuredData = 
+    // NEW: Detect unified content block format (direct array)
+    (message.structuredResponse?.response && 
+     Array.isArray(message.structuredResponse.response) &&
+     message.structuredResponse.response.length > 0 &&
+     message.structuredResponse.response.every((block: any) => block?.block_type)) ||
+    // LEGACY: Maintain backward compatibility (nested sections)
+    (message.structuredResponse?.response?.sections && 
+     Array.isArray(message.structuredResponse.response.sections) && 
+     message.structuredResponse.response.sections.length > 0 &&
+     message.structuredResponse.response.sections.some((section: any) => 
+       section && typeof section === 'object' && section.content && 
+       String(section.content).trim() !== ''
+     ))
   
   // 🔍 DEBUG: Log message rendering details with defensive checks
   if (!isUser) {
@@ -319,9 +507,9 @@ export default function MessageItem({ message }: MessageItemProps) {
     }
   }
   
-  // DEFENSIVE RENDERING LOGIC
+  // UNIFIED RENDERING LOGIC
   const renderContent = () => {
-    // Show a spinner while the AI is working
+    // Show spinner while processing
     if (message.isProcessing) {
       return (
         <div className="flex items-center gap-2">
@@ -331,44 +519,64 @@ export default function MessageItem({ message }: MessageItemProps) {
       )
     }
     
-    // PRIORITY 1: Attempt to render valid structured data if it exists
-    if (hasRenderableStructuredData) {
-      console.log('🎯 DEFENSIVE: Rendering structured data')
+    // PRIORITY 1: Unified content blocks (NEW FORMAT)
+    if (message.structuredResponse?.response && Array.isArray(message.structuredResponse.response)) {
+      console.log('🎯 UNIFIED: Rendering new content block format')
       return (
-        <ErrorBoundary fallback={
-          <FallbackDisplay message="Structured content rendering failed" />
-        }>
+        <ErrorBoundary fallback={<FallbackDisplay message="Content block rendering failed" />}>
+          <UnifiedContentBlockRenderer blocks={message.structuredResponse.response} />
+        </ErrorBoundary>
+      )
+    }
+    
+    // PRIORITY 2: Legacy structured format (BACKWARD COMPATIBILITY)
+    if (message.structuredResponse?.response?.sections && 
+        Array.isArray(message.structuredResponse.response.sections)) {
+      console.log('🎯 LEGACY: Rendering legacy structured format')
+      return (
+        <ErrorBoundary fallback={<FallbackDisplay message="Legacy structured rendering failed" />}>
           <StructuredResponseRenderer response={message.structuredResponse} />
         </ErrorBoundary>
       )
     }
     
-    // PRIORITY 2: Render clean markdown output from unified pipeline
+    // PRIORITY 3: Prevent raw JSON rendering
     if (message.output && typeof message.output === 'string' && message.output.trim() !== '') {
-      console.log('🎯 DEFENSIVE: Rendering clean output from unified pipeline')
+      // Detect and prevent raw JSON from being displayed
+      try {
+        const parsed = JSON.parse(message.output)
+        if (parsed.response && Array.isArray(parsed.response)) {
+          console.log('⚠️ BLOCKED: Raw JSON detected in output field')
+          return (
+            <FallbackDisplay 
+              message="Response format error: Raw JSON detected in output field. This indicates a frontend parsing issue." 
+            />
+          )
+        }
+      } catch (e) {
+        // Not JSON, safe to render as markdown
+      }
+      
+      console.log('🎯 MARKDOWN: Rendering clean output as markdown')
       return (
-        <ErrorBoundary fallback={
-          <FallbackDisplay message="Clean output rendering failed" />
-        }>
+        <ErrorBoundary fallback={<FallbackDisplay message="Output rendering failed" />}>
           <MarkdownRenderer content={message.output} />
         </ErrorBoundary>
       )
     }
     
-    // PRIORITY 3 (FALLBACK): Render the raw markdown content if it exists
+    // PRIORITY 4: Fallback content
     if (message.content && message.content.trim() !== '') {
-      console.log('🎯 DEFENSIVE: Rendering fallback markdown content')
+      console.log('🎯 FALLBACK: Rendering content field as markdown')
       return (
-        <ErrorBoundary fallback={
-          <FallbackDisplay message="Markdown content rendering failed" />
-        }>
+        <ErrorBoundary fallback={<FallbackDisplay message="Content rendering failed" />}>
           <MarkdownRenderer content={message.content} />
         </ErrorBoundary>
       )
     }
     
-    // PRIORITY 3 (FINAL FALLBACK): Show explicit message for empty responses
-    console.log('🎯 DEFENSIVE: No renderable content found')
+    // FINAL: Empty response
+    console.log('🎯 EMPTY: No renderable content found')
     return <FallbackDisplay message="Assistant returned an empty response." />
   }
   
