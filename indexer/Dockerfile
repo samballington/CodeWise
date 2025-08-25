@@ -7,8 +7,10 @@ COPY requirements-prod.txt ./requirements-prod.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-prod.txt
 
-# Copy source code into /app/indexer
+# Copy indexer source code 
 COPY . /app/indexer
+
+# Note: storage module will be copied from docker-compose volume mount
 
 ENV WORKSPACE_DIR=/workspace
 ENV OPENAI_API_KEY=""

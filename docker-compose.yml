@@ -55,6 +55,7 @@ services:
     volumes:
       - ./workspace:/workspace
       - vector_cache:/workspace/.vector_cache
+      - ./storage:/app/storage
     networks:
       - codewise-network
 

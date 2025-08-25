@@ -378,13 +378,20 @@ class ProjectService:
             # Get project info
             project_size = ProjectService._get_directory_size(target_path)
             
-            # Notify indexer to rebuild for this project
+            # Notify indexer to rebuild for this project with progress tracking
+            indexer_triggered = False
             try:
                 import httpx, os
                 indexer_url = os.getenv("INDEXER_URL", "http://indexer:8002")
-                httpx.post(f"{indexer_url}/rebuild", json={"project": target_name}, timeout=5)
+                with httpx.Client() as client:
+                    response = client.post(f"{indexer_url}/rebuild", json={"project": target_name}, timeout=10)
+                    if response.status_code in [200, 202]:
+                        indexer_triggered = True
+                        print(f"[backend] ✅ Indexing triggered for project: {target_name}")
+                    else:
+                        print(f"[backend] ⚠️ Indexer responded with status {response.status_code}")
             except Exception as e:
-                print(f"[backend] Warning: could not notify indexer to rebuild: {e}")
+                print(f"[backend] ❌ Failed to trigger indexer for {target_name}: {e}")
 
             return {
                 "success": True,
@@ -392,7 +399,9 @@ class ProjectService:
                 "project_name": target_name,
                 "project_path": str(target_path.relative_to(workspace_path)),
                 "size": project_size,
-                "clone_url": clone_url
+                "clone_url": clone_url,
+                "indexing_triggered": indexer_triggered,
+                "indexing_status": "started" if indexer_triggered else "failed_to_start"
             }
             
         except subprocess.TimeoutExpired:
