@@ -24,7 +24,7 @@ from storage.database_manager import DatabaseManager
 from storage.database_setup import setup_codewise_database
 from knowledge_graph.symbol_collector import SymbolCollector
 from knowledge_graph.relationship_extractor import RelationshipExtractor
-from backend.vector_store_auto import AutoGPUVectorStore
+from backend.vector_store import VectorStore as AutoGPUVectorStore
 from indexer.chunkers.hierarchical_chunker import HierarchicalChunker
 
 logger = logging.getLogger(__name__)
@@ -84,21 +84,24 @@ class UnifiedIndexer:
     for intelligent chunk linking and organization.
     """
     
-    def __init__(self, db_path: str = "codewise.db", vector_model: str = "BAAI/bge-large-en-v1.5"):
+    def __init__(self, db_path: str = "codewise.db", vector_model: str = "BAAI/bge-large-en-v1.5", 
+                 project_name: Optional[str] = None):
         """
         Initialize unified indexer with all components.
         
         Args:
             db_path: Path to SQLite database
             vector_model: BGE model for embeddings
+            project_name: Project name for consistent path normalization
         """
         # Initialize database
         self.db_path = db_path
+        self.project_name = project_name
         self.db_setup = setup_codewise_database(db_path)
         self.db_manager = DatabaseManager(db_path)
         
-        # Initialize Phase 2 components
-        self.symbol_collector = SymbolCollector(self.db_manager)
+        # Initialize Phase 2 components with project context
+        self.symbol_collector = SymbolCollector(self.db_manager, project_name=project_name)
         self.relationship_extractor = None  # Created after symbol collection
         
         # Initialize Phase 1 components with GPU acceleration
@@ -132,6 +135,41 @@ class UnifiedIndexer:
         
         logger.info(f"Unified indexer initialized with database: {db_path}")
         logger.info(f"BGE model: {vector_model}")
+        logger.info(f"Project context: {project_name or 'auto-detect'}")
+    
+    def _extract_project_name_from_path(self, codebase_path: Path) -> str:
+        """
+        Extract project name from codebase path for path normalization.
+        
+        Args:
+            codebase_path: Root path of the codebase
+            
+        Returns:
+            Project name extracted from the path
+        """
+        if self.project_name:
+            return self.project_name
+        
+        # Try to extract from path components
+        path_parts = codebase_path.parts
+        
+        # Look for workspace-style paths: /workspace/project-name/...
+        if 'workspace' in path_parts:
+            workspace_idx = path_parts.index('workspace')
+            if workspace_idx + 1 < len(path_parts):
+                project_name = path_parts[workspace_idx + 1]
+                logger.info(f"Extracted project name from workspace path: {project_name}")
+                return project_name
+        
+        # Fallback: use the directory name
+        project_name = codebase_path.name
+        if project_name:
+            logger.info(f"Using directory name as project: {project_name}")
+            return project_name
+        
+        # Final fallback
+        logger.warning("Could not extract project name, using 'unknown-project'")
+        return "unknown-project"
     
     async def index_codebase(self, codebase_path: Path, 
                       force_reindex: bool = False,
@@ -153,6 +191,14 @@ class UnifiedIndexer:
         
         # Discover files to process
         file_paths = self._discover_files(codebase_path, file_patterns)
+        
+        # Extract project name from path if not provided and update components
+        runtime_project_name = self._extract_project_name_from_path(codebase_path)
+        if runtime_project_name != self.project_name:
+            logger.info(f"Updating project context: {self.project_name} -> {runtime_project_name}")
+            self.project_name = runtime_project_name
+            # Update SymbolCollector project context
+            self.symbol_collector.project_name = runtime_project_name
         
         if not file_paths:
             logger.warning("No supported files found for indexing")
@@ -726,7 +772,8 @@ class UnifiedIndexer:
             from knowledge_graph.relationship_extractor import RelationshipExtractor
             
             logger.info("Using legacy relationship extractor")
-            self.relationship_extractor = RelationshipExtractor(self.db_manager, symbol_table)
+            self.relationship_extractor = RelationshipExtractor(self.db_manager, symbol_table, 
+                                                              project_name=self.project_name)
             self.relationship_extractor.extract_relationships(file_paths)
             return self.relationship_extractor.get_extraction_statistics()
             
