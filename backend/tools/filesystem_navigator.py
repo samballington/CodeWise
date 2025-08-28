@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 import fnmatch
 
+# Import PathManager for consistent path handling
+try:
+    from storage.path_manager import get_path_manager
+    PATH_MANAGER_AVAILABLE = True
+except ImportError:
+    PATH_MANAGER_AVAILABLE = False
+    
 logger = logging.getLogger(__name__)
 
 
@@ -28,16 +35,24 @@ class FilesystemNavigator:
     
     def __init__(self, db_manager):
         """
-        Initialize with database manager.
+        Initialize with database manager and PathManager for consistent path handling.
         
         Args:
             db_manager: DatabaseManager instance with connection attribute
         """
         self.db = db_manager
         
+        # Initialize PathManager for consistent path operations
+        if PATH_MANAGER_AVAILABLE:
+            self.path_manager = get_path_manager()
+            logger.info("FilesystemNavigator initialized with PathManager integration")
+        else:
+            self.path_manager = None
+            logger.warning("PathManager not available - using legacy path handling")
+        
     def _build_project_filter(self, base_query: str, params: list, project_scope: Optional[str] = None) -> tuple:
         """
-        Add project scope filtering to SQL query.
+        Add project scope filtering to SQL query using PathManager for accurate patterns.
         
         Args:
             base_query: Base SQL query string
@@ -48,9 +63,19 @@ class FilesystemNavigator:
             Tuple of (modified_query, modified_params)
         """
         if project_scope:
-            # Handle both absolute and relative paths for project filtering
-            relative_pattern = f"{project_scope}/%"
-            absolute_pattern = f"/workspace/{project_scope}/%"
+            # Use PathManager to build accurate search patterns if available
+            if self.path_manager:
+                try:
+                    relative_pattern, absolute_pattern = self.path_manager.build_search_patterns(project_scope)
+                    logger.debug(f"PathManager patterns: relative={relative_pattern}, absolute={absolute_pattern}")
+                except Exception as e:
+                    logger.warning(f"PathManager pattern building failed: {e}, using fallback")
+                    relative_pattern = f"{project_scope}/%"
+                    absolute_pattern = f"/workspace/{project_scope}/%"
+            else:
+                # Fallback to legacy patterns
+                relative_pattern = f"{project_scope}/%"
+                absolute_pattern = f"/workspace/{project_scope}/%"
             
             if "WHERE" in base_query.upper():
                 # Already has WHERE clause - add OR condition for both patterns
@@ -71,11 +96,97 @@ class FilesystemNavigator:
                 
                 modified_params = [relative_pattern, absolute_pattern] + params
                 
-            logger.info(f"🎯 Applied project filter: {project_scope} (checking both relative and absolute paths)")
+            logger.info(f"🎯 Applied project filter: {project_scope} (patterns: {relative_pattern}, {absolute_pattern})")
             return modified_query, modified_params
         else:
             logger.info("📂 No project filter applied - searching all projects")
             return base_query, params
+    
+    def validate_project_paths(self, project_name: str) -> Dict[str, Any]:
+        """
+        Validate path consistency for a project and provide diagnostic information.
+        
+        Args:
+            project_name: Name of the project to validate
+            
+        Returns:
+            Dictionary with validation results and suggestions
+        """
+        cursor = self.db.connection.cursor()
+        
+        # Check different path formats for the project
+        relative_pattern = f"{project_name}/%"
+        absolute_pattern = f"/workspace/{project_name}/%"
+        
+        # Count files by path format
+        relative_count = cursor.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM nodes WHERE file_path LIKE ?", 
+            [relative_pattern]
+        ).fetchone()[0]
+        
+        absolute_count = cursor.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM nodes WHERE file_path LIKE ?", 
+            [absolute_pattern]
+        ).fetchone()[0]
+        
+        # Only check for files without project prefix if the project actually exists
+        no_prefix_count = 0
+        if relative_count > 0 or absolute_count > 0:
+            # Project exists, check for files without project prefix (potential issues)
+            no_prefix_patterns = [
+                "frontend/%", "backend/%", "src/%", "lib/%", "components/%",
+                "pages/%", "styles/%", "utils/%", "api/%", "models/%"
+            ]
+            
+            for pattern in no_prefix_patterns:
+                count = cursor.execute(
+                    "SELECT COUNT(DISTINCT file_path) FROM nodes WHERE file_path LIKE ? AND file_path NOT LIKE ? AND file_path NOT LIKE ?",
+                    [pattern, relative_pattern, absolute_pattern]
+                ).fetchone()[0]
+                no_prefix_count += count
+        
+        # Get all available projects
+        all_projects = cursor.execute("""
+            SELECT DISTINCT 
+                CASE 
+                    WHEN file_path LIKE '/workspace/%' THEN 
+                        SUBSTR(file_path, 12, INSTR(SUBSTR(file_path, 12), '/') - 1)
+                    ELSE
+                        SUBSTR(file_path, 1, INSTR(file_path, '/') - 1)
+                END as project
+            FROM nodes 
+            WHERE project != '' AND project IS NOT NULL
+            ORDER BY project
+            LIMIT 10
+        """).fetchall()
+        
+        available_projects = [p[0] for p in all_projects if p[0] and p[0] != project_name]
+        
+        return {
+            "project_name": project_name,
+            "relative_path_files": relative_count,
+            "absolute_path_files": absolute_count,
+            "no_prefix_files": no_prefix_count,
+            "total_files": relative_count + absolute_count + no_prefix_count,
+            "path_consistency": "good" if relative_count > 0 and no_prefix_count == 0 else "issues",
+            "available_projects": available_projects[:5],  # Top 5 suggestions
+            "recommendations": self._get_path_recommendations(relative_count, absolute_count, no_prefix_count)
+        }
+    
+    def _get_path_recommendations(self, relative_count: int, absolute_count: int, no_prefix_count: int) -> List[str]:
+        """Generate recommendations based on path consistency analysis."""
+        recommendations = []
+        
+        if relative_count == 0 and absolute_count == 0:
+            recommendations.append("Project not found in database - check project name spelling")
+        elif no_prefix_count > 0:
+            recommendations.append(f"Found {no_prefix_count} files without project prefix - may need path migration")
+        elif absolute_count > relative_count:
+            recommendations.append("Most files use absolute paths - consider running path migration for consistency")
+        elif relative_count > 0:
+            recommendations.append("Project has consistent normalized paths - filesystem navigation should work correctly")
+        
+        return recommendations
     
     def execute(self, operation: str, path: str = None, pattern: str = None, 
                 recursive: bool = False, project_scope: str = None) -> Dict[str, Any]:
@@ -107,8 +218,12 @@ class FilesystemNavigator:
                 if not path:
                     return {"error": "A 'path' is required for the 'tree' operation."}
                 return self._show_tree(path, project_scope)
+            elif operation == "validate":
+                if not project_scope:
+                    return {"error": "A 'project_scope' is required for the 'validate' operation."}
+                return self.validate_project_paths(project_scope)
             else:
-                return {"error": f"Unknown operation: {operation}. Valid operations: list, find, tree"}
+                return {"error": f"Unknown operation: {operation}. Valid operations: list, find, tree, validate"}
                 
         except sqlite3.Error as e:
             logger.error(f"Database query failed for operation {operation}: {e}")
@@ -143,19 +258,44 @@ class FilesystemNavigator:
         path_check = cursor.execute(query, query_params).fetchone()[0]
         
         if path_check == 0:
-            # Suggest alternatives
-            project_suggestions = cursor.execute(
-                "SELECT DISTINCT SUBSTR(file_path, 1, INSTR(file_path, '/') - 1) as project FROM nodes WHERE project != '' LIMIT 5"
-            ).fetchall()
-            suggestions = [s[0] for s in project_suggestions if s[0]]
-            
-            return {
-                "error": f"Path '{path}' not found in codebase",
-                "suggestions": f"Try searching in these projects: {', '.join(suggestions)}",
-                "files": [],
-                "operation": "list",
-                "path": path
-            }
+            # Enhanced error handling with path validation
+            if project_scope:
+                # If project was specified, validate its path consistency
+                validation = self.validate_project_paths(project_scope)
+                
+                if validation['total_files'] == 0:
+                    return {
+                        "error": f"Project '{project_scope}' not found in codebase",
+                        "suggestions": f"Available projects: {', '.join(validation['available_projects'])}",
+                        "files": [],
+                        "operation": "list",
+                        "path": path,
+                        "validation": validation
+                    }
+                else:
+                    return {
+                        "error": f"Path '{path}' not found in project '{project_scope}'",
+                        "project_info": f"Project has {validation['total_files']} files",
+                        "recommendations": validation['recommendations'],
+                        "files": [],
+                        "operation": "list", 
+                        "path": path,
+                        "validation": validation
+                    }
+            else:
+                # Generic suggestions when no project specified
+                project_suggestions = cursor.execute(
+                    "SELECT DISTINCT SUBSTR(file_path, 1, INSTR(file_path, '/') - 1) as project FROM nodes WHERE project != '' LIMIT 5"
+                ).fetchall()
+                suggestions = [s[0] for s in project_suggestions if s[0]]
+                
+                return {
+                    "error": f"Path '{path}' not found in codebase",
+                    "suggestions": f"Try specifying a project: {', '.join(suggestions)}",
+                    "files": [],
+                    "operation": "list",
+                    "path": path
+                }
         
         cursor = self.db.connection.cursor()
         
