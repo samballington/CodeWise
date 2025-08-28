@@ -6,6 +6,8 @@
   -webkit-user-select: none;
   -moz-user-select: none;
   -ms-user-select: none;
+  width: 100%;
+  min-height: 300px;
 }
 
 .interactive-mermaid-container:hover {
@@ -205,6 +207,10 @@
 
 /* Responsive adjustments */
 @media (max-width: 768px) {
+  .interactive-mermaid-container {
+    min-height: 250px;
+  }
+  
   .minimap {
     width: 96px;
     height: 72px;
@@ -221,6 +227,12 @@
   
   .fullscreen-content {
     border-radius: 8px;
+  }
+}
+
+@media (min-width: 1200px) {
+  .interactive-mermaid-container {
+    min-height: 400px;
   }
 }
 

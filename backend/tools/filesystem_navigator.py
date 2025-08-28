@@ -35,8 +35,50 @@ class FilesystemNavigator:
         """
         self.db = db_manager
         
+    def _build_project_filter(self, base_query: str, params: list, project_scope: Optional[str] = None) -> tuple:
+        """
+        Add project scope filtering to SQL query.
+        
+        Args:
+            base_query: Base SQL query string
+            params: List of query parameters
+            project_scope: Project name to filter by
+            
+        Returns:
+            Tuple of (modified_query, modified_params)
+        """
+        if project_scope:
+            # Handle both absolute and relative paths for project filtering
+            relative_pattern = f"{project_scope}/%"
+            absolute_pattern = f"/workspace/{project_scope}/%"
+            
+            if "WHERE" in base_query.upper():
+                # Already has WHERE clause - add OR condition for both patterns
+                modified_query = base_query.replace("WHERE", f"WHERE (file_path LIKE ? OR file_path LIKE ?) AND", 1)
+                modified_params = [relative_pattern, absolute_pattern] + params
+            else:
+                # No WHERE clause - insert OR condition before final clauses
+                insertion_point = len(base_query)
+                for clause in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"]:
+                    pos = base_query.upper().find(clause)
+                    if pos != -1 and pos < insertion_point:
+                        insertion_point = pos
+                
+                if insertion_point == len(base_query):
+                    modified_query = base_query + " WHERE (file_path LIKE ? OR file_path LIKE ?)"
+                else:
+                    modified_query = base_query[:insertion_point].strip() + " WHERE (file_path LIKE ? OR file_path LIKE ?) " + base_query[insertion_point:]
+                
+                modified_params = [relative_pattern, absolute_pattern] + params
+                
+            logger.info(f"🎯 Applied project filter: {project_scope} (checking both relative and absolute paths)")
+            return modified_query, modified_params
+        else:
+            logger.info("📂 No project filter applied - searching all projects")
+            return base_query, params
+    
     def execute(self, operation: str, path: str = None, pattern: str = None, 
-                recursive: bool = False) -> Dict[str, Any]:
+                recursive: bool = False, project_scope: str = None) -> Dict[str, Any]:
         """
         Execute filesystem navigation operation.
         
@@ -45,25 +87,26 @@ class FilesystemNavigator:
             path: Directory path (required for list/tree)
             pattern: File pattern (required for find, optional for list)
             recursive: Whether to search recursively
+            project_scope: Project name to filter results (e.g., 'infinite-kanvas')
             
         Returns:
             Dictionary with operation results or error information
         """
         try:
-            logger.info(f"Executing filesystem operation: {operation} path={path} pattern={pattern} recursive={recursive}")
+            logger.info(f"Executing filesystem operation: {operation} path={path} pattern={pattern} recursive={recursive} project_scope={project_scope}")
             
             if operation == "list":
                 if not path:
                     return {"error": "A 'path' is required for the 'list' operation."}
-                return self._list_directory(path, pattern, recursive)
+                return self._list_directory(path, pattern, recursive, project_scope)
             elif operation == "find":
                 if not pattern:
                     return {"error": "A 'pattern' is required for the 'find' operation."}
-                return self._find_files(pattern, recursive)
+                return self._find_files(pattern, recursive, project_scope)
             elif operation == "tree":
                 if not path:
                     return {"error": "A 'path' is required for the 'tree' operation."}
-                return self._show_tree(path)
+                return self._show_tree(path, project_scope)
             else:
                 return {"error": f"Unknown operation: {operation}. Valid operations: list, find, tree"}
                 
@@ -74,7 +117,7 @@ class FilesystemNavigator:
             logger.error(f"Unexpected error in filesystem navigation: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
     
-    def _list_directory(self, path: str, pattern: Optional[str], recursive: bool) -> Dict[str, Any]:
+    def _list_directory(self, path: str, pattern: Optional[str], recursive: bool, project_scope: Optional[str] = None) -> Dict[str, Any]:
         """
         List files in a specific directory.
         
@@ -91,9 +134,13 @@ class FilesystemNavigator:
         
         # Quick validation - check if path exists in any files before doing expensive queries
         cursor = self.db.connection.cursor()
-        path_check = cursor.execute(
-            "SELECT COUNT(*) FROM nodes WHERE file_path LIKE ?", (f"%{path}%",)
-        ).fetchone()[0]
+        
+        # Build path check query with project filtering
+        base_query = "SELECT COUNT(*) FROM nodes WHERE file_path LIKE ?"
+        params = [f"%{path}%"]
+        query, query_params = self._build_project_filter(base_query, params, project_scope)
+        
+        path_check = cursor.execute(query, query_params).fetchone()[0]
         
         if path_check == 0:
             # Suggest alternatives
@@ -115,12 +162,13 @@ class FilesystemNavigator:
         if recursive:
             # Recursive search: include all subdirectories
             like_pattern = f"%{path}%"
-            query = "SELECT DISTINCT file_path FROM nodes WHERE file_path LIKE ? ORDER BY file_path"
-            results = cursor.execute(query, (like_pattern,)).fetchall()
+            base_query = "SELECT DISTINCT file_path FROM nodes WHERE file_path LIKE ? ORDER BY file_path"
+            query, query_params = self._build_project_filter(base_query, [like_pattern], project_scope)
+            results = cursor.execute(query, query_params).fetchall()
         else:
             # Non-recursive: only immediate directory contents
             # Match files that start with path/ but don't have additional slashes
-            query = """
+            base_query = """
                 SELECT DISTINCT file_path FROM nodes 
                 WHERE file_path LIKE ? 
                 AND file_path NOT LIKE ?
@@ -128,7 +176,8 @@ class FilesystemNavigator:
             """
             path_prefix = f"%{path}/%"
             path_with_subdir = f"%{path}/%/%"
-            results = cursor.execute(query, (path_prefix, path_with_subdir)).fetchall()
+            query, query_params = self._build_project_filter(base_query, [path_prefix, path_with_subdir], project_scope)
+            results = cursor.execute(query, query_params).fetchall()
         
         files = [row[0] for row in results]
         
@@ -150,7 +199,7 @@ class FilesystemNavigator:
             "count": len(files)
         }
     
-    def _find_files(self, pattern: str, recursive: bool = True) -> Dict[str, Any]:
+    def _find_files(self, pattern: str, recursive: bool = True, project_scope: Optional[str] = None) -> Dict[str, Any]:
         """
         Find files matching a pattern across the codebase.
         
@@ -163,9 +212,10 @@ class FilesystemNavigator:
         """
         cursor = self.db.connection.cursor()
         
-        # Get all file paths from knowledge graph
-        query = "SELECT DISTINCT file_path FROM nodes ORDER BY file_path"
-        results = cursor.execute(query).fetchall()
+        # Get all file paths from knowledge graph with project filtering
+        base_query = "SELECT DISTINCT file_path FROM nodes ORDER BY file_path"
+        query, query_params = self._build_project_filter(base_query, [], project_scope)
+        results = cursor.execute(query, query_params).fetchall()
         
         matching_files = []
         for row in results:
@@ -185,7 +235,7 @@ class FilesystemNavigator:
             "count": len(matching_files)
         }
     
-    def _show_tree(self, path: str) -> Dict[str, Any]:
+    def _show_tree(self, path: str, project_scope: Optional[str] = None) -> Dict[str, Any]:
         """
         Show hierarchical tree structure of a directory.
         
@@ -198,9 +248,10 @@ class FilesystemNavigator:
         path = path.strip('/')
         
         cursor = self.db.connection.cursor()
-        query = "SELECT DISTINCT file_path FROM nodes WHERE file_path LIKE ? ORDER BY file_path"
+        base_query = "SELECT DISTINCT file_path FROM nodes WHERE file_path LIKE ? ORDER BY file_path"
         like_pattern = f"%{path}%"
-        results = cursor.execute(query, (like_pattern,)).fetchall()
+        query, query_params = self._build_project_filter(base_query, [like_pattern], project_scope)
+        results = cursor.execute(query, query_params).fetchall()
         
         if not results:
             return {

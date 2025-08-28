@@ -33,7 +33,7 @@ class HierarchicalChunker:
     - Three chunk granularities: Symbol, Block, Summary
     """
     
-    def __init__(self, max_chunk_size: int = 2000, min_chunk_size: int = 50):
+    def __init__(self, max_chunk_size: int = 3000, min_chunk_size: int = 200):
         """
         Initialize the hierarchical chunker.
         
