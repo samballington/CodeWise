@@ -13,8 +13,8 @@ from pathlib import Path
 from websocket_adapter_simple import CodeWiseAgent
 from chat_memory import ChatMemory
 from starlette.middleware.sessions import SessionMiddleware
-from github_auth import router as github_oauth_router
 from routers.projects import router as projects_router
+from routers.validation import router as validation_router
 from api_providers import get_provider_manager
 from services import run_startup_kg_population
 import time
@@ -44,11 +44,9 @@ app.add_middleware(
 # Session cookies for Auth
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "change_me"))
 
-# Include GitHub OAuth router
-app.include_router(github_oauth_router)
-
-# Include Projects router
+# Include routers
 app.include_router(projects_router)
+app.include_router(validation_router)
 
 # Store active connections
 active_connections: Dict[str, WebSocket] = {}
