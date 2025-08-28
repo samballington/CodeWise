@@ -36,6 +36,7 @@ except ImportError:
         def parse_content(self, content, file_path):
             return None
 from storage.database_manager import DatabaseManager
+from storage.path_manager import get_path_manager
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,10 @@ class SymbolCollector:
     provides consistent symbol extraction across 87+ supported file types.
     """
     
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager: DatabaseManager, project_name: Optional[str] = None):
         self.db_manager = db_manager
+        self.project_name = project_name
+        self.path_manager = get_path_manager()
         self.parser_factory = TreeSitterFactory() if TREE_SITTER_FACTORY_AVAILABLE else None
         self.symbol_table: Dict[str, Dict] = {}  # Global symbol table: symbol_id -> symbol_info
         self.file_symbols: Dict[str, Set[str]] = {}  # Per-file symbol tracking: file_path -> symbol_ids
@@ -63,6 +66,9 @@ class SymbolCollector:
             'symbols_by_type': {},
             'processing_errors': []
         }
+        
+        # Log PathManager integration
+        logger.info(f"SymbolCollector initialized with PathManager (project: {project_name})")
     
     def collect_all_symbols(self, file_paths: List[Path]) -> Dict[str, Dict]:
         """
@@ -228,7 +234,7 @@ class SymbolCollector:
                     node_id=symbol_id,
                     node_type=symbol_info['type'],
                     name=symbol_info['name'],
-                    file_path=str(file_path),
+                    file_path=self._normalize_file_path(file_path),
                     line_start=symbol_info['line_start'],
                     line_end=symbol_info['line_end'],
                     signature=symbol_info.get('signature'),
@@ -682,7 +688,7 @@ class SymbolCollector:
                                 node_id=symbol_id,
                                 node_type=symbol_type,
                                 name=symbol_name,
-                                file_path=str(file_path),
+                                file_path=self._normalize_file_path(file_path),
                                 line_start=symbol_info['line_start'],
                                 line_end=symbol_info['line_end'],
                                 signature=symbol_info['signature'],
@@ -715,6 +721,30 @@ class SymbolCollector:
             'java_method': 'method'
         }
         return mapping.get(pattern_name, 'unknown')
+    
+    def _normalize_file_path(self, file_path: Path) -> str:
+        """
+        Convert file path using centralized path manager for consistent storage.
+        
+        Args:
+            file_path: File path object
+            
+        Returns:
+            Normalized workspace-relative path with project prefix
+        """
+        try:
+            # Use PathManager with project context for consistent normalization
+            normalized = self.path_manager.normalize_for_storage(file_path, self.project_name)
+            logger.debug(f"Normalized path: {file_path} -> {normalized}")
+            return normalized
+        except Exception as e:
+            # Fallback to original logic if normalization fails
+            logger.warning(f"Path normalization failed for {file_path}: {e}, using fallback")
+            file_path_str = str(file_path)
+            if '/workspace/' in file_path_str:
+                workspace_relative = file_path_str.split('/workspace/', 1)[-1]
+                return workspace_relative
+            return file_path_str
 
 
 if __name__ == "__main__":
