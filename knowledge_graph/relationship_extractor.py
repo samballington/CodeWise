@@ -37,6 +37,7 @@ except ImportError:
         def parse_content(self, content, file_path):
             return None
 from storage.database_manager import DatabaseManager
+from storage.path_manager import get_path_manager
 
 logger = logging.getLogger(__name__)
 
@@ -189,11 +190,17 @@ class RelationshipExtractor:
     accurately resolve cross-file references and aliased symbols.
     """
     
-    def __init__(self, db_manager: DatabaseManager, symbol_table: Dict[str, Dict]):
+    def __init__(self, db_manager: DatabaseManager, symbol_table: Dict[str, Dict], 
+                 project_name: Optional[str] = None):
         self.db_manager = db_manager
         self.symbol_table = symbol_table
+        self.project_name = project_name
+        self.path_manager = get_path_manager()
         self.parser_factory = TreeSitterFactory() if TREE_SITTER_FACTORY_AVAILABLE else None
         self.import_resolver = ImportResolver(symbol_table)
+        
+        # Log PathManager integration
+        logger.info(f"RelationshipExtractor initialized with PathManager (project: {project_name})")
         
         # Extraction statistics
         self.extraction_stats = {
@@ -640,7 +647,7 @@ class RelationshipExtractor:
             node_id=module_symbol_id,
             node_type='module',
             name=module_name,
-            file_path=file_path_str,
+            file_path=self._normalize_file_path_for_storage(file_path_str),
             line_start=1,
             line_end=1,
             signature=f"module {module_name}"
@@ -871,6 +878,29 @@ class RelationshipExtractor:
             'method_call': 'calls'
         }
         return mapping.get(pattern_name, 'uses')
+    
+    def _normalize_file_path_for_storage(self, file_path_str: str) -> str:
+        """
+        Convert file path using centralized path manager for consistent storage.
+        
+        Args:
+            file_path_str: File path string (absolute or relative)
+            
+        Returns:
+            Normalized workspace-relative path with project prefix
+        """
+        try:
+            # Use PathManager with project context for consistent normalization
+            normalized = self.path_manager.normalize_for_storage(file_path_str, self.project_name)
+            logger.debug(f"Normalized path: {file_path_str} -> {normalized}")
+            return normalized
+        except Exception as e:
+            # Fallback to original logic if normalization fails
+            logger.warning(f"Path normalization failed for {file_path_str}: {e}, using fallback")
+            if '/workspace/' in file_path_str:
+                workspace_relative = file_path_str.split('/workspace/', 1)[-1]
+                return workspace_relative
+            return file_path_str
 
 
 if __name__ == "__main__":
