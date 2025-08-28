@@ -17,11 +17,18 @@
       "Bash(find:*)",
       "Bash(mkdir:*)",
       "Bash(docker cp:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)",
+      "Read(/C:\\c\\Users\\suga\\Desktop\\aistuff/**)"
     ],
     "deny": [],
     "additionalDirectories": [
-      "C:\\c\\Users\\suga\\Desktop\\aistuff"
+      "C:\\c\\Users\\suga\\Desktop\\aistuff",
+      "C:\\c\\Users\\suga\\Desktop\\aistuff\\codewise"
     ]
   }
 }

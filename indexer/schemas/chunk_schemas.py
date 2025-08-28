@@ -86,7 +86,11 @@ class SymbolChunk(ChunkBase):
         """Validate symbol type."""
         valid_types = {
             'function', 'class', 'method', 'variable', 
-            'import', 'constant', 'property', 'async_function'
+            'import', 'constant', 'property', 'async_function',
+            # Java-specific types
+            'interface', 'enum', 'annotation', 'constructor',
+            # Universal fallback
+            'unknown'
         }
         if v not in valid_types:
             raise ValueError(f'symbol_type must be one of: {valid_types}')

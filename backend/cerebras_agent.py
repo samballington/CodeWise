@@ -1711,8 +1711,13 @@ NO other text. NO markdown. NO explanations. ONLY the JSON object."""
                     "operation": operation
                 }
             
-            # Execute the filesystem operation using KG data
-            result = self.filesystem_navigator.execute(operation, path, pattern, recursive)
+            # Execute the filesystem operation using KG data with project scope
+            project_scope = None
+            if hasattr(self, 'mentioned_projects') and self.mentioned_projects:
+                project_scope = self.mentioned_projects[0]  # Use first mentioned project
+                logger.info(f"🎯 Passing project scope to filesystem navigator: {project_scope}")
+            
+            result = self.filesystem_navigator.execute(operation, path, pattern, recursive, project_scope)
             
             # Add success flag if not present
             if "error" not in result:

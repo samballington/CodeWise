@@ -24,7 +24,7 @@ from storage.database_manager import DatabaseManager
 from storage.database_setup import setup_codewise_database
 from knowledge_graph.symbol_collector import SymbolCollector
 from knowledge_graph.relationship_extractor import RelationshipExtractor
-from indexer.enhanced_vector_store import EnhancedVectorStore
+from backend.vector_store_auto import AutoGPUVectorStore
 from indexer.chunkers.hierarchical_chunker import HierarchicalChunker
 
 logger = logging.getLogger(__name__)
@@ -101,9 +101,9 @@ class UnifiedIndexer:
         self.symbol_collector = SymbolCollector(self.db_manager)
         self.relationship_extractor = None  # Created after symbol collection
         
-        # Initialize Phase 1 components
+        # Initialize Phase 1 components with GPU acceleration
         self.hierarchical_chunker = HierarchicalChunker()
-        self.vector_store = EnhancedVectorStore(model_name=vector_model)
+        self.vector_store = AutoGPUVectorStore("/app")
         
         # Indexing statistics
         self.indexing_stats = {
@@ -417,10 +417,29 @@ class UnifiedIndexer:
         linked_chunks = []
         
         for chunk in chunks:
-            linked_chunk = chunk.copy()
+            # Handle both dict and Pydantic model formats
+            if isinstance(chunk, dict):
+                linked_chunk = chunk.copy()
+            else:
+                # Convert Pydantic model to dict for easier manipulation
+                if hasattr(chunk, 'model_dump'):  # Pydantic v2
+                    linked_chunk = chunk.model_dump()
+                elif hasattr(chunk, 'dict'):  # Pydantic v1
+                    linked_chunk = chunk.dict()
+                else:
+                    # Fallback: create dict manually
+                    linked_chunk = {
+                        'id': getattr(chunk, 'id', ''),
+                        'type': getattr(chunk, 'type', ''),
+                        'content': getattr(chunk, 'content', ''),
+                        'file_path': getattr(chunk, 'file_path', ''),
+                        'line_start': getattr(chunk, 'line_start', 0),
+                        'line_end': getattr(chunk, 'line_end', 0),
+                        'metadata': {}
+                    }
             
             # Try to link chunk to KG node based on content and location
-            node_id = self._find_matching_kg_node(chunk, file_symbols)
+            node_id = self._find_matching_kg_node(linked_chunk, file_symbols)
             if node_id:
                 linked_chunk['node_id'] = node_id
                 
@@ -513,11 +532,23 @@ class UnifiedIndexer:
                 )
                 
                 if success:
-                    # Handle both dict and object formats
-                    if hasattr(chunk, '__setitem__'):
+                    # Handle both dict and Pydantic object formats
+                    # For Pydantic models, use attribute assignment even if __setitem__ exists
+                    if isinstance(chunk, dict):
                         chunk['id'] = chunk_id
                     elif hasattr(chunk, 'id'):
-                        chunk.id = chunk_id
+                        # For Pydantic models with validation, create new instance with id
+                        if hasattr(chunk, 'model_copy'):  # Pydantic v2
+                            chunk = chunk.model_copy(update={'id': chunk_id})
+                        elif hasattr(chunk, 'copy'):  # Pydantic v1
+                            chunk = chunk.copy(update={'id': chunk_id})
+                        else:
+                            # Fallback for other object types
+                            try:
+                                chunk.id = chunk_id
+                            except (AttributeError, TypeError):
+                                # If we can't set the id, continue without it
+                                logger.debug(f"Could not set id on chunk: {type(chunk)}")
                     stored_chunks.append(chunk)
                     
                     # Store embedding in vector store (if available)

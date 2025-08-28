@@ -60,7 +60,7 @@ class KGStartupService:
     REQ-3.7.1: Startup KG Population Service
     """
     
-    def __init__(self, workspace_dir: str = "/workspace", db_path: str = "/app/storage/codewise.db"):
+    def __init__(self, workspace_dir: str = "/workspace", db_path: str = "/workspace/.vector_cache/codewise.db"):
         """Initialize startup service with workspace configuration."""
         self.workspace_dir = Path(workspace_dir)
         self.db_path = db_path
