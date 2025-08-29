@@ -188,7 +188,7 @@ open http://localhost:3000
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-org/codewise.git
+   git clone https://https://github.com/samballington/CodeWise
    cd codewise
    ```
 
