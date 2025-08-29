@@ -69,10 +69,12 @@ screenshots/
 docs/
 docs/*
 
-# Test files (not needed for running app)
+# Test files in root directories (exclude loose test files)
 backend/test_*.py
 indexer/test_*.py
-**/test_*.py
+# But allow organized test files in tests/ directories
+!*/tests/test_*.py
+!tests/test_*.py
 
 # Database files - NEVER commit these
 *.db
