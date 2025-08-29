@@ -73,4 +73,16 @@ docs/*
 backend/test_*.py
 indexer/test_*.py
 **/test_*.py
-storage/codewise.db
+
+# Database files - NEVER commit these
+*.db
+*.db-*
+**/*.db
+**/*.db-*
+storage/codewise.db*
+backend/codewise.db*
+temp_test*.db
+
+# Backup files
+*.backup
+*.backup_*
