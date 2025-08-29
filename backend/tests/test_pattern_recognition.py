@@ -12,8 +12,8 @@ from pathlib import Path
 # Add backend to path
 sys.path.append(str(Path(__file__).parent))
 
-from tools.universal_pattern_recognizer import UniversalPatternRecognizer, RelationshipType
-from tools.universal_relationship_engine import UniversalRelationshipEngine
+from backend.tools.universal_pattern_recognizer import UniversalPatternRecognizer, RelationshipType
+from backend.tools.universal_relationship_engine import UniversalRelationshipEngine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

@@ -17,7 +17,7 @@ def test_system_prompt_update():
     
     try:
         # Import and get the agent 
-        from cerebras_agent import CerebrasNativeAgent
+        from backend.cerebras_agent import CerebrasNativeAgent
         agent = CerebrasNativeAgent()
         
         # Get the system prompt
@@ -215,7 +215,7 @@ def test_prompt_integration():
     print("=" * 55)
     
     try:
-        from cerebras_agent import CerebrasNativeAgent
+        from backend.cerebras_agent import CerebrasNativeAgent
         
         # Test agent initialization with updated prompt
         agent = CerebrasNativeAgent()
