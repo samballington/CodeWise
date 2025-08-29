@@ -20,7 +20,10 @@ from langchain.globals import set_llm_cache
 from langchain.cache import InMemoryCache, SQLiteCache
 from vector_store import get_vector_store
 from api_providers import get_provider_manager
-from backend.hybrid_search import HybridSearchEngine
+try:
+    from hybrid_search import HybridSearchEngine
+except ImportError:
+    from backend.hybrid_search import HybridSearchEngine
 from context_delivery import ContextDeliverySystem
 from directory_filters import (
     get_find_filter_args, get_grep_filter_args, should_include_file,

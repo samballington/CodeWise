@@ -10,11 +10,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
 
-from backend.path_resolution_cache import (
-    PathResolutionCache, 
-    PathResolutionCacheConfig,
-    get_global_cache
-)
+try:
+    from path_resolution_cache import (
+        PathResolutionCache, 
+        PathResolutionCacheConfig,
+        get_global_cache
+    )
+except ImportError:
+    from backend.path_resolution_cache import (
+        PathResolutionCache, 
+        PathResolutionCacheConfig,
+        get_global_cache
+    )
 
 logger = logging.getLogger(__name__)
 
