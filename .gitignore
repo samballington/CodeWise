@@ -61,7 +61,30 @@ backend/.claude/
 **/*.md
 !README.md
 
-# Test files (not needed for running app)
+# Screenshots and assets - NEVER commit these
+screenshots/
+**screenshots/
+
+# Phase documentation - LOCAL ONLY
+docs/
+docs/*
+
+# Test files in root directories (exclude loose test files)
 backend/test_*.py
 indexer/test_*.py
-**/test_*.py
+# But allow organized test files in tests/ directories
+!*/tests/test_*.py
+!tests/test_*.py
+
+# Database files - NEVER commit these
+*.db
+*.db-*
+**/*.db
+**/*.db-*
+storage/codewise.db*
+backend/codewise.db*
+temp_test*.db
+
+# Backup files
+*.backup
+*.backup_*

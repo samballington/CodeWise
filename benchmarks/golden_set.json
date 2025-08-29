@@ -1,0 +1,236 @@
+{
+  "benchmark_metadata": {
+    "version": "1.0.0",
+    "created_date": "2025-01-15",
+    "description": "Golden set benchmark for evaluating semantic search quality improvements",
+    "total_queries": 15,
+    "categories": ["conceptual", "specific_symbol", "debugging", "structural", "architectural"]
+  },
+  "benchmark_queries": [
+    {
+      "query_id": "auth_flow_1",
+      "query": "How does user authentication work in this system?",
+      "expected_chunk_ids": [
+        "backend_cerebras_agent_py::authenticate_user",
+        "backend_auth_middleware_py::AuthMiddleware", 
+        "frontend_auth_component::LoginForm",
+        "backend_models_user_py::User::verify_password"
+      ],
+      "category": "conceptual",
+      "difficulty": "medium",
+      "description": "Tests understanding of authentication flow across multiple components"
+    },
+    {
+      "query_id": "specific_func_1", 
+      "query": "validate_password function implementation",
+      "expected_chunk_ids": [
+        "backend_auth_service_py::validate_password",
+        "backend_utils_security_py::hash_password",
+        "backend_models_user_py::User::check_password"
+      ],
+      "category": "specific_symbol",
+      "difficulty": "easy",
+      "description": "Tests ability to find specific function implementations"
+    },
+    {
+      "query_id": "error_handling_1",
+      "query": "database connection error handling patterns",
+      "expected_chunk_ids": [
+        "backend_database_py::DatabaseError",
+        "backend_connection_pool_py::retry_connection",
+        "backend_models_base_py::handle_db_exception",
+        "backend_middleware_error_py::ErrorHandler"
+      ],
+      "category": "debugging", 
+      "difficulty": "hard",
+      "description": "Tests ability to find error handling code across system"
+    },
+    {
+      "query_id": "api_endpoints_1",
+      "query": "REST API endpoints for user management",
+      "expected_chunk_ids": [
+        "backend_routes_users_py::create_user",
+        "backend_routes_users_py::update_user", 
+        "backend_routes_users_py::delete_user",
+        "backend_routes_users_py::get_user"
+      ],
+      "category": "structural",
+      "difficulty": "medium",
+      "description": "Tests finding related API endpoints in same domain"
+    },
+    {
+      "query_id": "mermaid_generation_1",
+      "query": "mermaid diagram generation and theming",
+      "expected_chunk_ids": [
+        "backend_tools_mermaid_generator_py::RoleAwareMermaidGenerator",
+        "backend_themes_theme_manager_py::ThemeManager",
+        "backend_themes_schemas_py::SemanticRole",
+        "backend_cerebras_agent_py::mermaid_generation_prompt"
+      ],
+      "category": "architectural",
+      "difficulty": "medium",
+      "description": "Tests understanding of mermaid generation architecture"
+    },
+    {
+      "query_id": "vector_search_1",
+      "query": "vector embeddings and similarity search",
+      "expected_chunk_ids": [
+        "backend_vector_store_py::VectorStore",
+        "backend_smart_search_py::SmartSearchEngine",
+        "indexer_enhanced_vector_store_py::EnhancedVectorStore"
+      ],
+      "category": "conceptual",
+      "difficulty": "medium",
+      "description": "Tests understanding of vector search implementation"
+    },
+    {
+      "query_id": "chunking_system_1",
+      "query": "hierarchical code chunking and AST parsing",
+      "expected_chunk_ids": [
+        "indexer_chunkers_hierarchical_chunker_py::HierarchicalChunker",
+        "indexer_parsers_tree_sitter_parser_py::TreeSitterFactory",
+        "indexer_schemas_chunk_schemas_py::SymbolChunk",
+        "indexer_storage_enhanced_metadata_store_py::EnhancedMetadataStore"
+      ],
+      "category": "architectural",
+      "difficulty": "hard",
+      "description": "Tests understanding of complex chunking architecture"
+    },
+    {
+      "query_id": "smart_search_implementation",
+      "query": "smart search query intent detection",
+      "expected_chunk_ids": [
+        "backend_smart_search_py::SmartSearchEngine::search",
+        "backend_smart_search_py::QueryClassifier",
+        "backend_smart_search_py::IntentDetector"
+      ],
+      "category": "specific_symbol",
+      "difficulty": "medium",
+      "description": "Tests finding specific smart search components"
+    },
+    {
+      "query_id": "file_discovery_1",
+      "query": "file discovery and indexing pipeline",
+      "expected_chunk_ids": [
+        "indexer_file_discovery_py::FileDiscovery",
+        "indexer_main_py::index_workspace",
+        "backend_vector_store_py::_build"
+      ],
+      "category": "structural",
+      "difficulty": "medium",
+      "description": "Tests understanding of indexing pipeline structure"
+    },
+    {
+      "query_id": "theme_validation_1",
+      "query": "theme validation and Pydantic schemas",
+      "expected_chunk_ids": [
+        "backend_themes_schemas_py::Theme",
+        "backend_themes_theme_manager_py::_load_themes",
+        "backend_themes_schemas_py::StyleRole"
+      ],
+      "category": "specific_symbol",
+      "difficulty": "easy",
+      "description": "Tests finding theme validation code"
+    },
+    {
+      "query_id": "async_functions_1",
+      "query": "asynchronous function implementations",
+      "expected_chunk_ids": [
+        "backend_cerebras_agent_py::_smart_search",
+        "backend_cerebras_agent_py::_examine_files",
+        "backend_api_py::async_handler"
+      ],
+      "category": "structural",
+      "difficulty": "medium",
+      "description": "Tests finding async function patterns"
+    },
+    {
+      "query_id": "configuration_1",
+      "query": "configuration management and settings",
+      "expected_chunk_ids": [
+        "backend_config_py::Config",
+        "backend_settings_py::get_settings",
+        "indexer_main_py::load_config"
+      ],
+      "category": "structural",
+      "difficulty": "easy",
+      "description": "Tests finding configuration-related code"
+    },
+    {
+      "query_id": "relationship_tracking_1",
+      "query": "bidirectional chunk relationships and context",
+      "expected_chunk_ids": [
+        "indexer_storage_context_reconstructor_py::ContextReconstructor",
+        "indexer_schemas_chunk_schemas_py::ChunkRelationship",
+        "indexer_chunkers_hierarchical_chunker_py::_apply_bidirectional_relationships"
+      ],
+      "category": "architectural",
+      "difficulty": "hard",
+      "description": "Tests understanding of relationship tracking system"
+    },
+    {
+      "query_id": "complexity_calculation_1",
+      "query": "code complexity scoring and metrics",
+      "expected_chunk_ids": [
+        "indexer_complexity_py::calculate_complexity",
+        "indexer_chunkers_hierarchical_chunker_py::_calculate_complexity",
+        "indexer_schemas_chunk_schemas_py::complexity_score"
+      ],
+      "category": "specific_symbol",
+      "difficulty": "medium",
+      "description": "Tests finding complexity calculation code"
+    },
+    {
+      "query_id": "logging_system_1",
+      "query": "logging configuration and error tracking",
+      "expected_chunk_ids": [
+        "backend_logger_py::setup_logging",
+        "indexer_main_py::logger",
+        "backend_error_handler_py::log_error"
+      ],
+      "category": "debugging",
+      "difficulty": "easy",
+      "description": "Tests finding logging and error tracking code"
+    }
+  ],
+  "evaluation_metrics": {
+    "precision_at_3": {
+      "description": "Percentage of relevant chunks in top 3 results",
+      "target_improvement": "15%"
+    },
+    "precision_at_5": {
+      "description": "Percentage of relevant chunks in top 5 results",
+      "target_improvement": "12%"
+    },
+    "recall_at_10": {
+      "description": "Percentage of expected chunks found in top 10 results",
+      "target_improvement": "20%"
+    },
+    "mean_reciprocal_rank": {
+      "description": "Average of 1/rank for first relevant result",
+      "target_improvement": "18%"
+    },
+    "semantic_understanding": {
+      "description": "Improvement in conceptual vs specific symbol query performance",
+      "target_improvement": "25%"
+    }
+  },
+  "expected_improvements": {
+    "bge_model_upgrade": {
+      "precision_at_3": 0.15,
+      "precision_at_5": 0.12,
+      "recall_at_10": 0.20,
+      "mean_reciprocal_rank": 0.18
+    },
+    "hierarchical_chunking": {
+      "context_relevance": 0.40,
+      "relationship_awareness": 0.35,
+      "architectural_understanding": 0.30
+    }
+  },
+  "baseline_thresholds": {
+    "minimum_precision_at_3": 0.60,
+    "minimum_recall_at_10": 0.70,
+    "minimum_mrr": 0.65
+  }
+}

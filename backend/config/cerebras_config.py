@@ -1,0 +1,108 @@
+"""
+Cerebras SDK Configuration for Native Integration
+
+Centralized configuration for Cerebras SDK with Docker compatibility
+and secure API key management for production environments.
+"""
+
+import os
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class CerebrasConfig:
+    """Centralized configuration for Cerebras SDK with Docker compatibility"""
+    
+    def __init__(self):
+        """Initialize configuration with environment variables and secure defaults"""
+        self.api_key = self._get_api_key()
+        self.model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+        self.reasoning_effort = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
+        self.max_tokens = int(os.getenv("CEREBRAS_MAX_TOKENS", "4096"))
+        self.timeout = float(os.getenv("CEREBRAS_TIMEOUT", "30.0"))
+        
+        # Validate configuration on initialization
+        self._validate_config()
+        
+    def _get_api_key(self) -> Optional[str]:
+        """Secure API key retrieval with explicit .env file loading"""
+        # Always try to load from .env file first for consistency
+        try:
+            from dotenv import load_dotenv
+            # Force reload .env file on every initialization
+            load_dotenv(override=True)
+            logger.debug("🔄 Reloaded .env file for fresh configuration")
+        except ImportError:
+            logger.warning("python-dotenv not available, using direct env vars only")
+        
+        # Get API key from environment (should be loaded from .env)
+        api_key = os.getenv("CEREBRAS_API_KEY")
+        
+        if not api_key:
+            logger.error("CEREBRAS_API_KEY not found in environment")
+            return None
+            
+        # Mask API key in logs for security
+        masked_key = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+        logger.info(f"✅ Cerebras API key loaded: {masked_key}")
+        return api_key
+    
+    def _validate_config(self) -> None:
+        """Validate configuration is complete and correct"""
+        if not self.api_key:
+            logger.error("❌ Cerebras API key missing - SDK will not function")
+            raise ValueError("CEREBRAS_API_KEY environment variable is required")
+            
+        if not self.model:
+            logger.error("❌ Cerebras model not specified")
+            raise ValueError("CEREBRAS_MODEL must be specified")
+        
+        if self.reasoning_effort not in ["low", "medium", "high"]:
+            logger.warning(f"⚠️ Invalid reasoning effort '{self.reasoning_effort}', using 'medium'")
+            self.reasoning_effort = "medium"
+            
+        if self.max_tokens < 100 or self.max_tokens > 32000:
+            logger.warning(f"⚠️ Invalid max_tokens '{self.max_tokens}', using 4096")
+            self.max_tokens = 4096
+            
+        logger.info(f"✅ Cerebras config validated: {self.model} with {self.reasoning_effort} reasoning")
+    
+    def validate_config(self) -> bool:
+        """Public method to validate configuration - returns True if valid"""
+        try:
+            self._validate_config()
+            return True
+        except (ValueError, TypeError) as e:
+            logger.error(f"❌ Configuration validation failed: {e}")
+            return False
+    
+    def get_client_config(self) -> dict:
+        """Get configuration dictionary for Cerebras client initialization"""
+        return {
+            "api_key": self.api_key,
+            "timeout": self.timeout
+        }
+    
+    def get_completion_config(self, selected_model: str = None) -> dict:
+        """Get configuration dictionary for completion requests"""
+        model_to_use = selected_model or self.model
+        return {
+            "model": model_to_use,
+            "max_tokens": self.max_tokens
+        }
+    
+    def supports_reasoning_effort(self, model_name: str) -> bool:
+        """Check if a model supports reasoning_effort parameter"""
+        # Registry of models that support reasoning_effort
+        reasoning_supported_models = {
+            "gpt-oss-120b",
+            "qwen-3-235b-a22b-thinking-2507"  # Qwen-3 thinking model supports reasoning effort
+        }
+        return model_name in reasoning_supported_models
+
+# Global configuration instance
+cerebras_config = CerebrasConfig()
+
+# Export for easy access
+__all__ = ["cerebras_config", "CerebrasConfig"]

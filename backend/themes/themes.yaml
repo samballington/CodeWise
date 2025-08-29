@@ -1,0 +1,169 @@
+# Semantic Role-Based Themes for CodeWise Mermaid Generation
+# 
+# This file defines visual themes that map semantic roles to specific
+# colors and styling. Themes are environment-specific and can be
+# customized without code changes.
+
+themes:
+  dark_professional:
+    name: "Dark Professional"
+    description: "High-contrast dark theme for professional presentations and code reviews"
+    roles:
+      logic:
+        fill_color: "#2563eb"
+        stroke_color: "#1d4ed8"
+        stroke_width: "2px"
+        text_color: "#ffffff"
+      io:
+        fill_color: "#059669"
+        stroke_color: "#047857"
+        stroke_width: "2px"
+        text_color: "#ffffff"
+      interface:
+        fill_color: "#7c3aed"
+        stroke_color: "#6d28d9"
+        stroke_width: "2px"
+        text_color: "#ffffff"
+      storage:
+        fill_color: "#dc2626"
+        stroke_color: "#b91c1c"
+        stroke_width: "3px"
+        text_color: "#ffffff"
+      test:
+        fill_color: "#ea580c"
+        stroke_color: "#c2410c"
+        stroke_width: "2px"
+        text_color: "#ffffff"
+      external:
+        fill_color: "#6b7280"
+        stroke_color: "#4b5563"
+        stroke_width: "2px"
+        text_color: "#ffffff"
+
+  light_clean:
+    name: "Light Clean"
+    description: "Minimal light theme for documentation and public presentations"
+    roles:
+      logic:
+        fill_color: "#dbeafe"
+        stroke_color: "#2563eb"
+        stroke_width: "2px"
+      io:
+        fill_color: "#d1fae5"
+        stroke_color: "#059669"
+        stroke_width: "2px"
+      interface:
+        fill_color: "#e9d5ff"
+        stroke_color: "#7c3aed"
+        stroke_width: "2px"
+      storage:
+        fill_color: "#fee2e2"
+        stroke_color: "#dc2626"
+        stroke_width: "3px"
+      test:
+        fill_color: "#fed7aa"
+        stroke_color: "#ea580c"
+        stroke_width: "2px"
+      external:
+        fill_color: "#f3f4f6"
+        stroke_color: "#6b7280"
+        stroke_width: "2px"
+
+  high_contrast:
+    name: "High Contrast"
+    description: "Maximum contrast theme for accessibility and projection displays"
+    roles:
+      logic:
+        fill_color: "#000000"
+        stroke_color: "#ffffff"
+        stroke_width: "3px"
+        text_color: "#ffffff"
+      io:
+        fill_color: "#00ff00"
+        stroke_color: "#000000"
+        stroke_width: "3px"
+        text_color: "#000000"
+      interface:
+        fill_color: "#0000ff"
+        stroke_color: "#ffffff"
+        stroke_width: "3px"
+        text_color: "#ffffff"
+      storage:
+        fill_color: "#ff0000"
+        stroke_color: "#ffffff"
+        stroke_width: "4px"
+        text_color: "#ffffff"
+      test:
+        fill_color: "#ffff00"
+        stroke_color: "#000000"
+        stroke_width: "3px"
+        text_color: "#000000"
+      external:
+        fill_color: "#808080"
+        stroke_color: "#ffffff"
+        stroke_width: "3px"
+        text_color: "#ffffff"
+
+  pastel_soft:
+    name: "Pastel Soft"
+    description: "Gentle pastel theme for creative and educational contexts"
+    roles:
+      logic:
+        fill_color: "#bfdbfe"
+        stroke_color: "#3b82f6"
+        stroke_width: "2px"
+      io:
+        fill_color: "#bbf7d0"
+        stroke_color: "#10b981"
+        stroke_width: "2px"
+      interface:
+        fill_color: "#ddd6fe"
+        stroke_color: "#8b5cf6"
+        stroke_width: "2px"
+      storage:
+        fill_color: "#fecaca"
+        stroke_color: "#ef4444"
+        stroke_width: "2px"
+      test:
+        fill_color: "#fed7aa"
+        stroke_color: "#f97316"
+        stroke_width: "2px"
+      external:
+        fill_color: "#e5e7eb"
+        stroke_color: "#6b7280"
+        stroke_width: "2px"
+
+  cyberpunk:
+    name: "Cyberpunk"
+    description: "Neon-inspired theme for modern tech presentations and demos"
+    roles:
+      logic:
+        fill_color: "#1a1a2e"
+        stroke_color: "#00d4ff"
+        stroke_width: "2px"
+        text_color: "#00d4ff"
+      io:
+        fill_color: "#16213e"
+        stroke_color: "#00ff88"
+        stroke_width: "2px"
+        text_color: "#00ff88"
+      interface:
+        fill_color: "#0f3460"
+        stroke_color: "#ff0080"
+        stroke_width: "2px"
+        text_color: "#ff0080"
+      storage:
+        fill_color: "#533483"
+        stroke_color: "#ff4081"
+        stroke_width: "3px"
+        text_color: "#ff4081"
+      test:
+        fill_color: "#ff6b35"
+        stroke_color: "#ffff00"
+        stroke_width: "2px"
+        text_color: "#000000"
+      external:
+        fill_color: "#2c2c54"
+        stroke_color: "#9b59b6"
+        stroke_width: "2px"
+        text_color: "#9b59b6"
