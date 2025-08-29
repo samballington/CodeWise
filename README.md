@@ -120,7 +120,7 @@ Real-time streaming of LLM responses. Persistent connections reduce latency for 
 | Vector Store | FAISS, BGE embeddings | Semantic code search |
 | Knowledge Graph | SQLite, custom schema | Code structure and relationships |
 | Pattern Engine | tree-sitter parsers | Multi-language AST analysis |
-| LLM Integration | Cerebras SDK | gpt-oss-120b model |
+| LLM Integration | Cerebras SDK | gpt-oss-120b model, switchable with Qwen models |
 | Frontend | React, TypeScript | Query interface |
 
 ## Performance Numbers
