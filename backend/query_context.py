@@ -27,8 +27,12 @@ import threading
 from contextlib import contextmanager
 
 # Cross-session cache integration
-from .cache.discovery_cache import get_global_discovery_cache
-from .cache.cache_metrics import get_global_cache_metrics
+try:
+    from cache.discovery_cache import get_global_discovery_cache
+    from cache.cache_metrics import get_global_cache_metrics
+except ImportError:
+    from backend.cache.discovery_cache import get_global_discovery_cache
+    from backend.cache.cache_metrics import get_global_cache_metrics
 
 # Configuration constants (following NO HARDCODING principle)
 DEFAULT_QUERY_TIMEOUT_SECONDS = 300  # 5 minutes max query execution

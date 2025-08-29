@@ -19,15 +19,6 @@ from pathlib import Path
 from enum import Enum
 
 try:
-    from backend.hybrid_search import HybridSearchEngine, SearchResult
-    from backend.bm25_index import BM25Index, BM25Result
-    from backend.vector_store import get_vector_store
-    from backend.discovery_pipeline import DiscoveryPipeline
-    from backend.path_resolver import PathResolver
-    from backend.directory_filters import get_project_from_path
-    from backend.project_context import get_context_manager
-    from backend.file_content_cache import get_global_content_cache
-except ImportError:
     from hybrid_search import HybridSearchEngine, SearchResult
     from bm25_index import BM25Index, BM25Result
     from vector_store import get_vector_store
@@ -36,8 +27,20 @@ except ImportError:
     from directory_filters import get_project_from_path
     from project_context import get_context_manager
     from file_content_cache import get_global_content_cache
+except ImportError:
+    from backend.hybrid_search import HybridSearchEngine, SearchResult
+    from backend.bm25_index import BM25Index, BM25Result
+    from backend.vector_store import get_vector_store
+    from backend.discovery_pipeline import DiscoveryPipeline
+    from backend.path_resolver import PathResolver
+    from directory_filters import get_project_from_path
+    from project_context import get_context_manager
+    from file_content_cache import get_global_content_cache
 try:
+    from query_context import QueryExecutionContext
+except ImportError:
     from backend.query_context import QueryExecutionContext
+try:
     # Phase 3 components now replaced by SDK native reasoning
     # QueryClassifier eliminated - SDK handles intent classification
     Phase3QueryIntent = None

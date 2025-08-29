@@ -20,8 +20,12 @@ from enum import Enum
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
-from backend.smart_search import SmartSearchEngine as BaseSmartSearchEngine, QueryIntent, SmartSearchResult
-from backend.hybrid_search import HybridSearchEngine, SearchResult
+try:
+    from smart_search import SmartSearchEngine as BaseSmartSearchEngine, QueryIntent, SmartSearchResult
+    from hybrid_search import HybridSearchEngine, SearchResult
+except ImportError:
+    from backend.smart_search import SmartSearchEngine as BaseSmartSearchEngine, QueryIntent, SmartSearchResult
+    from backend.hybrid_search import HybridSearchEngine, SearchResult
 
 # Import Phase 2 Knowledge Graph components
 try:
