@@ -56,6 +56,8 @@ services:
       - ./workspace:/workspace
       - vector_cache:/workspace/.vector_cache
       - ./storage:/app/storage
+      - ./indexer:/app/indexer
+      - ./knowledge_graph:/app/knowledge_graph
     networks:
       - codewise-network
 
