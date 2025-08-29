@@ -1290,6 +1290,15 @@ class SmartSearchEngine:
             logger.error(f"Phase 3 enhanced search failed: {e}, falling back to legacy")
             return await self.search(query, k, strategy_override, mentioned_projects)
         
+        # Phase 3: Create default query analysis for Phase 3 (SDK handles classification)
+        default_query_analysis = {
+            'intent': QueryIntent.GENERAL,
+            'confidence': 0.8,
+            'reasoning': 'SDK-native intelligent search',
+            'vector_weight': 0.7,
+            'bm25_weight': 0.3
+        }
+        
         # Phase 3: Enhance results with Code Lens
         enhanced_results = []
         for result in search_results:
@@ -1300,11 +1309,11 @@ class SmartSearchEngine:
                     file_path=result.file_path,
                     snippet=enhanced_snippet,
                     relevance_score=result.relevance_score,
-                    query_intent=query_analysis.intent,
-                    search_strategy=[query_analysis.reasoning],
+                    query_intent=default_query_analysis['intent'],
+                    search_strategy=[default_query_analysis['reasoning']],
                     matched_terms=getattr(result, 'matched_terms', []),
                     metadata={
-                        'query_analysis': query_analysis,
+                        'query_analysis': default_query_analysis,
                         'enhancement_applied': 'code_lens',
                         'hierarchical_context': self._extract_hierarchical_context(result)
                     },
@@ -1321,11 +1330,11 @@ class SmartSearchEngine:
         return {
             'results': enhanced_results,
             'query_analysis': {
-                'intent': query_analysis.intent.value,
-                'confidence': query_analysis.confidence,
-                'reasoning': query_analysis.reasoning,
-                'vector_weight': query_analysis.vector_weight,
-                'bm25_weight': query_analysis.bm25_weight
+                'intent': default_query_analysis['intent'].value,
+                'confidence': default_query_analysis['confidence'],
+                'reasoning': default_query_analysis['reasoning'],
+                'vector_weight': default_query_analysis['vector_weight'],
+                'bm25_weight': default_query_analysis['bm25_weight']
             },
             'search_strategies_used': ['phase3_intelligent'],
             'total_results': len(enhanced_results),
