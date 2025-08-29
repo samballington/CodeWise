@@ -413,22 +413,22 @@ class CerebrasProvider(BaseProvider):
         global _local_embedder
         if SentenceTransformer is None:
             logger.error("SentenceTransformer not installed; cannot generate local embeddings")
-            return [[0.0] * 768] * len(texts)
+            return [[0.0] * 1024] * len(texts)
 
         if _local_embedder is None:
             try:
-                logger.info("Loading local embedding model 'all-MiniLM-L6-v2' …")
-                _local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+                logger.info("Loading BGE embedding model 'BAAI/bge-large-en-v1.5' …")
+                _local_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
             except Exception as e:
                 logger.error(f"Failed to load local embedding model: {e}")
-                return [[0.0] * 768] * len(texts)
+                return [[0.0] * 1024] * len(texts)
 
         try:
             embs = _local_embedder.encode(texts, normalize_embeddings=True).tolist()
             return embs
         except Exception as e:
             logger.error(f"Local embedding inference failed: {e}")
-            return [[0.0] * 768] * len(texts)
+            return [[0.0] * 1024] * len(texts)
 
 
 class APIProviderManager:

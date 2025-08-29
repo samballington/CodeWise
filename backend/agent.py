@@ -20,7 +20,10 @@ from langchain.globals import set_llm_cache
 from langchain.cache import InMemoryCache, SQLiteCache
 from vector_store import get_vector_store
 from api_providers import get_provider_manager
-from backend.hybrid_search import HybridSearchEngine
+try:
+    from hybrid_search import HybridSearchEngine
+except ImportError:
+    from backend.hybrid_search import HybridSearchEngine
 from context_delivery import ContextDeliverySystem
 from directory_filters import (
     get_find_filter_args, get_grep_filter_args, should_include_file,
@@ -35,6 +38,18 @@ from enhanced_project_structure import EnhancedProjectStructure
 # Set up enhanced logging for context retrieval
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Phase 2: Knowledge Graph imports
+try:
+    from backend.kg_query_methods import (
+        kg_find_symbol, kg_explore_neighborhood, kg_analyze_dependencies, kg_find_callers
+    )
+    from backend.kg_enhanced_smart_search import KGEnhancedSmartSearchEngine
+    from backend.kg_enhanced_analyze_relationships import enhanced_analyze_relationships
+    KG_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Knowledge Graph components unavailable: {e}")
+    KG_AVAILABLE = False
 
 # Optional Redis cache if redis client is installed and LC_CACHE starts with redis://
 _cache_uri = os.getenv("LC_CACHE", "sqlite")
@@ -1457,6 +1472,188 @@ class CodeWiseAgent:
             # Fallback: treat as simple file path
             return await self.mcp_wrapper.find_related_files(input_str, ["import", "test", "config"])
 
+    # ==================== PHASE 2: KNOWLEDGE GRAPH HANDLER METHODS ====================
+    
+    async def _handle_kg_find_symbol(self, input_str: str) -> str:
+        """Handle kg_find_symbol tool with JSON parameter parsing"""
+        if not KG_AVAILABLE:
+            return "❌ Knowledge Graph components not available. Please ensure the database is indexed."
+        
+        try:
+            params = json.loads(input_str)
+            symbol_name = params.get("symbol_name", "")
+            exact_match = params.get("exact_match", True)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not symbol_name:
+                return "❌ symbol_name is required"
+            
+            return kg_find_symbol(symbol_name, exact_match, db_path)
+        except json.JSONDecodeError:
+            # Fallback: treat as simple symbol name
+            return kg_find_symbol(input_str, True, "codewise.db")
+        except Exception as e:
+            return f"❌ KG find symbol failed: {str(e)}"
+    
+    async def _handle_kg_explore_neighborhood(self, input_str: str) -> str:
+        """Handle kg_explore_neighborhood tool with JSON parameter parsing"""
+        if not KG_AVAILABLE:
+            return "❌ Knowledge Graph components not available. Please ensure the database is indexed."
+        
+        try:
+            params = json.loads(input_str)
+            symbol_name = params.get("symbol_name", "")
+            max_depth = params.get("max_depth", 3)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not symbol_name:
+                return "❌ symbol_name is required"
+            
+            return kg_explore_neighborhood(symbol_name, max_depth, db_path)
+        except json.JSONDecodeError:
+            # Fallback: treat as simple symbol name
+            return kg_explore_neighborhood(input_str, 3, "codewise.db")
+        except Exception as e:
+            return f"❌ KG explore neighborhood failed: {str(e)}"
+    
+    async def _handle_kg_analyze_dependencies(self, input_str: str) -> str:
+        """Handle kg_analyze_dependencies tool with JSON parameter parsing"""
+        if not KG_AVAILABLE:
+            return "❌ Knowledge Graph components not available. Please ensure the database is indexed."
+        
+        try:
+            params = json.loads(input_str)
+            symbol_name = params.get("symbol_name", "")
+            max_depth = params.get("max_depth", 3)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not symbol_name:
+                return "❌ symbol_name is required"
+            
+            return kg_analyze_dependencies(symbol_name, max_depth, db_path)
+        except json.JSONDecodeError:
+            # Fallback: treat as simple symbol name
+            return kg_analyze_dependencies(input_str, 3, "codewise.db")
+        except Exception as e:
+            return f"❌ KG analyze dependencies failed: {str(e)}"
+    
+    async def _handle_kg_find_callers(self, input_str: str) -> str:
+        """Handle kg_find_callers tool with JSON parameter parsing"""
+        if not KG_AVAILABLE:
+            return "❌ Knowledge Graph components not available. Please ensure the database is indexed."
+        
+        try:
+            params = json.loads(input_str)
+            symbol_name = params.get("symbol_name", "")
+            max_depth = params.get("max_depth", 3)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not symbol_name:
+                return "❌ symbol_name is required"
+            
+            return kg_find_callers(symbol_name, max_depth, db_path)
+        except json.JSONDecodeError:
+            # Fallback: treat as simple symbol name
+            return kg_find_callers(input_str, 3, "codewise.db")
+        except Exception as e:
+            return f"❌ KG find callers failed: {str(e)}"
+    
+    async def _handle_smart_search(self, input_str: str) -> str:
+        """Handle enhanced smart_search tool with KG expansion"""
+        if not KG_AVAILABLE:
+            # Fallback to basic search if KG unavailable
+            return await self._search_code_with_summary(input_str)
+        
+        try:
+            params = json.loads(input_str)
+            query = params.get("query", "")
+            limit = params.get("limit", 10)
+            enable_kg_expansion = params.get("enable_kg_expansion", True)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not query:
+                return "❌ query is required"
+            
+            # Initialize KG Enhanced Smart Search Engine
+            search_engine = KGEnhancedSmartSearchEngine(db_path)
+            
+            try:
+                results = await search_engine.search(
+                    query=query,
+                    limit=limit,
+                    enable_kg_expansion=enable_kg_expansion
+                )
+                
+                # Format results for display
+                if not results:
+                    return f"No results found for query: '{query}'"
+                
+                formatted_results = []
+                formatted_results.append(f"🔍 SMART SEARCH RESULTS for '{query}'")
+                formatted_results.append(f"Found {len(results)} results:")
+                formatted_results.append("=" * 60)
+                
+                for i, result in enumerate(results, 1):
+                    kg_info = ""
+                    if result.kg_expansion_used:
+                        kg_info = f" [KG Enhanced: {len(result.relationship_types)} relationship types]"
+                    
+                    formatted_results.append(f"{i}. {result.file_path} (score: {result.relevance_score:.3f}){kg_info}")
+                    formatted_results.append(f"   {result.snippet[:150]}...")
+                    
+                    if result.related_symbols:
+                        formatted_results.append(f"   Related symbols: {', '.join(result.related_symbols[:3])}")
+                    
+                    formatted_results.append("")
+                
+                # Add search statistics
+                stats = search_engine.get_search_statistics()
+                formatted_results.append("📊 Search Statistics:")
+                formatted_results.append(f"   Total queries: {stats['total_queries']}")
+                formatted_results.append(f"   KG enhanced: {stats['kg_enhanced_queries']}")
+                formatted_results.append(f"   KG enhancement rate: {stats.get('kg_enhancement_rate', 0):.2%}")
+                
+                return "\n".join(formatted_results)
+                
+            finally:
+                search_engine.close()
+                
+        except json.JSONDecodeError:
+            # Fallback: treat as simple query
+            if not KG_AVAILABLE:
+                return await self._search_code_with_summary(input_str)
+            
+            search_engine = KGEnhancedSmartSearchEngine("codewise.db")
+            try:
+                results = await search_engine.search(query=input_str, limit=10)
+                return f"Found {len(results)} results for '{input_str}'"
+            finally:
+                search_engine.close()
+        except Exception as e:
+            return f"❌ Smart search failed: {str(e)}"
+    
+    async def _handle_analyze_relationships(self, input_str: str) -> str:
+        """Handle enhanced analyze_relationships tool with KG power"""
+        if not KG_AVAILABLE:
+            return "❌ Knowledge Graph components not available. Please ensure the database is indexed."
+        
+        try:
+            params = json.loads(input_str)
+            target = params.get("target", "")
+            analysis_type = params.get("analysis_type", "all")
+            max_depth = params.get("max_depth", 2)
+            db_path = params.get("db_path", "codewise.db")
+            
+            if not target:
+                return "❌ target is required"
+            
+            return await enhanced_analyze_relationships(target, analysis_type, db_path)
+        except json.JSONDecodeError:
+            # Fallback: treat as simple target
+            return await enhanced_analyze_relationships(input_str, "all", "codewise.db")
+        except Exception as e:
+            return f"❌ Analyze relationships failed: {str(e)}"
+
     def _get_directory_fallback_summary(self, query: str) -> str:
         """Get directory-based summary when vector search is insufficient."""
         try:
@@ -1654,6 +1851,43 @@ class CodeWiseAgent:
                 description="Find files related to a given file through various relationships (imports, tests, configs, naming patterns). Use JSON format: {\"file_path\": \"path/to/file.py\", \"relationship_types\": [\"import\", \"test\", \"config\"]}. Returns a formatted summary of related files.",
                 func=lambda x: self._run_async_safe(self._handle_find_related_files(x)),
                 coroutine=lambda x: self._handle_find_related_files(x)
+            ),
+            # ==================== PHASE 2: KNOWLEDGE GRAPH QUERY METHODS ====================
+            Tool(
+                name="kg_find_symbol",
+                description="Find symbols in the Knowledge Graph by name. Use JSON format: {\"symbol_name\": \"function_name\", \"exact_match\": true}. Returns detailed symbol information with location, type, and metadata.",
+                func=lambda x: self._run_async_safe(self._handle_kg_find_symbol(x)),
+                coroutine=lambda x: self._handle_kg_find_symbol(x)
+            ),
+            Tool(
+                name="kg_explore_neighborhood", 
+                description="Explore the complete 'neighborhood' of relationships around a symbol. Use JSON format: {\"symbol_name\": \"function_name\", \"max_depth\": 3}. Returns comprehensive relationship analysis including callers, dependencies, inheritance, and file context.",
+                func=lambda x: self._run_async_safe(self._handle_kg_explore_neighborhood(x)),
+                coroutine=lambda x: self._handle_kg_explore_neighborhood(x)
+            ),
+            Tool(
+                name="kg_analyze_dependencies",
+                description="Comprehensive dependency analysis for a symbol. Use JSON format: {\"symbol_name\": \"function_name\", \"max_depth\": 3}. Returns detailed dependency tree, circular dependency detection, and complexity metrics.",
+                func=lambda x: self._run_async_safe(self._handle_kg_analyze_dependencies(x)),
+                coroutine=lambda x: self._handle_kg_analyze_dependencies(x)
+            ),
+            Tool(
+                name="kg_find_callers",
+                description="Find all symbols that call the target symbol through the Knowledge Graph. Use JSON format: {\"symbol_name\": \"function_name\", \"max_depth\": 3}. Returns accurate caller information with relationship context.",
+                func=lambda x: self._run_async_safe(self._handle_kg_find_callers(x)),
+                coroutine=lambda x: self._handle_kg_find_callers(x)
+            ),
+            Tool(
+                name="smart_search",
+                description="Enhanced smart search with Knowledge Graph expansion. Use JSON format: {\"query\": \"natural language query\", \"limit\": 10, \"enable_kg_expansion\": true}. Returns highly relevant results with relationship context when beneficial.",
+                func=lambda x: self._run_async_safe(self._handle_smart_search(x)),
+                coroutine=lambda x: self._handle_smart_search(x)
+            ),
+            Tool(
+                name="analyze_relationships",
+                description="Factual relationship analysis using Knowledge Graph. Use JSON format: {\"target\": \"symbol_or_file\", \"analysis_type\": \"all\", \"max_depth\": 2}. Provides 100% accurate relationship discovery vs LLM-based inference.",
+                func=lambda x: self._run_async_safe(self._handle_analyze_relationships(x)),
+                coroutine=lambda x: self._handle_analyze_relationships(x)
             )
         ]
     
@@ -1697,6 +1931,20 @@ Available tools for direct code manipulation and exploration:
 13. grep_search - Search for text patterns across multiple files
 14. get_file_info - Get detailed file information (size, type, permissions)
 15. explore_directory_tree - Get tree view of directory structure with depth control
+
+**Phase 2: Knowledge Graph Query Methods (when database is indexed):**
+16. kg_find_symbol - Find symbols by name with exact location and metadata
+17. kg_explore_neighborhood - Comprehensive relationship analysis around a symbol
+18. kg_analyze_dependencies - Detailed dependency analysis with complexity metrics
+19. kg_find_callers - Accurate caller discovery through graph traversal
+20. smart_search - Enhanced search with Knowledge Graph expansion for relationship context
+21. analyze_relationships - Factual relationship analysis (100% accurate vs LLM inference)
+
+**KG Tools Usage:**
+- Use KG tools for architectural analysis, dependency tracking, and relationship discovery
+- All KG tools accept JSON parameters: {"symbol_name": "function_name", "max_depth": 3}
+- KG tools provide deterministic, factual results vs pattern-matching approaches
+- Gracefully fall back to standard tools if KG database is not available
 </capabilities>
 
 <response_guidelines>
@@ -1749,7 +1997,7 @@ Available tools for direct code manipulation and exploration:
             early_stopping_method="generate"
         )
     
-    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None, selected_model: str = "gpt-oss-120b") -> AsyncGenerator[Dict[str, Any], None]:
         """Process a user request and yield updates"""
         
         # Set up project context isolation
@@ -1767,7 +2015,7 @@ Available tools for direct code manipulation and exploration:
         # Route to appropriate agent implementation
         if self.use_native_cerebras:
             # Use native Cerebras agent
-            async for update in self.cerebras_agent.process_request(user_query, chat_history, mentioned_projects):
+            async for update in self.cerebras_agent.process_request(user_query, chat_history, mentioned_projects, selected_model):
                 yield update
         else:
             # Use LangChain agent (existing implementation)

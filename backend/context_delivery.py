@@ -12,7 +12,10 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 # import tiktoken  # Optional dependency
 
-from backend.hybrid_search import HybridSearchEngine, SearchResult
+try:
+    from hybrid_search import HybridSearchEngine, SearchResult
+except ImportError:
+    from backend.hybrid_search import HybridSearchEngine, SearchResult
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

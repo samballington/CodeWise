@@ -134,12 +134,16 @@ export default function InteractiveMermaid({ code, className, title }: Interacti
     const container = containerRef.current.getBoundingClientRect()
     const scaleX = (container.width - 40) / bounds.width
     const scaleY = (container.height - 40) / bounds.height
-    const scale = Math.min(scaleX, scaleY, 1)
+    const scale = Math.min(scaleX, scaleY, 2) // Allow up to 2x scale for better use of space
+    
+    // Center the diagram in the container
+    const translateX = Math.max(0, (container.width - bounds.width * scale) / 2)
+    const translateY = Math.max(0, (container.height - bounds.height * scale) / 2)
     
     setViewport({
       scale,
-      translateX: 0,
-      translateY: 0,
+      translateX,
+      translateY,
       isDragging: false,
       dragStart: { x: 0, y: 0 },
       lastPanPoint: { x: 0, y: 0 }
@@ -477,8 +481,8 @@ export default function InteractiveMermaid({ code, className, title }: Interacti
     )
   }
 
-  const containerHeight = bounds.complexity === 'complex' ? '575px' : 
-                         bounds.complexity === 'medium' ? '460px' : '345px'
+  const containerHeight = bounds.complexity === 'complex' ? 'min(80vh, 800px)' : 
+                         bounds.complexity === 'medium' ? 'min(70vh, 600px)' : 'min(60vh, 500px)'
 
   return (
     <>
@@ -545,6 +549,8 @@ export default function InteractiveMermaid({ code, className, title }: Interacti
           className={`interactive-mermaid-container relative border border-slate-600/40 rounded bg-slate-900/50 overflow-hidden ${viewport.isDragging ? 'dragging' : ''}`}
           style={{ 
             height: containerHeight,
+            width: '100%',
+            maxWidth: '100%',
             cursor: viewport.isDragging ? 'grabbing' : 'grab'
           }}
           onMouseDown={handleMouseDown}

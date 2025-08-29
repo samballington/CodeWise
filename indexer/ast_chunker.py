@@ -21,6 +21,14 @@ except ImportError:
     ESPRIMA_AVAILABLE = False
     logging.warning("esprima not available - JavaScript/TypeScript chunking will use regex fallback")
 
+# Tree-sitter universal parsing
+try:
+    from indexer.parsers.tree_sitter_parser import TreeSitterFactory
+    TREE_SITTER_FACTORY_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_FACTORY_AVAILABLE = False
+    logging.warning("TreeSitterFactory not available - falling back to regex parsing")
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -991,7 +999,7 @@ class MarkdownChunker(BaseChunker):
 class SmallFileChunker(BaseChunker):
     """Chunker for small files that should be kept as single chunks"""
     
-    def __init__(self, max_size: int = 500):
+    def __init__(self, max_size: int = 300):
         self.max_size = max_size
     
     def chunk_content(self, content: str, file_path: Path) -> List[CodeChunk]:
@@ -1018,10 +1026,175 @@ class SmallFileChunker(BaseChunker):
         )]
 
 
+class TreeSitterChunker(BaseChunker):
+    """Universal chunker using tree-sitter for multiple languages"""
+    
+    def __init__(self):
+        if TREE_SITTER_FACTORY_AVAILABLE:
+            self.factory = TreeSitterFactory()
+        else:
+            self.factory = None
+    
+    def chunk_content(self, content: str, file_path: Path) -> List[CodeChunk]:
+        """Chunk content using tree-sitter AST parsing"""
+        if not self.factory:
+            return self._fallback_chunk(content, file_path)
+        
+        try:
+            # Parse with tree-sitter
+            tree = self.factory.parse_content(content, file_path)
+            if not tree or not hasattr(tree, 'root_node'):
+                return self._fallback_chunk(content, file_path)
+            
+            chunks = []
+            lines = content.split('\\n')
+            
+            # Extract symbols from tree
+            symbols = self._extract_symbols(tree.root_node, lines)
+            
+            if not symbols:
+                return self._fallback_chunk(content, file_path)
+            
+            # Create chunks for each symbol
+            for symbol in symbols:
+                start_line = max(0, symbol['start_line'])
+                end_line = min(len(lines), symbol['end_line'])
+                
+                chunk_text = '\\n'.join(lines[start_line:end_line + 1])
+                
+                metadata = ChunkMetadata(
+                    file_type=file_path.suffix.lstrip('.'),
+                    chunk_type=symbol['type'],
+                    function_name=symbol.get('name') if symbol['type'] == 'function' else None,
+                    class_name=symbol.get('name') if symbol['type'] == 'class' else None,
+                    imports=symbol.get('imports', []),
+                    line_start=start_line,
+                    line_end=end_line,
+                    docstring=symbol.get('docstring')
+                )
+                
+                chunks.append(CodeChunk(
+                    text=chunk_text,
+                    metadata=metadata,
+                    file_path=str(file_path),
+                    start_line=start_line,
+                    end_line=end_line
+                ))
+            
+            return chunks
+            
+        except Exception as e:
+            logger.warning(f"Tree-sitter chunking failed for {file_path}: {e}")
+            return self._fallback_chunk(content, file_path)
+    
+    def _extract_symbols(self, node, lines) -> List[Dict]:
+        """Extract symbols (functions, classes, etc.) from tree-sitter AST"""
+        symbols = []
+        
+        def traverse(node):
+            # Common tree-sitter node types across languages
+            if node.type in ['function_definition', 'function_declaration', 'method_definition', 'function', 'method_declaration']:
+                name = self._get_symbol_name(node)
+                if name:
+                    symbols.append({
+                        'type': 'function',
+                        'name': name,
+                        'start_line': node.start_point[0],
+                        'end_line': node.end_point[0],
+                        'docstring': self._get_docstring(node, lines)
+                    })
+            
+            elif node.type in ['class_definition', 'class_declaration', 'class', 'struct_declaration', 'interface_declaration', 'struct']:
+                name = self._get_symbol_name(node)
+                if name:
+                    symbols.append({
+                        'type': 'class',
+                        'name': name,
+                        'start_line': node.start_point[0],
+                        'end_line': node.end_point[0],
+                        'docstring': self._get_docstring(node, lines)
+                    })
+            
+            elif node.type in ['import_declaration', 'import_statement', 'from_import']:
+                import_name = self._get_import_name(node, lines)
+                if import_name:
+                    symbols.append({
+                        'type': 'import',
+                        'name': import_name,
+                        'start_line': node.start_point[0],
+                        'end_line': node.end_point[0],
+                        'imports': [import_name]
+                    })
+            
+            # Recursively traverse children
+            for child in node.children:
+                traverse(child)
+        
+        traverse(node)
+        return symbols
+    
+    def _get_symbol_name(self, node) -> Optional[str]:
+        """Extract symbol name from tree-sitter node"""
+        # Look for identifier child nodes
+        for child in node.children:
+            if child.type in ['identifier', 'name', 'type_identifier']:
+                return child.text.decode('utf-8') if isinstance(child.text, bytes) else str(child.text)
+        return None
+    
+    def _get_docstring(self, node, lines) -> Optional[str]:
+        """Extract docstring/comment before the symbol"""
+        start_line = node.start_point[0]
+        if start_line > 0 and start_line - 1 < len(lines):
+            prev_line = lines[start_line - 1].strip()
+            if prev_line.startswith('//') or prev_line.startswith('#') or '/**' in prev_line:
+                return prev_line
+        return None
+    
+    def _get_import_name(self, node, lines) -> Optional[str]:
+        """Extract import name from import statement"""
+        # Get the text of the import line
+        start_line = node.start_point[0]
+        if start_line < len(lines):
+            import_line = lines[start_line].strip()
+            # Simple regex extraction for common import patterns
+            import re
+            patterns = [
+                r'import\s+([\w.]+)',           # import java.util.List
+                r'from\s+([\w.]+)\s+import',   # from typing import List  
+                r'#include\s+[<"]([\w./]+)[>"]', # #include <stdio.h>
+                r'use\s+([\w:]+);'             # use std::collections::HashMap;
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, import_line)
+                if match:
+                    return match.group(1)
+        return None
+    
+    def _fallback_chunk(self, content: str, file_path: Path) -> List[CodeChunk]:
+        """Fallback to simple chunking"""
+        lines = content.split('\n')
+        metadata = ChunkMetadata(
+            file_type=file_path.suffix.lstrip('.'),
+            chunk_type="fallback",
+            line_start=1,
+            line_end=len(lines)
+        )
+        return [CodeChunk(
+            text=content, 
+            metadata=metadata, 
+            file_path=str(file_path),
+            start_line=1,
+            end_line=len(lines)
+        )]
+
+
 class ASTChunker:
     """Main chunking coordinator that selects appropriate chunker based on file type"""
     
     def __init__(self):
+        # Initialize tree-sitter chunker for universal language support
+        self.tree_sitter_chunker = TreeSitterChunker() if TREE_SITTER_FACTORY_AVAILABLE else None
+        
         self.chunkers = {
             'python': PythonASTChunker(),
             'javascript': JavaScriptASTChunker(),
@@ -1030,6 +1203,15 @@ class ASTChunker:
             'markdown': MarkdownChunker(),
             'small_file': SmallFileChunker()
         }
+        
+        # Add tree-sitter support for additional languages
+        if self.tree_sitter_chunker:
+            tree_sitter_languages = [
+                'java', 'swift', 'rust', 'kotlin', 'dart', 'go', 
+                'c', 'cpp', 'csharp', 'php', 'ruby', 'scala'
+            ]
+            for lang in tree_sitter_languages:
+                self.chunkers[lang] = self.tree_sitter_chunker
     
     def chunk_content(self, content: str, file_path: Path) -> List[CodeChunk]:
         """Chunk content based on file type and structure"""
@@ -1043,7 +1225,7 @@ class ASTChunker:
                 if chunks:
                     # If the result is just a fallback and file is small, prefer small_file chunker
                     if (
-                        len(content) <= 500 and
+                        len(content) <= 300 and
                         len(chunks) == 1 and
                         chunks[0].metadata.chunk_type == "fallback"
                     ):
@@ -1051,7 +1233,7 @@ class ASTChunker:
                     return chunks
 
             # Fallback to small file heuristic
-            if len(content) <= 500:
+            if len(content) <= 300:
                 return self.chunkers['small_file'].chunk_content(content, file_path)
             
             # Fallback to character-based chunking

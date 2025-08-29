@@ -5,7 +5,7 @@ import ChatInterface from '../components/ChatInterface'
 import ChatOverlay from '../components/ChatOverlay'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useChatStore, useThemeStore } from '../lib/store'
-import GitHubAuth from '../components/GitHubAuth'
+import GitHubClone from '../components/GitHubClone'
 import ImportDialog from '../components/ImportDialog'
 
 export default function Home() {
@@ -13,7 +13,6 @@ export default function Home() {
   const { messages } = useChatStore()
   const { isDarkMode, toggleTheme } = useThemeStore()
   const [showGitHub, setShowGitHub] = useState(false)
-  const [githubSession, setGithubSession] = useState<string | null>(null)
   const [showChatOverlay, setShowChatOverlay] = useState(false)
   const [showImportDialog, setShowImportDialog] = useState(false)
 
@@ -79,7 +78,7 @@ export default function Home() {
               Import
             </button>
 
-            {/* GitHub toggle */}
+            {/* GitHub Clone toggle */}
             <button
               onClick={() => setShowGitHub(!showGitHub)}
               className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
@@ -90,7 +89,7 @@ export default function Home() {
                   : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               }`}
             >
-              GitHub
+              Clone Repo
             </button>
             
             {/* Chat toggle */}
@@ -131,7 +130,7 @@ export default function Home() {
       <div className="flex-1 flex min-h-0">
         {showGitHub ? (
           <div className="flex-1 p-6">
-            <GitHubAuth onAuthSuccess={(session) => setGithubSession(session)} />
+            <GitHubClone onCloneSuccess={() => setShowGitHub(false)} />
           </div>
         ) : (
           <ChatInterface />

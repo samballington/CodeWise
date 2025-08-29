@@ -2,11 +2,12 @@
 
 import React, { useState, KeyboardEvent, useRef, useEffect, useCallback } from 'react'
 import { Send, Square, ChevronDown } from 'lucide-react'
-import { useThemeStore } from '../lib/store'
+import { useThemeStore, useModelStore } from '../lib/store'
 import { useProjectStore } from '../lib/projectStore'
+import ModelSelector from './ModelSelector'
 
 interface MessageInputProps {
-  onSendMessage: (message: string, mentionedProjects?: string[]) => void
+  onSendMessage: (message: string, mentionedProjects?: string[], selectedModel?: string) => void
   disabled?: boolean
 }
 
@@ -97,6 +98,7 @@ export default function MessageInput({ onSendMessage, disabled = false }: Messag
   
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const { isDarkMode } = useThemeStore()
+  const { selectedModel, setSelectedModel } = useModelStore()
   const { projects, fetchProjects } = useProjectStore()
 
   // Fetch projects on component mount
@@ -203,7 +205,7 @@ export default function MessageInput({ onSendMessage, disabled = false }: Messag
   const handleSend = () => {
     if (input.trim() && !isLoading) {
       const mentions = parseMentions(input.trim())
-      onSendMessage(input.trim(), mentions.length > 0 ? mentions : undefined)
+      onSendMessage(input.trim(), mentions.length > 0 ? mentions : undefined, selectedModel)
       setInput('')
       setIsLoading(true)
       setShowMentionDropdown(false)
@@ -236,6 +238,15 @@ export default function MessageInput({ onSendMessage, disabled = false }: Messag
   return (
     <>
     <div className="relative">
+      {/* Model Selector */}
+      <div className="mb-3">
+        <ModelSelector
+          selectedModel={selectedModel}
+          onModelChange={setSelectedModel}
+          disabled={isLoading || disabled}
+        />
+      </div>
+      
       <div className={`flex items-end gap-3 rounded-2xl p-2 focus-ring transition-all duration-200 border ${
         isDarkMode 
           ? 'bg-background-secondary border-border hover:border-primary/50' 

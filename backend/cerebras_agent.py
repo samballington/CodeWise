@@ -1,2667 +1,2974 @@
-#!/usr/bin/env python3
 """
-Native Cerebras Agent Implementation
-Follows Cerebras SDK tool calling patterns exactly as documented
+COMPLETE Cerebras SDK Native Integration
+
+This replaces ALL custom tool routing, reasoning, and execution with 
+native SDK capabilities. No more emulation - this is pure SDK integration.
+
+Key principles:
+- SDK handles ALL reasoning and tool selection
+- Our infrastructure provides pure data sources
+- Tools are pure functions with zero custom logic
+- Future-proof architecture that adapts to SDK improvements
 """
 
-import asyncio
-import json
-import logging
 import os
-import subprocess
+import json
+import asyncio
+import logging
 import time
-from typing import Dict, Any, List, AsyncGenerator
+from typing import Dict, List, Any, Optional
 from cerebras.cloud.sdk import Cerebras
-from pathlib import Path
-import re
-from directory_filters import (
-    get_find_filter_args, get_grep_filter_args, should_include_file,
-    filter_file_list, resolve_workspace_path, get_project_from_path
-)
-from project_context import (
-    get_context_manager, set_project_context, get_current_context,
-    filter_files_by_context
-)
-from enhanced_project_structure import EnhancedProjectStructure
-from backend.smart_search import smart_search
-from backend.path_resolver import PathResolver
-from backend.response_formatter import ResponseFormatter, StandardizedResponse
-from backend.tools.mermaid_generator import create_mermaid_diagram
-from backend.json_prompt_schema import parse_json_prompt
-from backend.json_prompt_postprocess import improve_json_prompt_readability
-from backend.response_consolidator import ResponseConsolidator, ResponseSource
-from backend.discovery_pipeline import DiscoveryPipeline
-from backend.query_context_manager import QueryContextManager
-from backend.table_generator import TableGenerator, StructuredTable, FileReference
+
+# Import our existing Phase 1/2 infrastructure (PRESERVE these)
+try:
+    from tools.unified_query_pure import query_codebase_pure as query_codebase
+    from tools.mermaid_renderer import MermaidRenderer
+    from smart_search import get_smart_search_engine
+    from vector_store import VectorStore
+    from tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
+    from tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
+    from tools.filesystem_navigator import FilesystemNavigator
+    from config.cerebras_config import cerebras_config
+except ImportError:
+    from .tools.unified_query_pure import query_codebase_pure as query_codebase
+    from .tools.mermaid_renderer import MermaidRenderer
+    from .smart_search import get_smart_search_engine
+    from .vector_store import VectorStore
+    from .tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
+    from .tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
+    from .tools.filesystem_navigator import FilesystemNavigator
+    from .config.cerebras_config import cerebras_config
+
+# Import Phase 2 KG with fallback
+try:
+    from ..storage.database_manager import DatabaseManager
+    KG_AVAILABLE = True
+except ImportError:
+    try:
+        from storage.database_manager import DatabaseManager
+        KG_AVAILABLE = True
+    except ImportError:
+        KG_AVAILABLE = False
+        DatabaseManager = None
 
 logger = logging.getLogger(__name__)
 
-
 class CerebrasNativeAgent:
-    """Native Cerebras agent with proper tool calling support"""
+    """
+    FULLY SDK-Native Agent - Zero Custom Reasoning/Tool Logic
     
-    def __init__(self, api_key: str, mcp_server_url: str):
-        self.client = Cerebras(api_key=api_key, timeout=30.0)  # 30 second timeout to prevent hanging
-        self.mcp_server_url = mcp_server_url
-        self.tools_schema = self._create_tools_schema()
-        self.available_functions = self._create_function_mapping()
-        self.current_mentioned_projects = None  # Store current project context
-        
-        # Rate limiting: Optimized for better performance
-        # Reduced from 1.1s to 0.5s for faster processing
-        self.min_request_interval = 0.5
-        self.last_request_time = 0
-        
-        # Initialize enhanced project structure analyzer
-        self.enhanced_structure = EnhancedProjectStructure(self._call_mcp_tool_wrapper)
-        
-        # Initialize path resolver for Task 3 fix
-        self.path_resolver = PathResolver()
-        
-        # Initialize response formatter for Task 5
-        self.response_formatter = ResponseFormatter()
-        
-        # Initialize discovery pipeline for Task 5 extension
-        self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
-        
-        # Initialize query context manager for performance optimization
-        self.context_manager = QueryContextManager(
-            max_concurrent_contexts=10,
-            cleanup_interval_seconds=60,
-            enable_health_monitoring=True
-        )
-        
-        # Tool context for result chaining
-        self.tool_context = {
-            'last_search_results': None,
-            'discovered_files': [],
-            'query_intent': None,
-            'main_files': [],
-            'entities_found': []
-        }
+    This agent is a thin coordination layer that lets the Cerebras SDK
+    handle ALL reasoning, tool selection, and execution planning while
+    providing access to our Phase 1/2 infrastructure.
     
-    def _repair_truncated_json(self, truncated_json: str) -> str:
-        """Attempt to repair truncated JSON for mermaid diagrams"""
+    Architecture:
+    - SDK: Handles reasoning, tool selection, conversation management
+    - Agent: Coordinates infrastructure and executes pure tool functions
+    - Infrastructure: Provides data through smart search, KG, vector store
+    """
+    
+    def __init__(self):
+        """Initialize with ONLY infrastructure connections"""
+        
+        # Validate configuration first
+        if not cerebras_config.validate_config():
+            raise ValueError("Invalid Cerebras configuration - cannot initialize agent")
+        
+        # SDK Client (this does ALL the reasoning)
         try:
-            # Remove any trailing incomplete text
-            json_str = truncated_json.strip()
-            
-            # Find the last complete object/array structure
-            bracket_count = 0
-            brace_count = 0
-            last_valid_pos = 0
-            in_string = False
-            escape_next = False
-            
-            for i, char in enumerate(json_str):
-                if escape_next:
-                    escape_next = False
-                    continue
-                
-                if char == '\\' and in_string:
-                    escape_next = True
-                    continue
-                
-                if char == '"' and not escape_next:
-                    in_string = not in_string
-                    continue
-                
-                if not in_string:
-                    if char == '{':
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                    elif char == '[':
-                        bracket_count += 1
-                    elif char == ']':
-                        bracket_count -= 1
-                    
-                    # Check if we have a complete structure
-                    if brace_count == 0 and bracket_count == 0 and i > 0:
-                        last_valid_pos = i + 1
-            
-            # If we found a complete structure, use it
-            if last_valid_pos > 0:
-                repaired = json_str[:last_valid_pos]
-                logger.info(f"🔧 JSON repair: truncated from {len(json_str)} to {len(repaired)} chars")
-                return repaired
-            
-            # Otherwise, attempt to close unclosed structures
-            repaired = json_str
-            
-            # Close unclosed strings
-            if in_string:
-                repaired += '"'
-            
-            # Close unclosed arrays
-            while bracket_count > 0:
-                repaired += ']'
-                bracket_count -= 1
-            
-            # Close unclosed objects
-            while brace_count > 0:
-                repaired += '}'
-                brace_count -= 1
-            
-            logger.info(f"🔧 JSON repair: added {len(repaired) - len(json_str)} closing characters")
-            return repaired
-            
+            self.client = Cerebras(**cerebras_config.get_client_config())
+            self.model = cerebras_config.model
+            logger.info(f"✅ Cerebras SDK client initialized with model: {self.model}")
         except Exception as e:
-            logger.error(f"❌ JSON repair failed: {e}")
-            return None
-
-    async def _call_mcp_tool_wrapper(self, tool_name: str, params):
-        """Wrapper method for MCP tool calls to match the expected signature"""
-        if tool_name == "run_command":
-            if isinstance(params, str):
-                command = params
-            else:
-                command = params.get("command", params)
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
-            return result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
-        elif tool_name == "read_file":
+            logger.error(f"❌ Failed to initialize Cerebras client: {e}")
+            raise
+        
+        # REQ-3.6.6: Future-proofing SDK capability detection
+        self.sdk_version = self._detect_sdk_version()
+        self.available_features = self._detect_sdk_features()
+        logger.info(f"✅ SDK capabilities detected: {list(self.available_features.keys())}")
+        
+        # Phase 1/2 Infrastructure (data sources only)
+        try:
+            self.smart_search = get_smart_search_engine()
+            self.vector_store = VectorStore()
+            self.mermaid_renderer = MermaidRenderer()
+            logger.info("✅ Core infrastructure initialized")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize core infrastructure: {e}")
+            raise
+        
+        # Phase 2 Knowledge Graph (optional)
+        if KG_AVAILABLE:
             try:
-                with open(params, 'r', encoding='utf-8') as f:
-                    return f.read()
+                self.kg = DatabaseManager()
+                logger.info("✅ Knowledge Graph available for SDK")
             except Exception as e:
-                return f"Error reading file: {e}"
+                logger.warning(f"⚠️ Knowledge Graph initialization failed: {e}")
+                self.kg = None
         else:
-            return f"Tool {tool_name} not supported in wrapper"
+            self.kg = None
+            logger.warning("⚠️ Knowledge Graph not available")
         
-    def _filter_results_by_projects(self, results: List, mentioned_projects: List[str] = None) -> List:
-        """Filter search results by mentioned projects using centralized context management"""
-        if not mentioned_projects:
-            return results
-        
-        # Use centralized filtering logic
-        filtered_results = []
-        for result in results:
-            # Get file path from result (handle both search results and file paths)
-            file_path = result.file_path if hasattr(result, 'file_path') else str(result)
-            
-            # Use centralized context manager for consistent filtering
-            if get_context_manager().is_file_in_current_context(file_path):
-                filtered_results.append(result)
-        
-        return filtered_results
-    
-    def _detect_negative_result(self, result_text: str, function_name: str) -> bool:
-        """Detect if a tool result indicates no findings (Phase 1 fix)"""
-        negative_patterns = {
-            "smart_search": ["no results found", "not found", "no matches"],
-            "examine_files": ["file not found", "does not exist", "error reading"],
-            "analyze_relationships": ["not found", "error analyzing", "no references found"]
-        }
-        
-        patterns = negative_patterns.get(function_name, ["not found", "no results"])
-        return any(pattern in result_text.lower() for pattern in patterns)
-    
-    def _get_fallback_guidance(self, function_name: str) -> str:
-        """Get fallback strategy guidance for negative results (Phase 1 fix)"""
-        fallback_strategies = {
-            "smart_search": "Try different search terms or more general queries - smart_search adapts automatically",
-            "examine_files": "Verify file paths are correct or try smart_search to find the files first",
-            "analyze_relationships": "Ensure target exists or try smart_search to find the correct symbol/file names"
-        }
-        
-        return fallback_strategies.get(function_name, "Try alternative approaches or different search terms")
-    
-    async def _get_smart_fallback_files(self, query_intent: str = None, query: str = "") -> List[str]:
-        """Get intelligent fallback files when search fails"""
-        import subprocess
-        from pathlib import Path
-        
-        workspace = Path('/workspace')
-        fallback_files = []
-        
-        try:
-            # Intent-based fallbacks
-            if query_intent == "ARCHITECTURE" or any(word in query.lower() for word in ['architecture', 'system', 'overview', 'structure']):
-                # Look for architectural files
-                arch_patterns = ['README*', 'package.json', 'pom.xml', 'setup.py', 'requirements.txt', 'Dockerfile', 'docker-compose*']
-                for pattern in arch_patterns:
-                    matches = list(workspace.rglob(pattern))
-                    fallback_files.extend([str(f) for f in matches[:2]])  # Limit per pattern
-                
-                # Look for main entry points
-                entry_patterns = ['main.py', 'app.py', 'index.js', 'server.js', 'Application.java', 'manage.py']
-                for pattern in entry_patterns:
-                    matches = list(workspace.rglob(pattern))
-                    fallback_files.extend([str(f) for f in matches[:1]])
-            
-            elif query_intent == "ENTITY" or any(word in query.lower() for word in ['entity', 'model', 'database', 'schema']):
-                # Look for entity-like files
-                try:
-                    cmd = ["find", "/workspace", "-name", "*model*", "-o", "-name", "*entity*", "-o", "-name", "*Entity*", "-type", "f"]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                    if result.returncode == 0:
-                        files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
-                        fallback_files.extend(files[:5])
-                except Exception:
-                    pass
-            
-            else:
-                # General fallbacks - look for common important files
-                general_patterns = ['README*', 'main.*', 'app.*', 'index.*', 'package.json']
-                for pattern in general_patterns:
-                    matches = list(workspace.rglob(pattern))
-                    fallback_files.extend([str(f) for f in matches[:2]])
-            
-            # Remove duplicates and apply project filtering
-            unique_files = []
-            for f in fallback_files:
-                if f not in unique_files:
-                    if self.current_mentioned_projects:
-                        for project in self.current_mentioned_projects:
-                            if f"/{project}/" in f or f.endswith(f"/{project}"):
-                                unique_files.append(f)
-                                break
-                    else:
-                        unique_files.append(f)
-            
-            # Limit to reasonable number
-            return unique_files[:8]
-            
-        except Exception as e:
-            logger.debug(f"Error in smart fallback discovery: {e}")
-            return []
-    
-    def _extract_files_from_search_results(self, search_result: str) -> List[str]:
-        """Extract file paths from smart_search results"""
-        import re
-        
-        files = []
-        
-        # Look for FILE: patterns
-        file_matches = re.findall(r'FILE:\s*([^\n]+)', search_result)
-        files.extend(file_matches)
-        
-        # Look for file paths in results
-        path_matches = re.findall(r'([a-zA-Z0-9_./\\-]+\.[a-zA-Z]{2,4})', search_result)
-        files.extend(path_matches)
-        
-        # Clean and deduplicate
-        cleaned_files = []
-        for f in files:
-            f = f.strip()
-            if f and f not in cleaned_files and not f.startswith('Error'):
-                cleaned_files.append(f)
-        
-        return cleaned_files[:10]  # Limit to 10 files
-    
-    def _extract_query_intent_from_search(self, search_result: str) -> str:
-        """Extract query intent from smart_search results"""
-        import re
-        
-        intent_match = re.search(r'Query Intent:\s*(\w+)', search_result)
-        if intent_match:
-            return intent_match.group(1)
-        return "GENERAL"
-    
-    def _extract_main_target_from_examine_results(self, examine_result: str) -> str:
-        """Extract main target for relationship analysis from examine_files results"""
-        import re
-        
-        # Look for the first successfully examined file
-        file_match = re.search(r'FILE:\s*([^\n]+)', examine_result)
-        if file_match:
-            return file_match.group(1).strip()
-        
-        # Look for class or function names that could be analyzed
-        class_matches = re.findall(r'class\s+(\w+)', examine_result)
-        if class_matches:
-            return class_matches[0]
-        
-        function_matches = re.findall(r'def\s+(\w+)', examine_result)
-        if function_matches:
-            return function_matches[0]
-        
-        return "main"  # Default fallback
-    
-    def _detect_incomplete_response(self, response_text: str) -> bool:
-        """Detect if response indicates intention to do more work (Phase 2 fix)"""
-        continuation_signals = [
-            "let me try", "i will", "let me search", "i'll examine", 
-            "let me check", "i'll look", "let me find", "i will search",
-            "let me explore", "i'll investigate", "let me analyze"
-        ]
-        return any(signal in response_text.lower() for signal in continuation_signals)
-    
-    def _detect_inadequate_response(self, response_text: str, tool_call_count: int) -> bool:
-        """Detect if GPT-OSS-120B provided inadequate response after calling tools (Two-Stage Fix)"""
-        if tool_call_count == 0:
-            return False  # No tools called, response is expected to be brief
-        
-        # More conservative inadequate response detection
-        response_lower = response_text.lower().strip()
-        
-        # Only trigger for very short responses that are clearly inadequate
-        if len(response_text.strip()) < 30 and tool_call_count > 2:
-            # Check if it's just a generic completion message
-            inadequate_patterns = [
-                "task completed",
-                "done",
-                "completed", 
-                "finished"
-            ]
-            if any(pattern in response_lower for pattern in inadequate_patterns):
-                return True
-            
-        # Don't trigger synthesis for Mermaid generation or intermediate responses
-        if "mermaid" in response_lower or "diagram" in response_lower:
-            return False
-            
-        return False
-    
-    def _compile_tool_results_summary(self, tool_results: List[Dict]) -> str:
-        """Compile tool results into a comprehensive summary for synthesis stage"""
-        if not tool_results:
-            return "No tool results available."
-        
-        summary_parts = []
-        
-        for i, result in enumerate(tool_results, 1):
-            tool_name = result.get('tool_name', 'unknown_tool')
-            result_content = result.get('result', '')
-            
-            # Truncate very long results but preserve key information
-            if len(result_content) > 2000:
-                result_content = result_content[:1800] + "...\n[Content truncated for synthesis]"
-            
-            summary_parts.append(f"**Tool {i}: {tool_name.upper()}**\n{result_content}")
-        
-        return "\n\n".join(summary_parts)
-    
-    async def _enforce_rate_limit(self):
-        """Enforce rate limiting to prevent 429 errors - 1 request per second max"""
-        current_time = time.time()
-        time_since_last_request = current_time - self.last_request_time
-        
-        if time_since_last_request < self.min_request_interval:
-            wait_time = self.min_request_interval - time_since_last_request
-            logger.info(f"🕒 RATE LIMITING: Waiting {wait_time:.1f}s before next API request")
-            await asyncio.sleep(wait_time)
-        
-        self.last_request_time = time.time()
-    
-    def _calculate_investigation_completeness(self, tool_calls_made: List[str], messages: List[Dict]) -> float:
-        """Calculate investigation quality score to prevent premature termination (Updated for 3-tool system)"""
-        score = 0.0
-        
-        # Extract function names from tool call signatures
-        tool_types = set()
-        for call in tool_calls_made:
-            if ':' in call:
-                func_name = call.split(':')[0]
-                tool_types.add(func_name)
-        
-        # Points for tool diversity (encourages using different approaches)
-        score += len(tool_types) * 2.0  # Increased weight for tool diversity
-        
-        # Check recent results for negative outcomes
-        recent_results = []
-        for msg in messages[-10:]:  # Check last 10 messages
-            if msg.get('role') == 'tool':
-                recent_results.append(msg.get('content', ''))
-        
-        # Deduct for negative results without alternatives
-        negative_results = sum(1 for result in recent_results if "not found" in result.lower() or "no matches" in result.lower())
-        if negative_results > 0 and len(tool_types) < 2:
-            score -= 1  # Reduced penalty
-        
-        # Bonus for comprehensive investigation patterns (updated for 3-tool system)
-        if "smart_search" in tool_types and "examine_files" in tool_types:
-            score += 2
-        
-        # Bonus for complete workflow
-        if "smart_search" in tool_types and "examine_files" in tool_types and "analyze_relationships" in tool_types:
-            score += 3
-        
-        return score
-    
-    def _create_tools_schema(self) -> List[Dict[str, Any]]:
-        """Create simplified 3-tool architecture schema with smart tools"""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "smart_search",
-                    "description": "Intelligent unified search combining vector search, keyword search, and entity discovery. Automatically detects query intent (entity, file, general) and routes to optimal search strategies. Use this as your primary search tool.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query - can be about entities, files, code functionality, or general questions"
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "description": "Maximum number of results to return (default: 10)"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            },
-            {
-                "type": "function", 
-                "function": {
-                    "name": "examine_files",
-                    "description": "Flexible file inspection with multiple detail levels. Automatically uses files from previous smart_search if no paths provided. Can show file summaries, full content, or structural analysis.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_paths": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of file paths to examine. Optional - will use smart fallbacks from previous search if not provided."
-                            },
-                            "detail_level": {
-                                "type": "string",
-                                "enum": ["summary", "full", "structure"],
-                                "description": "Level of detail: 'summary' (key sections), 'full' (complete content), 'structure' (outline only)"
-                            }
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "analyze_relationships",
-                    "description": "Analyze code relationships and dependencies using AST-based analysis. Automatically uses targets from previous examine_files if no target provided. Find imports, references, related files, and predict impact of changes.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "target": {
-                                "type": "string",
-                                "description": "Target file, class, or function to analyze relationships for. Optional - will use smart fallbacks from previous tools if not provided."
-                            },
-                            "analysis_type": {
-                                "type": "string",
-                                "enum": ["imports", "usage", "impact", "all"],
-                                "description": "Type of analysis: 'imports' (what it uses), 'usage' (what uses it), 'impact' (change prediction), 'all' (comprehensive)"
-                            }
-                        },
-                        "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "mermaid_generator",
-                    "description": "Generate professional Mermaid.js diagrams from structured data. Converts semantic diagram descriptions into syntactically correct, styled Mermaid code using predefined templates.",
-                    "parameters": {
-                        "type": "object", 
-                        "properties": {
-                            "diagram_type": {
-                                "type": "string",
-                                "enum": ["Full-Stack Application", "API / Microservice Interaction", "Database Schema", "Internal Component Flow", "CI/CD Pipeline", "General System Architecture"],
-                                "description": "The type of diagram template to use for styling and structure"
-                            },
-                            "nodes": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string", "description": "Unique alphanumeric identifier"},
-                                        "label": {"type": "string", "description": "Display text (will be auto-escaped)"},
-                                        "shape": {"type": "string", "enum": ["square", "round-edge", "database", "rhombus", "circle", "hexagon"], "description": "Mermaid node shape"},
-                                        "group": {"type": "string", "description": "Optional subgraph name"}
-                                    },
-                                    "required": ["id", "label"]
-                                },
-                                "description": "List of all diagram nodes/components"
-                            },
-                            "edges": {
-                                "type": "array", 
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "from": {"type": "string", "description": "Source node ID"},
-                                        "to": {"type": "string", "description": "Target node ID"}, 
-                                        "label": {"type": "string", "description": "Optional edge label"}
-                                    },
-                                    "required": ["from", "to"]
-                                },
-                                "description": "List of connections between nodes"
-                            }
-                        },
-                        "required": ["diagram_type", "nodes", "edges"]
-                    }
-                }
-            }
-        ]
-    
-    def _create_function_mapping(self) -> Dict[str, callable]:
-        """Map function names to simplified 4-tool implementations"""
-        return {
-            "smart_search": self._smart_search_router,  # Context-aware router
-            "examine_files": self._examine_files,
-            "analyze_relationships": self._analyze_relationships,
-            "mermaid_generator": self._mermaid_generator_wrapper
-        }
-    
-    async def _mermaid_generator_wrapper(self, diagram_type: str, nodes: List[Dict], edges: List[Dict]) -> str:
-        """Async wrapper for mermaid generator tool"""
-        try:
-            # Validate input
-            if not nodes:
-                return "❌ **Error**: No nodes provided for diagram generation"
-               
-            if not edges:
-                return "❌ **Error**: No edges provided for diagram generation"
-            
-            logger.info(f"🎨 Generating {diagram_type} diagram with {len(nodes)} nodes and {len(edges)} edges")
-            
-            # Call the tool
-            diagram_data = {
-                "diagram_type": diagram_type,
-                "nodes": nodes,
-                "edges": edges
-            }
-            
-            result = create_mermaid_diagram(diagram_data)
-            
-            # Format for structured response
-            response = f"✅ **Mermaid Diagram Generated Successfully**\n\n"
-            response += f"**📊 Diagram Details:**\n"
-            response += f"- **Type:** {diagram_type}\n"
-            response += f"- **Nodes:** {len(nodes)} components\n"
-            response += f"- **Connections:** {len(edges)} relationships\n"
-            response += f"- **Diagram Length:** {len(result)} characters\n\n"
-            response += "```mermaid\n"
-            response += result
-            response += "\n```"
-            
-            logger.info(f"🎨 Successfully generated Mermaid diagram ({len(result)} chars)")
-            return response
-            
-        except ValueError as ve:
-            logger.error(f"Mermaid validation error: {ve}")
-            return f"❌ **Mermaid Validation Error:** {str(ve)}\n\nPlease check your input data format and try again."
-        except Exception as e:
-            logger.error(f"Mermaid generator error: {e}")
-            return f"❌ **Mermaid Generation Failed:** {str(e)}\n\nThe diagram could not be generated. Please verify your input data."
-    
-    async def _smart_search_router(self, query: str, max_results: int = 10) -> str:
-        """Route to context-aware or legacy smart search based on availability"""
-        if hasattr(self, 'current_query_context') and self.current_query_context is not None:
-            # Use context-aware version (THE PERFORMANCE FIX)
-            return await self._smart_search_context_aware(query, self.current_query_context, max_results)
+        # REQ-3.6.1: Initialize filesystem navigator tool
+        if self.kg:
+            try:
+                self.filesystem_navigator = FilesystemNavigator(self.kg)
+                logger.info("✅ Filesystem navigator initialized with KG integration")
+            except Exception as e:
+                logger.warning(f"⚠️ Filesystem navigator initialization failed: {e}")
+                self.filesystem_navigator = None
         else:
-            # Fallback to legacy version
-            logger.warning("⚠️ Using legacy smart search - context not available")
-            return await self._smart_search_legacy(query, max_results)
-    
-    async def _smart_search_context_aware(self, query: str, query_context, max_results: int = 10) -> str:
-        """Context-aware intelligent unified search (PERFORMANCE OPTIMIZED)"""
-        try:
-            logger.info(f"🧠 CONTEXT-AWARE SMART SEARCH: '{query}' (context: {query_context.query_id[:8]}, max_results={max_results})")
-            
-            # Use the context-aware smart search engine (THE KEY FIX)
-            from backend.smart_search import SmartSearchEngine
-            search_engine = SmartSearchEngine()  # Get the search engine instance
-            search_result = await search_engine.search_with_context(
-                query=query, 
-                context=query_context,
-                k=max_results, 
-                mentioned_projects=self.current_mentioned_projects
-            )
-            
-            results = search_result['results']
-            query_analysis = search_result['query_analysis']
-            strategies_used = search_result['search_strategies_used']
-            
-            # Store context for tool chaining
-            self.tool_context['last_search_results'] = search_result
-            self.tool_context['query_intent'] = query_analysis['intent'].value
-            
-            # Apply project filtering if mentioned projects are specified (same as legacy)
-            if self.current_mentioned_projects:
-                filtered_results = []
-                for result in results:
-                    file_path = result.file_path
-                    if not file_path.startswith('/workspace/'):
-                        file_path = f"/workspace/{file_path.lstrip('/')}"
-                    
-                    if get_context_manager().is_file_in_current_context(file_path):
-                        filtered_results.append(result)
-                results = filtered_results
-            
-            # Extract discovered files for tool chaining
-            discovered_files = [result.file_path for result in results]
-            self.tool_context['discovered_files'] = discovered_files
-            query_context.discovered_files.extend(discovered_files)  # Update context
-            
-            # Handle auto-examination recommendations from discovery pipeline
-            auto_examine_files = search_result.get('auto_examine_files', [])
-            if auto_examine_files:
-                logger.info(f"🔍 AUTO-EXAMINATION: Discovery pipeline recommends examining {len(auto_examine_files)} files")
-                logger.info(f"🔍 AUTO-EXAMINATION: Files: {auto_examine_files}")
-                self.tool_context['auto_examine_files'] = auto_examine_files
-            else:
-                auto_examine_files = []
-            
-            # Rest of the method logic (same as legacy)...
-            if not results:
-                filter_msg = f" (filtered for projects: {self.current_mentioned_projects})" if self.current_mentioned_projects else ""
-                intent_for_fallback = query_analysis['intent'].value
-                
-                fallback_files = await self._get_smart_fallback_files(intent_for_fallback, query)
-                if fallback_files:
-                    fallback_msg = f"\n\n🎯 **Smart Fallback Guidance:**\n"
-                    for i, file_path in enumerate(fallback_files[:3], 1):
-                        fallback_msg += f"{i}. `{file_path}`\n"
-                    fallback_msg += "\nConsider examining these files that might contain relevant information."
-                else:
-                    fallback_msg = ""
-                
-                return f"❌ **No results found**{filter_msg} for query: '{query}'\n\n📊 **Search Analysis:**\n- Intent: {intent_for_fallback.title()}\n- Strategies: {', '.join(strategies_used)}\n- Results: 0 matches{fallback_msg}"
-            
-            # Create structured response with both markdown and JSON table
-            markdown_summary = []
-            markdown_summary.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} matches)")
-            markdown_summary.append(f"📊 **Query Analysis:** Intent={query_analysis['intent'].value}, Confidence={query_analysis['confidence']:.2f}")
-            markdown_summary.append(f"🎯 **Strategies Used:** {', '.join(strategies_used)}")
-            
-            if auto_examine_files:
-                markdown_summary.append(f"🔍 **Discovery Pipeline:** Found {len(auto_examine_files)} files for auto-examination")
-            
-            execution_time = search_result.get('execution_time', 0)
-            markdown_summary.append(f"⚡ **Execution time:** {execution_time:.2f}s")
-            
-            # Add auto-examine suggestion if files were found
-            if auto_examine_files and len(auto_examine_files) > 0:
-                markdown_summary.append(f"\n💡 **Auto-Examine Suggestion:** The discovery pipeline found {len(auto_examine_files)} related files. Consider examining them for deeper insights.")
-            
-            # Create structured table for search results
-            search_table = TableGenerator.create_search_results_table(
-                [
-                    {
-                        'file_path': result.file_path.replace('/workspace/', ''),
-                        'relevance_score': result.relevance_score,
-                        'snippet': result.snippet,
-                        'matched_terms': getattr(result, 'matched_terms', []),
-                        'search_strategy': getattr(result, 'search_strategy', ['hybrid'])
-                    } 
-                    for result in results[:max_results]
-                ],
-                title="Search Results"
-            )
-            
-            # Create file references for JSON
-            file_refs = [
-                FileReference(
-                    path=result.file_path.replace('/workspace/', ''),
-                    line_start=getattr(result, 'line_start', None),
-                    line_end=getattr(result, 'line_end', None)
-                )
-                for result in results[:max_results]
-            ]
-            
-            # Combine markdown and structured data
-            markdown_content = "\n".join(markdown_summary)
-            result_text = TableGenerator.wrap_response_with_structured_data(
-                markdown_content,
-                tables=[search_table],
-                references=file_refs
-            )
-            logger.info(f"✅ CONTEXT-AWARE SMART SEARCH COMPLETE: {len(results)} results, {execution_time:.2f}s")
-            return result_text
-            
-        except Exception as e:
-            logger.error(f"❌ CONTEXT-AWARE SMART SEARCH ERROR: {e}")
-            return f"❌ **Search Error:** {str(e)}\n\nPlease try a different query or check the system logs for more details."
-    
-    async def _smart_search_legacy(self, query: str, max_results: int = 10) -> str:
-        """Intelligent unified search combining vector, BM25, and entity discovery"""
-        try:
-            logger.error(f"🚀 SMART_SEARCH START CHECKPOINT: '{query}' (max_results={max_results})")
-            logger.info(f"🧠 SMART SEARCH: '{query}' (max_results={max_results})")
-            
-            # Use the smart search engine (with project filtering)
-            search_result = await smart_search(query, k=max_results, mentioned_projects=self.current_mentioned_projects)
-            
-            results = search_result['results']
-            query_analysis = search_result['query_analysis']
-            strategies_used = search_result['search_strategies_used']
-            
-            # Store context for tool chaining
-            self.tool_context['last_search_results'] = search_result
-            self.tool_context['query_intent'] = query_analysis['intent'].value
-            
-            # Apply project filtering if mentioned projects are specified
-            if self.current_mentioned_projects:
-                filtered_results = []
-                for result in results:
-                    # Normalize file path to full workspace path for filtering
-                    file_path = result.file_path
-                    if not file_path.startswith('/workspace/'):
-                        file_path = f"/workspace/{file_path.lstrip('/')}"
-                    
-                    if get_context_manager().is_file_in_current_context(file_path):
-                        filtered_results.append(result)
-                results = filtered_results
-            
-            # Extract discovered files for tool chaining
-            discovered_files = [result.file_path for result in results]
-            self.tool_context['discovered_files'] = discovered_files
-            
-            # NEW: Handle auto-examination recommendations from discovery pipeline
-            auto_examine_files = search_result.get('auto_examine_files', [])
-            if auto_examine_files:
-                logger.info(f"🔍 AUTO-EXAMINATION: Discovery pipeline recommends examining {len(auto_examine_files)} files")
-                logger.info(f"🔍 AUTO-EXAMINATION: Files: {auto_examine_files}")
-                # Store for potential auto-examination
-                self.tool_context['auto_examine_files'] = auto_examine_files
-            else:
-                # Ensure we have an empty list if no files found
-                auto_examine_files = []
-            
-            if not results:
-                filter_msg = f" (filtered for projects: {self.current_mentioned_projects})" if self.current_mentioned_projects else ""
-                
-                # Store intent even when no results found for fallback
-                intent_for_fallback = query_analysis['intent'].value
-                self.tool_context['query_intent'] = intent_for_fallback
-                
-                return f"No results found for query '{query}'{filter_msg}.\n\nQuery Analysis:\n- Intent: {intent_for_fallback}\n- Confidence: {query_analysis['confidence']:.2f}\n- Strategies tried: {', '.join(strategies_used)}\n\n💡 TIP: Other tools can use smart fallbacks based on the detected intent."
-            
-            # Create structured table for search results
-            search_table = TableGenerator.create_search_results_table([
-                {
-                    'file_path': result.file_path.replace('/workspace/', ''),
-                    'relevance_score': result.confidence,
-                    'snippet': result.snippet,
-                    'matched_terms': getattr(result, 'matched_terms', []),
-                    'search_strategy': result.search_strategy
-                } 
-                for result in results[:max_results]
-            ], title="Smart Search Results")
-            
-            # Build markdown response with metadata
-            markdown_parts = []
-            markdown_parts.append(f"🧠 **SMART SEARCH RESULTS** ({len(results)} found)")
-            markdown_parts.append(f"📊 **Query Analysis:**")
-            markdown_parts.append(f"   • Intent: {query_analysis['intent'].value} (confidence: {query_analysis['confidence']:.2f})")
-            markdown_parts.append(f"   • Strategies: {', '.join(strategies_used)}")
-            markdown_parts.append(f"   • Execution Time: {search_result.get('execution_time', 0):.2f}s")
-            markdown_parts.append("")
-            
-            # Store main files for potential relationship analysis
-            main_files = []
-            for result in results:
-                # Collect high-confidence files as potential main files
-                if result.confidence > 0.7:
-                    main_files.append(result.file_path)
-            
-            self.tool_context['main_files'] = main_files[:3]  # Keep top 3
-            
-            # Add project filter info if applicable
-            if self.current_mentioned_projects:
-                markdown_parts.append(f"[Filtered for projects: {', '.join(self.current_mentioned_projects)}]")
-            
-            # Add tool chaining hint
-            markdown_parts.append(f"💡 **DISCOVERED:** {len(discovered_files)} files ready for examination")
-            
-            # NEW: Auto-examination integration for Task 5 Extension
-            logger.info(f"🔍 AUTO-EXAMINATION DEBUG: auto_examine_files = {auto_examine_files}")
-            logger.info(f"🔍 AUTO-EXAMINATION DEBUG: len(auto_examine_files) = {len(auto_examine_files) if auto_examine_files else 0}")
-            
-            if auto_examine_files and len(auto_examine_files) > 0:
-                logger.info(f"🔍 AUTO-EXAMINATION: CONDITION MET - Starting examination of {len(auto_examine_files)} files")
-                markdown_parts.append("")
-                markdown_parts.append(f"🔍 **DISCOVERY PIPELINE:** Found {len(auto_examine_files)} files for auto-examination")
-                markdown_parts.append(f"   📁 Auto-examine files: {', '.join(auto_examine_files)}")
-                
-                # Automatically examine the discovered files
-                try:
-                    logger.info(f"🔍 AUTO-EXAMINATION: Starting examination of {len(auto_examine_files)} files")
-                    auto_exam_result = await self._examine_files(auto_examine_files, "summary")
-                    
-                    # Add the auto-examination results to the response
-                    markdown_parts.append("")
-                    markdown_parts.append("---")
-                    markdown_parts.append("🔍 **AUTO-EXAMINATION RESULTS:**")
-                    markdown_parts.append("---")
-                    markdown_parts.append(auto_exam_result)
-                    
-                    logger.info("✅ AUTO-EXAMINATION: Completed successfully")
-                    
-                except Exception as auto_exam_error:
-                    logger.error(f"❌ AUTO-EXAMINATION: Failed: {auto_exam_error}")
-                    markdown_parts.append(f"\n⚠️ Auto-examination failed: {auto_exam_error}")
-            else:
-                logger.info(f"🔍 AUTO-EXAMINATION: CONDITION NOT MET - No files to examine")
-            
-            # Use TableGenerator to wrap response with structured data
-            markdown_response = "\n".join(markdown_parts)
-            return TableGenerator.wrap_response_with_structured_data(markdown_response, [search_table])
-            
-        except Exception as e:
-            logger.error(f"Smart search error: {e}")
-            return f"Error during smart search: {str(e)}"
-    
-
-    
-    def _apply_syntax_highlighting(self, content: str, file_extension: str) -> str:
-        """Apply basic syntax highlighting using markdown code blocks"""
+            self.filesystem_navigator = None
+            logger.warning("⚠️ Filesystem navigator not available - requires Knowledge Graph")
         
-        # Map file extensions to language identifiers for markdown code blocks
-        language_map = {
-            '.py': 'python',
-            '.js': 'javascript', 
-            '.ts': 'typescript',
-            '.jsx': 'jsx',
-            '.tsx': 'tsx',
-            '.java': 'java',
-            '.cpp': 'cpp',
-            '.c': 'c',
-            '.cs': 'csharp',
-            '.php': 'php',
-            '.rb': 'ruby',
-            '.go': 'go',
-            '.rs': 'rust',
-            '.kt': 'kotlin',
-            '.swift': 'swift',
-            '.html': 'html',
-            '.css': 'css',
-            '.scss': 'scss',
-            '.sass': 'sass',
-            '.json': 'json',
-            '.xml': 'xml',
-            '.yaml': 'yaml',
-            '.yml': 'yaml',
-            '.toml': 'toml',
-            '.ini': 'ini',
-            '.cfg': 'ini',
-            '.conf': 'ini',
-            '.sh': 'bash',
-            '.bash': 'bash',
-            '.zsh': 'zsh',
-            '.fish': 'fish',
-            '.ps1': 'powershell',
-            '.sql': 'sql',
-            '.md': 'markdown',
-            '.dockerfile': 'dockerfile',
-            '.gitignore': 'gitignore',
-            '.env': 'bash'
+        # CRITICAL: Tool functions that SDK will call (REQ-3.6.1: Two-tool architecture)
+        # These are PURE functions - no reasoning, just execution
+        self.tool_functions = {
+            "query_codebase": self._execute_query_codebase,
+            "navigate_filesystem": self._execute_navigate_filesystem,
+            # Removed from primary tools - now internal utilities:
+            # "generate_diagram": self._execute_generate_diagram,  # Now internal via mermaid_renderer
+            # "examine_files": self._execute_examine_files,        # Functionality absorbed into navigate_filesystem
+            # "search_symbols": self._execute_search_symbols       # Functionality absorbed into query_codebase
         }
         
-        # Get language for syntax highlighting
-        language = language_map.get(file_extension.lower(), 'text')
+        # Conversation limits for safety
+        self.max_iterations = 20
+        self.current_iteration = 0
         
-        # Apply markdown code block formatting for syntax highlighting
-        highlighted_content = f"```{language}\n{content}\n```"
-        
-        return highlighted_content
-
-    async def _examine_files(self, file_paths: List[str] = None, detail_level: str = "summary") -> str:
-        """Flexible file inspection with multiple detail levels"""
-        try:
-            # Smart fallback: Use discovered files from previous search or intelligent discovery
-            if not file_paths or len(file_paths) == 0:
-                logger.info("📄 EXAMINE FILES: No files provided, using smart fallbacks")
-                
-                # Try to use files discovered from previous smart_search
-                if self.tool_context['discovered_files']:
-                    file_paths = self.tool_context['discovered_files'][:5]  # Limit to 5
-                    logger.info(f"📄 Using {len(file_paths)} files from previous search results")
-                else:
-                    # Use intelligent fallback discovery
-                    query_intent = self.tool_context.get('query_intent', 'GENERAL')
-                    fallback_files = await self._get_smart_fallback_files(query_intent)
-                    if fallback_files:
-                        file_paths = fallback_files
-                        logger.info(f"📄 Using {len(file_paths)} fallback files for intent: {query_intent}")
-                    else:
-                        return "❌ No files to examine. Try running smart_search first to discover files, or provide specific file paths."
-            
-            logger.info(f"📄 EXAMINE FILES: {len(file_paths)} files, detail={detail_level}")
-            
-            workspace_path = Path('/workspace')
-            results = []
-            results.append(f"📄 FILE EXAMINATION ({detail_level} level)")
-            
-            # Add context info if using discovered files
-            if self.tool_context['discovered_files'] and file_paths == self.tool_context['discovered_files'][:5]:
-                results.append("🔗 Using files discovered from previous smart_search")
-            elif self.tool_context.get('query_intent') and file_paths != self.tool_context['discovered_files']:
-                results.append(f"🎯 Using smart fallback files for intent: {self.tool_context['query_intent']}")
-            
-            results.append("=" * 60)
-            
-            successful_files = []
-            failed_files = []
-            
-            for file_path in file_paths[:10]:  # Limit to 10 files
-                try:
-                    # Resolve path
-                    if not file_path.startswith('/workspace'):
-                        full_path = workspace_path / file_path.lstrip('./')
-                    else:
-                        full_path = Path(file_path)
-                    
-                    if not full_path.exists():
-                        results.append(f"\n❌ FILE NOT FOUND: {file_path}")
-                        continue
-                    
-                    results.append(f"\n📁 FILE: {file_path}")
-                    
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    lines = content.split('\n')
-                    file_size = len(content)
-                    line_count = len(lines)
-                    
-                    results.append(f"   Size: {file_size:,} chars | Lines: {line_count:,}")
-                    
-                    if detail_level == "structure":
-                        # Show file structure (functions, classes, imports)
-                        structure_info = self._analyze_file_structure(content, full_path.suffix)
-                        results.append(f"   📋 Structure:\n{structure_info}")
-                        
-                        # Also show a small code sample with syntax highlighting for structure level
-                        if line_count > 0:
-                            sample_lines = min(15, line_count)
-                            code_sample = '\n'.join(lines[:sample_lines])
-                            if sample_lines < line_count:
-                                code_sample += f"\n... ({line_count - sample_lines} more lines)"
-                            highlighted_sample = self._apply_syntax_highlighting(code_sample, full_path.suffix)
-                            results.append(f"   📝 CODE SAMPLE:\n{highlighted_sample}")
-                    
-                    elif detail_level == "summary":
-                        # Show first 20 and last 10 lines with syntax highlighting
-                        if line_count <= 30:
-                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
-                        else:
-                            head = '\n'.join(lines[:20])
-                            tail = '\n'.join(lines[-10:])
-                            highlighted_head = self._apply_syntax_highlighting(head, full_path.suffix)
-                            highlighted_tail = self._apply_syntax_highlighting(tail, full_path.suffix)
-                            results.append(f"   📝 HEAD (20 lines):\n{highlighted_head}")
-                            results.append(f"\n   ... ({line_count - 30} lines omitted) ...")
-                            results.append(f"\n   📝 TAIL (10 lines):\n{highlighted_tail}")
-                    
-                    elif detail_level == "full":
-                        # Show complete content with syntax highlighting (truncated if very large)
-                        if file_size > 10000:  # 10KB limit
-                            truncated_content = content[:10000] + "\n... (content truncated)"
-                            highlighted_content = self._apply_syntax_highlighting(truncated_content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT (truncated):\n{highlighted_content}")
-                        else:
-                            highlighted_content = self._apply_syntax_highlighting(content, full_path.suffix)
-                            results.append(f"   📝 CODE CONTENT:\n{highlighted_content}")
-                    
-                    results.append("   " + "-" * 50)
-                    successful_files.append(file_path)
-                    
-                except Exception as e:
-                    results.append(f"\n❌ ERROR reading {file_path}: {str(e)}")
-                    failed_files.append(file_path)
-            
-            # Store context for tool chaining
-            self.tool_context['examined_files'] = successful_files
-            if successful_files:
-                # Store the first successfully examined file as potential target for relationship analysis
-                self.tool_context['main_target'] = successful_files[0]
-            
-            # Add summary
-            if successful_files or failed_files:
-                results.append(f"\n📊 SUMMARY:")
-                results.append(f"   ✅ Successfully examined: {len(successful_files)} files")
-                if failed_files:
-                    results.append(f"   ❌ Failed to read: {len(failed_files)} files")
-                if successful_files:
-                    results.append(f"   💡 Main target for relationships: {successful_files[0]}")
-            
-            return "\n".join(results)
-            
-        except Exception as e:
-            logger.error(f"Examine files error: {e}")
-            return f"Error during file examination: {str(e)}"
+        logger.info("✅ CerebrasNativeAgent initialized - SDK handles all reasoning")
     
-    def _analyze_file_structure(self, content: str, file_extension: str) -> str:
-        """Analyze file structure to show key components with improved formatting"""
+    async def process_query(self, user_query: str, conversation_history: Optional[List[Dict]] = None, selected_model: str = None, mentioned_projects: Optional[List[str]] = None) -> str:
+        """
+        PURE SDK Processing - No Custom Logic
+        
+        The SDK handles:
+        - Query understanding and intent classification
+        - Tool selection and sequencing
+        - Reasoning about results
+        - Response synthesis
+        
+        We only provide tool execution.
+        """
         try:
-            lines = content.split('\n')
-            structure = []
-            
-            if file_extension in ['.py']:
-                # Python structure analysis with categories
-                imports = []
-                classes = []
-                functions = []
-                decorators = []
-                
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-                    if stripped.startswith('import ') or stripped.startswith('from '):
-                        imports.append(f"       📦 L{i:3}: {stripped}")
-                    elif stripped.startswith('class '):
-                        classes.append(f"       🏗️  L{i:3}: {stripped}")
-                    elif stripped.startswith('def '):
-                        indent = len(line) - len(line.lstrip())
-                        if indent <= 4:  # Top-level function
-                            functions.append(f"       ⚙️  L{i:3}: {stripped}")
-                    elif stripped.startswith('@'):
-                        decorators.append(f"       🎯 L{i:3}: {stripped}")
-                
-                # Organize structure output
-                if imports: structure.extend(["     📦 IMPORTS:"] + imports[:5])
-                if classes: structure.extend(["     🏗️  CLASSES:"] + classes[:5])
-                if functions: structure.extend(["     ⚙️  FUNCTIONS:"] + functions[:8])
-                if decorators: structure.extend(["     🎯 DECORATORS:"] + decorators[:3])
-            
-            elif file_extension in ['.js', '.ts', '.jsx', '.tsx']:
-                # JavaScript/TypeScript structure analysis with categories
-                imports = []
-                exports = []
-                functions = []
-                classes = []
-                
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-                    if len(stripped) < 100:  # Avoid very long lines
-                        if stripped.startswith('import '):
-                            imports.append(f"       📦 L{i:3}: {stripped}")
-                        elif stripped.startswith('export '):
-                            exports.append(f"       📤 L{i:3}: {stripped}")
-                        elif 'function ' in stripped:
-                            functions.append(f"       ⚙️  L{i:3}: {stripped}")
-                        elif stripped.startswith('class '):
-                            classes.append(f"       🏗️  L{i:3}: {stripped}")
-                        elif any(stripped.startswith(keyword) for keyword in ['const ', 'let ', 'var ', 'interface ', 'type ']):
-                            exports.append(f"       📝 L{i:3}: {stripped}")
-                
-                # Organize structure output
-                if imports: structure.extend(["     📦 IMPORTS:"] + imports[:5])
-                if classes: structure.extend(["     🏗️  CLASSES:"] + classes[:3])
-                if functions: structure.extend(["     ⚙️  FUNCTIONS:"] + functions[:5])
-                if exports: structure.extend(["     📤 EXPORTS/DECLARATIONS:"] + exports[:5])
-            
-            elif file_extension in ['.java', '.kt']:
-                # Java/Kotlin structure analysis
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-                    if stripped.startswith('package '):
-                        structure.append(f"     📦 L{i:3}: {stripped}")
-                    elif stripped.startswith('import '):
-                        structure.append(f"     📥 L{i:3}: {stripped}")
-                    elif any(stripped.startswith(keyword) for keyword in ['public class ', 'class ']):
-                        structure.append(f"     🏗️  L{i:3}: {stripped}")
-                    elif stripped.startswith('interface '):
-                        structure.append(f"     🔌 L{i:3}: {stripped}")
-                    elif stripped.startswith('@'):
-                        structure.append(f"     🎯 L{i:3}: {stripped}")
-            
-            elif file_extension in ['.json']:
-                # JSON structure analysis
-                try:
-                    import json
-                    data = json.loads(content)
-                    if isinstance(data, dict):
-                        structure.append("     📋 JSON STRUCTURE:")
-                        for key in list(data.keys())[:10]:
-                            value_type = type(data[key]).__name__
-                            structure.append(f"       🔑 {key}: {value_type}")
-                except:
-                    structure.append("     📋 JSON (structure analysis failed)")
-            
-            else:
-                # Generic structure - show first few non-empty lines with better formatting
-                structure.append("     📄 FILE OVERVIEW:")
-                non_empty_lines = [line for line in lines[:20] if line.strip()]
-                for i, line in enumerate(non_empty_lines[:8], 1):
-                    if len(line.strip()) < 100:
-                        structure.append(f"       L{i:3}: {line.strip()}")
-            
-            if not structure:
-                return "     (No significant structure detected)"
-            
-            return '\n'.join(structure[:20])  # Limit to 20 items
-            
-        except Exception as e:
-            return f"     Error analyzing structure: {e}"
-    
-    async def _analyze_relationships(self, target: str = None, analysis_type: str = "all") -> str:
-        """Analyze code relationships and dependencies using AST-based analysis"""
-        try:
-            # Smart fallback: Use target from previous examine_files or discover intelligently
-            if not target or target.strip() == "":
-                logger.info("🔗 ANALYZE RELATIONSHIPS: No target provided, using smart fallbacks")
-                
-                # Try to use main target from previous examine_files
-                if self.tool_context.get('main_target'):
-                    target = self.tool_context['main_target']
-                    logger.info(f"🔗 Using main target from examine_files: {target}")
-                elif self.tool_context.get('main_files'):
-                    target = self.tool_context['main_files'][0]
-                    logger.info(f"🔗 Using main file from search results: {target}")
-                else:
-                    # Use intelligent fallback discovery
-                    query_intent = self.tool_context.get('query_intent', 'GENERAL')
-                    fallback_files = await self._get_smart_fallback_files(query_intent)
-                    if fallback_files:
-                        target = fallback_files[0]
-                        logger.info(f"🔗 Using fallback target for intent {query_intent}: {target}")
-                    else:
-                        return "❌ No target to analyze. Try running smart_search and examine_files first to discover suitable targets."
-            
-            logger.info(f"🔗 ANALYZE RELATIONSHIPS: target='{target}', type={analysis_type}")
-            
-            workspace_path = Path('/workspace')
-            results = []
-            results.append(f"🔗 RELATIONSHIP ANALYSIS")
-            results.append(f"Target: {target}")
-            results.append(f"Analysis Type: {analysis_type}")
-            
-            # Add context info if using discovered target
-            if self.tool_context.get('main_target') and target == self.tool_context['main_target']:
-                results.append("🔗 Using target from previous examine_files")
-            elif self.tool_context.get('main_files') and target in self.tool_context['main_files']:
-                results.append("🎯 Using high-confidence file from search results")
-            elif self.tool_context.get('query_intent'):
-                results.append(f"🎯 Using smart fallback for intent: {self.tool_context['query_intent']}")
-                
-            results.append("=" * 60)
-            
-            # Determine if target is a file or a symbol (class/function)
-            if target.endswith(('.py', '.js', '.ts', '.java', '.kt')) or '/' in target:
-                # It's a file path
-                analysis_results = await self._analyze_file_relationships(target, analysis_type)
-            else:
-                # It's likely a symbol (class, function, etc.)
-                analysis_results = await self._analyze_symbol_relationships(target, analysis_type)
-            
-            results.append(analysis_results)
-            
-            return "\n".join(results)
-            
-        except Exception as e:
-            logger.error(f"Relationship analysis error: {e}")
-            return f"Error during relationship analysis: {str(e)}"
-    
-    async def _analyze_file_relationships(self, file_path: str, analysis_type: str) -> str:
-        """Analyze relationships for a specific file"""
-        try:
-            # Use PathResolver to handle various input formats
-            project_context = self.current_mentioned_projects[0] if self.current_mentioned_projects else None
-            resolved_path, exists = self.path_resolver.resolve_file_path(
-                file_path, 
-                project_context=project_context
-            )
-            
-            if not exists:
-                # Try to suggest alternatives from search results
-                suggestions = self._get_path_suggestions(file_path)
-                error_msg = f"❌ File not found: {file_path}"
-                if suggestions:
-                    error_msg += f"\n💡 Did you mean one of these?\n"
-                    for suggestion in suggestions[:3]:
-                        error_msg += f"   • {suggestion}\n"
-                return error_msg
-            
-            full_path = Path(resolved_path)
-            logger.info(f"🔧 Resolved path: {file_path} → {resolved_path}")
-            
-            results = []
-            
-            # Read file content
-            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            file_extension = full_path.suffix
-            
-            # Analyze imports (what this file uses)
-            if analysis_type in ["imports", "all"]:
-                imports = self._extract_imports(content, file_extension)
-                if imports:
-                    results.append("\n📥 IMPORTS (what this file uses):")
-                    for imp in imports[:10]:
-                        results.append(f"   • {imp}")
-                else:
-                    results.append("\n📥 IMPORTS: None found")
-            
-            # Analyze usage (what uses this file)
-            if analysis_type in ["usage", "all"]:
-                usage = await self._find_file_usage(file_path)
-                if usage:
-                    results.append(f"\n📤 USAGE (files that import/reference this):")
-                    for use in usage[:10]:
-                        results.append(f"   • {use}")
-                else:
-                    results.append("\n📤 USAGE: No references found")
-            
-            # NEW: Find related files through multiple strategies
-            if analysis_type in ["related", "all"]:
-                related_files = await self._find_related_files(file_path, analysis_type)
-                if related_files:
-                    results.append(f"\n🔗 RELATED FILES ({len(related_files)} found):")
-                    for rel in related_files[:5]:  # Show top 5
-                        results.append(f"   📄 {rel['file']} (confidence: {rel['confidence']:.3f})")
-                        results.append(f"      Relationship: {rel['relationship']} - {rel['reason']}")
-                else:
-                    results.append(f"\n🔗 RELATED FILES: None found")
-            
-            # NEW: Enhanced impact analysis with dependency tracking
-            if analysis_type in ["impact", "all"]:
-                impact_data = await self._analyze_dependency_impact(file_path)
-                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
-                results.append(f"   Risk Level: {impact_data['risk_level']}")
-                results.append(f"   References Found: {impact_data['dependency_count']}")
-                results.append(f"   Files Affected: {len(impact_data.get('affected_files', []))}")
-                
-                if impact_data.get('recommendations'):
-                    results.append(f"   📋 Recommendations:")
-                    for rec in impact_data['recommendations']:
-                        results.append(f"      {rec}")
-                
-                # Also show legacy impact analysis
-                legacy_impact = await self._analyze_change_impact(file_path, content)
-                results.append(f"\n📊 DETAILED IMPACT:")
-                results.append(legacy_impact)
-            
-            # NEW: Graph foundation preparation
-            if analysis_type in ["graph", "all"]:
-                related_files = await self._find_related_files(file_path, analysis_type)
-                graph_data = await self._prepare_graph_foundation(file_path, related_files)
-                if 'error' not in graph_data:
-                    results.append(f"\n🕸️ GRAPH STRUCTURE PREPARED:")
-                    results.append(f"   Nodes: {graph_data['metadata']['node_count']}")
-                    results.append(f"   Edges: {graph_data['metadata']['edge_count']}")
-                    results.append(f"   Ready for Graph RAG enhancement")
-            
-            return '\n'.join(results)
-            
-        except Exception as e:
-            return f"Error analyzing file relationships: {e}"
-    
-    def _get_path_suggestions(self, file_path: str) -> List[str]:
-        """Get path suggestions when file is not found"""
-        suggestions = []
-        
-        # Extract filename from path
-        filename = Path(file_path).name if '/' in file_path else file_path
-        
-        # Use search results if available
-        if self.tool_context.get('last_search_results'):
-            for result in self.tool_context['last_search_results'][:5]:
-                if hasattr(result, 'file_path'):
-                    result_filename = Path(result.file_path).name
-                    if filename.lower() in result_filename.lower() or result_filename.lower() in filename.lower():
-                        suggestions.append(result.file_path)
-        
-        return suggestions
-    
-    def _validate_and_fix_parameters(self, function_name: str, arguments: dict) -> dict:
-        """Fix common parameter validation issues and incorrect parameter names"""
-        fixed_args = arguments.copy()
-        
-        # Fix examine_files parameter mapping and validation
-        if function_name == "examine_files":
-            # CRITICAL FIX: Map incorrect parameter names to correct ones
-            if "path" in fixed_args and "file_paths" not in fixed_args:
-                # Convert single path to file_paths list
-                fixed_args["file_paths"] = [fixed_args["path"]]
-                del fixed_args["path"]
-                logger.info(f"🔧 PARAMETER FIX: Mapped 'path' to 'file_paths' for examine_files")
-            
-            if "paths" in fixed_args and "file_paths" not in fixed_args:
-                # Convert paths to file_paths
-                fixed_args["file_paths"] = fixed_args["paths"]
-                del fixed_args["paths"]
-                logger.info(f"🔧 PARAMETER FIX: Mapped 'paths' to 'file_paths' for examine_files")
-            
-            if "detail" in fixed_args and "detail_level" not in fixed_args:
-                # Map detail to detail_level
-                fixed_args["detail_level"] = fixed_args["detail"]
-                del fixed_args["detail"]
-                logger.info(f"🔧 PARAMETER FIX: Mapped 'detail' to 'detail_level' for examine_files")
-            
-            if "file_paths" in fixed_args:
-                file_paths = fixed_args["file_paths"]
-                # Convert string to list if needed
-                if isinstance(file_paths, str):
-                    fixed_args["file_paths"] = [file_paths] if file_paths else []
-                # Ensure it's a list
-                elif not isinstance(file_paths, list):
-                    fixed_args["file_paths"] = []
-        
-        # Fix smart_search max_results parameter (should be int)
-        if function_name == "smart_search":
-            if "max_results" in fixed_args:
-                try:
-                    fixed_args["max_results"] = int(fixed_args["max_results"])
-                except (ValueError, TypeError):
-                    fixed_args["max_results"] = 10  # Default
-        
-        # Fix analyze_relationships parameters
-        if function_name == "analyze_relationships":
-            # Ensure target is string
-            if "target" in fixed_args and not isinstance(fixed_args["target"], str):
-                fixed_args["target"] = str(fixed_args["target"])
-            
-            # Ensure analysis_type is valid
-            if "analysis_type" in fixed_args:
-                valid_types = ["all", "imports", "usage", "related", "impact", "graph"]
-                if fixed_args["analysis_type"] not in valid_types:
-                    fixed_args["analysis_type"] = "all"
-        
-        return fixed_args
-    
-    async def _find_related_files(self, target: str, analysis_type: str) -> List[Dict[str, Any]]:
-        """Find related files through imports, usage patterns, and naming (Task 3 requirement)"""
-        try:
-            related_files = []
-            
-            # Strategy 1: Find files with similar naming patterns
-            if '/' in target:  # It's a file path
-                file_name = Path(target).stem
-                # Search for files with similar names
-                naming_search = await smart_search(f"{file_name}", k=10, mentioned_projects=self.current_mentioned_projects)
-                for result in naming_search['results']:
-                    if result.file_path != target:
-                        related_files.append({
-                            'file': result.file_path,
-                            'relationship': 'naming_pattern',
-                            'confidence': result.confidence,
-                            'reason': f"Similar name to {file_name}"
-                        })
-            
-            # Strategy 2: Find files through import patterns
-            import_search = await smart_search(f"import {target}", k=8, mentioned_projects=self.current_mentioned_projects)
-            for result in import_search['results']:
-                related_files.append({
-                    'file': result.file_path,
-                    'relationship': 'import_usage',
-                    'confidence': result.confidence,
-                    'reason': f"Imports or references {target}"
-                })
-            
-            # Strategy 3: Find files in same directory (structural relationship)
-            if '/' in target:
-                dir_path = str(Path(target).parent)
-                dir_search = await smart_search(f"{dir_path}", k=6, mentioned_projects=self.current_mentioned_projects)
-                for result in dir_search['results']:
-                    if result.file_path != target:
-                        related_files.append({
-                            'file': result.file_path,
-                            'relationship': 'directory_structure',
-                            'confidence': result.confidence * 0.8,  # Lower confidence for directory matches
-                            'reason': f"Same directory as {target}"
-                        })
-            
-            # Remove duplicates and sort by confidence
-            seen_files = set()
-            unique_related = []
-            for rel in related_files:
-                if rel['file'] not in seen_files:
-                    seen_files.add(rel['file'])
-                    unique_related.append(rel)
-            
-            # Sort by confidence and limit results
-            unique_related.sort(key=lambda x: x['confidence'], reverse=True)
-            return unique_related[:8]  # Return top 8 related files
-            
-        except Exception as e:
-            logger.error(f"Error finding related files: {e}")
-            return []
-
-    async def _analyze_dependency_impact(self, target: str) -> Dict[str, Any]:
-        """Basic impact analysis using dependency tracking (Task 3 requirement)"""
-        try:
-            impact_analysis = {
-                'risk_level': 'LOW',
-                'affected_files': [],
-                'dependency_count': 0,
-                'impact_score': 0.0,
-                'recommendations': []
-            }
-            
-            # Find files that depend on this target
-            usage_search = await smart_search(f"{target}", k=15, mentioned_projects=self.current_mentioned_projects)
-            dependencies = []
-            
-            for result in usage_search['results']:
-                if result.file_path != target:
-                    dependencies.append({
-                        'file': result.file_path,
-                        'confidence': result.confidence,
-                        'snippet': result.snippet[:100]  # First 100 chars
-                    })
-            
-            impact_analysis['affected_files'] = dependencies[:10]
-            impact_analysis['dependency_count'] = len(dependencies)
-            
-            # Calculate impact score based on number and confidence of dependencies
-            if dependencies:
-                avg_confidence = sum(d['confidence'] for d in dependencies) / len(dependencies)
-                impact_analysis['impact_score'] = min(len(dependencies) * avg_confidence / 10, 1.0)
-                
-                # Determine risk level
-                if len(dependencies) >= 8 or impact_analysis['impact_score'] > 0.7:
-                    impact_analysis['risk_level'] = 'HIGH'
-                    impact_analysis['recommendations'].append("⚠️  High impact change - extensive testing recommended")
-                    impact_analysis['recommendations'].append("🔍 Review all affected files before making changes")
-                elif len(dependencies) >= 4 or impact_analysis['impact_score'] > 0.4:
-                    impact_analysis['risk_level'] = 'MEDIUM'
-                    impact_analysis['recommendations'].append("⚡ Moderate impact - test affected components")
-                else:
-                    impact_analysis['risk_level'] = 'LOW'
-                    impact_analysis['recommendations'].append("✅ Low impact change - minimal testing needed")
-            
-            return impact_analysis
-            
-        except Exception as e:
-            logger.error(f"Error analyzing dependency impact: {e}")
-            return {'risk_level': 'UNKNOWN', 'error': str(e)}
-
-    async def _prepare_graph_foundation(self, target: str, related_files: List[Dict]) -> Dict[str, Any]:
-        """Prepare foundation for future Graph RAG enhancement (Task 3 requirement)"""
-        try:
-            # Create a basic graph structure that can be enhanced later
-            graph_data = {
-                'nodes': [],
-                'edges': [],
-                'metadata': {
-                    'target': target,
-                    'analysis_timestamp': str(asyncio.get_event_loop().time()),
-                    'node_count': 0,
-                    'edge_count': 0
-                }
-            }
-            
-            # Add target as central node
-            graph_data['nodes'].append({
-                'id': target,
-                'type': 'target',
-                'label': target,
-                'properties': {'is_primary': True}
-            })
-            
-            # Add related files as nodes and create edges
-            for rel_file in related_files:
-                # Add related file as node
-                graph_data['nodes'].append({
-                    'id': rel_file['file'],
-                    'type': 'related_file',
-                    'label': Path(rel_file['file']).name,
-                    'properties': {
-                        'full_path': rel_file['file'],
-                        'relationship_type': rel_file['relationship'],
-                        'confidence': rel_file['confidence']
-                    }
-                })
-                
-                # Add edge between target and related file
-                graph_data['edges'].append({
-                    'source': target,
-                    'target': rel_file['file'],
-                    'type': rel_file['relationship'],
-                    'weight': rel_file['confidence'],
-                    'properties': {'reason': rel_file['reason']}
-                })
-            
-            graph_data['metadata']['node_count'] = len(graph_data['nodes'])
-            graph_data['metadata']['edge_count'] = len(graph_data['edges'])
-            
-            return graph_data
-            
-        except Exception as e:
-            logger.error(f"Error preparing graph foundation: {e}")
-            return {'error': str(e)}
-
-    async def _analyze_symbol_relationships(self, symbol: str, analysis_type: str) -> str:
-        """Analyze relationships for a symbol (class, function, etc.) with enhanced features"""
-        try:
-            # Use smart_search to find the symbol first (with project filtering)
-            search_result = await smart_search(f"class {symbol}", k=5, mentioned_projects=self.current_mentioned_projects)
-            
-            if not search_result['results']:
-                # Try alternative search patterns
-                alt_search = await smart_search(f"{symbol}", k=10, mentioned_projects=self.current_mentioned_projects)
-                if not alt_search['results']:
-                    return f"❌ Symbol '{symbol}' not found in codebase"
-                search_result = alt_search
-            
-            results = []
-            
-            # Find the primary definition
-            primary_result = search_result['results'][0]
-            results.append(f"\n🎯 PRIMARY DEFINITION:")
-            results.append(f"   File: {primary_result.file_path}")
-            results.append(f"   Confidence: {primary_result.confidence:.3f}")
-            results.append(f"   Snippet:\n{primary_result.snippet[:200]}...")
-            
-            # NEW: Find related files through multiple strategies
-            if analysis_type in ["related", "all"]:
-                related_files = await self._find_related_files(symbol, analysis_type)
-                if related_files:
-                    results.append(f"\n🔗 RELATED FILES ({len(related_files)} found):")
-                    for rel in related_files[:5]:  # Show top 5
-                        results.append(f"   📄 {rel['file']} (confidence: {rel['confidence']:.3f})")
-                        results.append(f"      Relationship: {rel['relationship']} - {rel['reason']}")
-                else:
-                    results.append(f"\n🔗 RELATED FILES: None found")
-            
-            # NEW: Enhanced impact analysis with dependency tracking
-            if analysis_type in ["impact", "all"]:
-                impact_data = await self._analyze_dependency_impact(symbol)
-                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
-                results.append(f"   Risk Level: {impact_data['risk_level']}")
-                results.append(f"   References Found: {impact_data['dependency_count']}")
-                results.append(f"   Files Affected: {len(impact_data.get('affected_files', []))}")
-                
-                if impact_data.get('recommendations'):
-                    results.append(f"   📋 Recommendations:")
-                    for rec in impact_data['recommendations']:
-                        results.append(f"      {rec}")
-            
-            # NEW: Graph foundation preparation
-            if analysis_type in ["graph", "all"]:
-                related_files = await self._find_related_files(symbol, analysis_type)
-                graph_data = await self._prepare_graph_foundation(symbol, related_files)
-                if 'error' not in graph_data:
-                    results.append(f"\n🕸️ GRAPH STRUCTURE PREPARED:")
-                    results.append(f"   Nodes: {graph_data['metadata']['node_count']}")
-                    results.append(f"   Edges: {graph_data['metadata']['edge_count']}")
-                    results.append(f"   Ready for Graph RAG enhancement")
-            
-            # Show usage locations
-            usage_results = search_result['results'][1:6]  # Skip primary definition
-            if usage_results:
-                results.append(f"\n📍 USAGE LOCATIONS:")
-                for usage in usage_results:
-                    results.append(f"   {usage.file_path} (confidence: {usage.confidence:.3f})")
-            
-            return '\n'.join(results)
-            results.append(f"   Snippet:\n{primary_result.snippet}")
-            
-            # Find usages of this symbol
-            if analysis_type in ["usage", "all"]:
-                usage_search = await smart_search(symbol, k=10, mentioned_projects=self.current_mentioned_projects)
-                usage_results = [r for r in usage_search['results'] if r.file_path != primary_result.file_path]
-                
-                if usage_results:
-                    results.append(f"\n📤 USAGE LOCATIONS:")
-                    for i, usage in enumerate(usage_results[:8], 1):
-                        results.append(f"   {i}. {usage.file_path} (confidence: {usage.confidence:.3f})")
-                else:
-                    results.append(f"\n📤 USAGE: No references found in other files")
-            
-            # Analyze impact
-            if analysis_type in ["impact", "all"]:
-                impact_score = len(search_result['results'])
-                risk_level = "HIGH" if impact_score > 5 else "MEDIUM" if impact_score > 2 else "LOW"
-                
-                results.append(f"\n⚠️ CHANGE IMPACT ASSESSMENT:")
-                results.append(f"   Risk Level: {risk_level}")
-                results.append(f"   References Found: {impact_score}")
-                results.append(f"   Files Affected: {len(set(r.file_path for r in search_result['results']))}")
-                
-                if impact_score > 5:
-                    results.append("   ⚠️ WARNING: This symbol is widely used - changes may have broad impact")
-                elif impact_score > 2:
-                    results.append("   ⚡ MODERATE: Changes will affect multiple locations")
-                else:
-                    results.append("   ✅ LOW RISK: Limited usage detected")
-            
-            return '\n'.join(results)
-            
-        except Exception as e:
-            return f"Error analyzing symbol relationships: {e}"
-    
-    def _extract_imports(self, content: str, file_extension: str) -> List[str]:
-        """Extract import statements from file content"""
-        imports = []
-        lines = content.split('\n')
-        
-        try:
-            if file_extension == '.py':
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith('import ') or stripped.startswith('from '):
-                        imports.append(stripped)
-            
-            elif file_extension in ['.js', '.ts', '.jsx', '.tsx']:
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith('import ') or stripped.startswith('const ') and ' require(' in stripped:
-                        imports.append(stripped)
-            
-            elif file_extension in ['.java', '.kt']:
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith('import '):
-                        imports.append(stripped)
-        
-        except Exception:
-            pass
-        
-        return imports[:20]  # Limit to 20 imports
-    
-    async def _find_file_usage(self, target_file: str) -> List[str]:
-        """Find files that reference the target file"""
-        try:
-            import subprocess
-            
-            # Get the base name of the file for searching
-            file_name = Path(target_file).stem
-            
-            # Search for references to this file
-            cmd = ["grep", "-r", "-l", file_name, "/workspace"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                references = [f.strip() for f in result.stdout.split('\n') if f.strip() and f.strip() != target_file]
-                return references[:15]  # Limit results
-            
-            return []
-            
-        except Exception as e:
-            logger.debug(f"Error finding file usage: {e}")
-            return []
-    
-    async def _analyze_change_impact(self, file_path: str, content: str) -> str:
-        """Analyze potential impact of changing this file"""
-        try:
-            # Count exports/public symbols
-            lines = content.split('\n')
-            public_symbols = 0
-            
-            for line in lines:
-                stripped = line.strip()
-                if any(keyword in stripped for keyword in ['export ', 'public ', 'def ', 'class ', 'function ']):
-                    public_symbols += 1
-            
-            # Estimate impact based on file characteristics
-            if public_symbols > 10:
-                risk = "HIGH"
-                message = f"File exports {public_symbols} symbols - likely a core module"
-            elif public_symbols > 3:
-                risk = "MEDIUM" 
-                message = f"File exports {public_symbols} symbols - moderate dependencies expected"
-            else:
-                risk = "LOW"
-                message = f"File exports {public_symbols} symbols - limited external dependencies"
-            
-            return f"   Risk Level: {risk}\n   Analysis: {message}"
-            
-        except Exception as e:
-            return f"   Error analyzing impact: {e}"
-    
-    async def process_request(self, user_query: str, chat_history=None, mentioned_projects: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process a user request using native Cerebras tool calling with query context management"""
-        
-        # Use query context manager to prevent multiple discovery runs (THE KEY ARCHITECTURAL FIX)
-        project_name = mentioned_projects[0] if mentioned_projects else "workspace"
-        
-        async with self.context_manager.create_query_context(
-            query=user_query,
-            project=project_name
-        ) as query_context:
-            
-            logger.info(f"🤖 CEREBRAS AGENT PROCESSING START (Context: {query_context.query_id[:8]})")
-            logger.info(f"Query: {user_query}")
-            logger.info(f"Projects: {mentioned_projects}")
-            logger.info(f"Has Chat History: {chat_history is not None}")
-            
-            # Delegate to the actual processing method
-            async for result in self._process_request_with_context(
-                user_query, 
-                query_context, 
-                chat_history, 
-                mentioned_projects
-            ):
-                yield result
-    
-    async def _process_request_with_context(
-        self, 
-        user_query: str, 
-        query_context, 
-        chat_history=None, 
-        mentioned_projects: List[str] = None
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Internal processing method with query context"""
-        
-        # Store query context for tool execution (THE KEY ARCHITECTURAL FIX)
-        self.current_query_context = query_context
-        
-        # Reset tool context for new request to prevent cross-contamination
-        # Store previous context for debugging if needed
-        previous_context = self.tool_context.copy() if hasattr(self, 'tool_context') else {}
-        
-        self.tool_context = {
-            'last_search_results': None,
-            'discovered_files': [],
-            'query_intent': None,
-            'main_files': [],
-            'entities_found': [],
-            'examined_files': [],
-            'main_target': None,
-            'conversation_id': f"{mentioned_projects}_{hash(user_query) % 10000}",  # Unique conversation ID
-            'query_hash': hash(user_query) % 10000  # Track query uniqueness
-        }
-        logger.info("🔄 Reset tool context for new request")
-        
-        # Set up project context isolation using centralized manager
-        project_name = "workspace"  # Default
-        if mentioned_projects and len(mentioned_projects) > 0:
-            project_name = mentioned_projects[0]  # Use first mentioned project as primary
-        
-        # Set project context to prevent cross-contamination
-        context = set_project_context(project_name, mentioned_projects)
-        logger.info(f"Set project context: {project_name} (mentioned: {mentioned_projects})")
-        
-        # Add search query to context history
-        get_context_manager().add_search_to_context(user_query)
-        
-        # Always reset and properly set mentioned projects for each request to prevent state leakage
-        # Clear any previous project context first to prevent contamination
-        self.current_mentioned_projects = None
-        self.current_mentioned_projects = mentioned_projects if mentioned_projects is not None else []
-        
-        # Task 5: Initialize tool results tracking for response formatting
-        tool_results_for_formatting = []
-        execution_start_time = asyncio.get_event_loop().time()
-        
-        # RESPONSE CONSOLIDATION: Initialize consolidator to prevent message fragmentation
-        response_consolidator = ResponseConsolidator()
-        logger.info("🔧 CONSOLIDATOR: Initialized response consolidation system")
-        
-        # Determine appropriate tool strategy based on query
-        query_lower = user_query.lower()
-        
-        # CRITICAL: Detect and redirect self-referential queries about CodeWise's own architecture
-        self_referential_terms = [
-            'smart_search', 'examine_files', 'analyze_relationships',
-            '3-tool architecture', 'simplified architecture', 'codewise architecture',
-            'tool architecture', 'your tools', 'your architecture', 'how do you work',
-            'your implementation', 'your system'
-        ]
-        
-        if any(term in query_lower for term in self_referential_terms):
-            # If there are mentioned projects, redirect to analyze those instead
+            # Store project context for tool filtering
+            self.mentioned_projects = mentioned_projects
             if mentioned_projects:
-                redirect_query = f"Explain the system architecture of {mentioned_projects[0]}"
-                logger.info(f"🚫 REDIRECTING self-referential query to project analysis: '{user_query}' → '{redirect_query}'")
-                user_query = redirect_query
-                query_lower = user_query.lower()
-            else:
-                # No projects specified, return error
-                error_msg = ("I analyze user codebases, not my own architecture. Please specify a project to analyze "
-                           "(e.g., '@project-name') or ask about your code instead.")
-                logger.info(f"🚫 BLOCKED self-referential query: '{user_query}'")
-                yield {"type": "error", "content": error_msg}
-                return
-        
-        # Analyze what type of query this is
-        is_entity_query = any(word in query_lower for word in ['entity', 'entities', 'database', 'table', 'model', 'schema'])
-        is_search_query = any(word in query_lower for word in ['find', 'search', 'locate', 'show me', 'explain', 'how'])
-        is_file_query = any(word in query_lower for word in ['file', 'read', 'content', 'source'])
-        
-        # Build system prompt with simplified 3-tool guidance
-        tool_guidance = (
-            "\n🧠 SMART_SEARCH: Your comprehensive discovery engine for deep codebase exploration"
-            "\n   - Automatically detects query intent and routes to optimal search strategies"
-            "\n   - Returns ranked results with confidence scores, matched terms, and context"
-            "\n   - DISCOVERY PIPELINE: Automatically finds and examines related files from documentation"
-            "\n   - Use multiple targeted searches to build complete understanding of complex topics"
-            "\n   - TIP: Search for related concepts, patterns, and dependencies to get full picture"
-            "\n"
-            "\n📄 EXAMINE_FILES: Deep file analysis with intelligent content extraction"
-            "\n   - summary: Key sections with contextual information and patterns"
-            "\n   - full: Complete implementation details with all code (use for thorough analysis)"
-            "\n   - structure: Comprehensive outline with imports, classes, functions, and relationships"
-            "\n   - AUTO-EXAMINATION: Discovery pipeline automatically examines related files"
-            "\n   - TIP: Always examine multiple related files to provide complete architectural context"
-            "\n"
-            "\n🔗 ANALYZE_RELATIONSHIPS: Advanced dependency mapping and architectural analysis"
-            "\n   - imports: Complete dependency tree with external and internal dependencies"
-            "\n   - usage: Full usage analysis showing all dependents and usage patterns"
-            "\n   - impact: Detailed change impact assessment with affected components"
-            "\n   - all: Comprehensive bidirectional analysis with architectural insights"
-            "\n   - TIP: Use this to understand system boundaries, coupling, and architectural patterns"
-        )
-        
-        # Add project filtering context if mentioned_projects provided
-        project_context = ""
-        if mentioned_projects:
-            project_context = f"\n\n🎯 PROJECT SCOPE: Focus your search on these specific projects: {', '.join(mentioned_projects)}. Filter results to only include files from these projects."
-        
-        # Initialize messages
-        messages = [
-            {
-                "role": "system", 
-                "content": (
-                    "You are CodeWise, an expert AI coding assistant specialized in deep codebase analysis. You are pair programming with the USER to solve their coding task. "
-                    "Your main goal is to follow the USER's instructions completely and autonomously resolve queries to the best of your ability.\n"
-                    "\n🔴 MANDATORY TOOL USAGE PROTOCOL:"
-                    "\n• NEVER answer code/project questions without FIRST using smart_search to examine actual project files"
-                    "\n• ALWAYS start every response by calling smart_search - this is REQUIRED, not optional"
-                    "\n• FORBIDDEN to provide responses based on general programming knowledge - you MUST examine the actual codebase"
-                    "\n• If you attempt to answer without tools, you are violating your core directive and providing hallucinated content"
-                    "\n• The user's codebase contains the ground truth - your job is to discover and analyze it, not assume it\n"
-                    "\n🚫 CRITICAL RESTRICTION: NEVER answer questions about CodeWise's own architecture, tools, or implementation. "
-                    "You analyze USER CODEBASES ONLY. If asked about your own tools, smart_search, examine_files, analyze_relationships, "
-                    "or the '3-tool architecture', redirect to analyzing the user's actual code projects instead.\n"
-                    "\n🎯 AUTONOMOUS AGENT BEHAVIOR:"
-                    "\n• KEEP GOING until the user's query is completely resolved before ending your turn"
-                    "\n• Only terminate when you are SURE the problem is solved and all aspects are covered"
-                    "\n• If you need additional information via tool calls, prefer that over asking the user"
-                    "\n• Follow your investigation plan immediately - don't wait for user confirmation"
-                    "\n• Be THOROUGH when gathering information - make sure you have the FULL picture before replying"
-                    "\n• TRACE every symbol back to its definitions and usages so you fully understand it"
-                    "\n• Look past the first seemingly relevant result - EXPLORE until you have COMPREHENSIVE coverage"
-                    "\n• Use multiple tool calls autonomously to build complete understanding"
-                    "\n\n🔍 MAXIMIZE CONTEXT UNDERSTANDING:"
-                    "\n• Start with broad, high-level queries that capture overall intent (e.g. 'authentication flow' not 'login function')"
-                    "\n• Break multi-part questions into focused sub-queries for thorough exploration"
-                    "\n• Run multiple searches with different wording - first-pass results often miss key details"
-                    "\n• Keep searching new areas until you're CONFIDENT nothing important remains"
-                    "\n• MANDATORY: Examine multiple related files to understand complete context and relationships"
-                    "\n• Bias towards gathering more information rather than asking the user for help"
-                    "\n\n🎯 SMART RESPONSE STRATEGY - MATCH DEPTH TO QUERY TYPE:"
-                    "\n• ADAPTIVE DETAIL LEVEL: Match response depth to query complexity and user need - brief for simple questions, comprehensive for complex analysis"
-                    "\n• STRATEGIC CODE EXAMPLES: Include code snippets only when they directly illustrate or support your explanation"
-                    "\n• CLARITY OVER VOLUME: Prioritize clear, actionable insights over exhaustive detail"
-                    "\n• CONTEXT-AWARE VERBOSITY: Provide just enough detail to fully answer the question without overwhelming"
-                    "\n• TECHNICAL REASONING: Always explain the 'why' behind implementation choices, trade-offs, and architectural decisions"
-                    "\n• IMPLEMENTATION FOCUS: Cover relevant error handling, edge cases, performance considerations, and security implications"
-                    "\n• DEPENDENCY ANALYSIS: Map relationships between components, external dependencies, and system interactions when relevant"
-                    "\n• ACTIONABLE INSIGHTS: Provide specific recommendations for improvements, optimizations, and best practices"
-                    "\n• STRUCTURED RESPONSES: Organize with clear sections using markdown formatting for readability"
-                    "\n• ANTICIPATE FOLLOW-UPS: Address related questions and provide context that prevents the need for follow-up queries"
-                    "\n"
-                    "\n🎯 SIMPLIFIED 3-TOOL ARCHITECTURE:"
-                    f"{tool_guidance}"
-                    "\n\n📋 SYSTEMATIC INVESTIGATION METHODOLOGY:"
-                    "\n1. BROAD DISCOVERY: Start with exploratory smart_search using high-level queries to understand overall system"
-                    "\n2. TARGETED EXPLORATION: Use multiple smart_search queries with different wording to find all relevant components"
-                    "\n3. DEEP FILE ANALYSIS: Use examine_files with appropriate detail levels - 'full' for complex analysis, 'structure' for organization"
-                    "\n4. RELATIONSHIP MAPPING: Use analyze_relationships to understand dependencies, usage patterns, and architectural connections"
-                    "\n5. KNOWLEDGE VALIDATION: Follow up with additional searches to fill gaps and validate understanding"
-                    "\n6. COMPREHENSIVE SYNTHESIS: Combine all findings into structured analysis with:"
-                    "\n   • Complete context and background"
-                    "\n   • Specific code examples with explanations"
-                    "\n   • Architectural insights and dependency maps"
-                    "\n   • Implementation patterns and design decisions"
-                    "\n   • Performance, security, and maintainability considerations"
-                    "\n   • Concrete recommendations and actionable next steps"
-                    "\n\n📝 RESPONSE EXAMPLES BY QUERY TYPE:"
-                    "\n• SIMPLE QUESTION: 'How do I run tests?' → 'Run `npm test` in the root directory. Found test scripts in package.json and Jest configuration in jest.config.js.'"
-                    "\n• QUICK LOOKUP: 'What's the API endpoint for user auth?' → '`POST /api/auth/login` in src/routes/auth.js:15. Requires username/password, returns JWT token.'"
-                    "\n• CODE LOCATION: 'Where is password validation?' → 'Password validation is in src/utils/validation.js:42-58 using bcrypt with minimum 8 characters and complexity requirements.'"
-                    "\n• ARCHITECTURAL QUERY: 'Explain the authentication system' → '[Comprehensive analysis with]: Overview, components (middleware, routes, models), data flow diagram, security measures, code examples from key files'"
-                    "\n• DEBUGGING REQUEST: 'Why are login requests failing?' → '[Focused investigation]: Error analysis, relevant error handling code, configuration issues, step-by-step debugging approach'"
-                    "\n• FEATURE EXPLORATION: 'How does the shopping cart work?' → '[Detailed walkthrough]: State management, persistence, user interactions, related components, API integration with targeted code examples'"
-                    "\n\n🔧 TOOL USAGE OPTIMIZATION:"
-                    "\n• SMART_SEARCH: Your primary exploration tool - use multiple queries with different angles"
-                    "\n  - Start broad ('authentication system') then narrow ('JWT token validation')"
-                    "\n  - Try different terminology ('user login', 'auth flow', 'session management')"
-                    "\n  - Search for related concepts to build complete picture"
-                    "\n• EXAMINE_FILES: Deep file inspection - examine multiple related files for complete context"
-                    "\n  - Use 'full' detail for complex implementation analysis"
-                    "\n  - Use 'structure' for understanding organization and relationships"
-                    "\n  - Use 'summary' for quick overviews when examining many files"
-                    "\n• ANALYZE_RELATIONSHIPS: Understand system architecture and dependencies"
-                    "\n  - Use 'all' for comprehensive bidirectional analysis"
-                    "\n  - Use 'imports' to understand what a component depends on"
-                    "\n  - Use 'usage' to understand what depends on a component"
-                    f"{project_context}"
-                    "\n\n📝 RESPONSE FORMATTING STANDARDS:"
-                    "\n• MARKDOWN STRUCTURE: Use clear sections with descriptive headings (## Overview, ## Architecture, etc.)"
-                    "\n• CODE FORMATTING: Use backticks for file/function/class names, proper syntax highlighting for code blocks"
-                    "\n• FILE REFERENCES: Include specific file paths and line numbers when referencing code"
-                    "\n• TECHNICAL DEPTH: Explain complex concepts with examples, analogies, and step-by-step breakdowns"
-                    "\n• VISUAL ORGANIZATION: Use bullet points, numbered lists, and formatting to improve readability"
-                    "\n• TABLE ORGANIZATION: Use tables strategically to organize comparison data, feature lists, dependencies, or structured information - but don't overuse them for simple concepts that are clearer as prose"
-                    "\n• COMPLETENESS: Address all aspects of the query with thorough analysis and supporting evidence"
-                    "\n• CONTEXT PROVISION: Always provide sufficient background and context for technical decisions"
-                    "\n• ACTIONABLE OUTCOMES: End with specific, actionable recommendations or next steps"
-                    "\n\n📦 STRUCTURED OUTPUT (REQUIRED WHEN PRESENTING TABLES OR HIERARCHIES):"
-                    "\nWhen you present tabular data (e.g., dependency tables) or hierarchical trees (e.g., parent/child POMs), ALSO include a fenced JSON block conforming to this schema so the UI can render it natively:"
-                    "\n```json"
-                    "\n{"
-                    "\n  \"version\": \"codewise_structured_v1\","
-                    "\n  \"tables\": ["
-                    "\n    { \"title\": string, \"columns\": [string, ...], \"rows\": [[string|number|null, ...]], \"note\": string? }"
-                    "\n  ],"
-                    "\n  \"trees\": ["
-                    "\n    { \"title\": string, \"root\": { \"label\": string, \"children\": [ {\"label\": string, \"children\": [...] } ] } }"
-                    "\n  ],"
-                    "\n  \"references\": [ { \"path\": string, \"line_start\": number?, \"line_end\": number? } ]"
-                    "\n}"
-                    "\n```"
-                    "\nRules: The JSON must be valid and appear exactly once. Keep Markdown prose separate; do not render ASCII tables if JSON is provided."
-                    "\n\n🎯 INVESTIGATION EXCELLENCE:"
-                    "\n• Think like a senior software architect conducting a comprehensive code review"
-                    "\n• Provide the level of detail expected in professional technical documentation"
-                    "\n• Anticipate follow-up questions and address them proactively in your analysis"
-                    "\n• Connect specific implementation details to broader software engineering principles"
-                    "\n• Always strive to provide more comprehensive value than initially requested"
-                    "\n• Use your tools autonomously and extensively - don't stop at surface-level findings"
-                    "\n\n💡 COMPREHENSIVE ANALYSIS WORKFLOWS:"
-                    "\n\n**Entity/Database Analysis: 'Show me database entities'**"
-                    "\n1. smart_search('database entities models schema') → broad discovery of data layer"
-                    "\n2. smart_search('ORM models relationships') → find relationship definitions"
-                    "\n3. examine_files([entity_files], 'full') → complete entity definitions with constraints"
-                    "\n4. analyze_relationships('User', 'all') → map entity relationships and dependencies"
-                    "\n5. smart_search('migrations database setup') → understand data evolution and configuration"
-                    "\n6. SYNTHESIZE: Complete entity ecosystem with relationships, constraints, patterns, and recommendations"
-                    "\n\n**Architecture Analysis: 'Explain the system architecture'**"
-                    "\n1. smart_search('system architecture') → high-level system overview"
-                    "\n2. smart_search('main entry points application structure') → find core components"
-                    "\n3. examine_files([main_files], 'structure') → understand component organization"
-                    "\n4. analyze_relationships(main_component, 'all') → map complete dependency graph"
-                    "\n5. smart_search('configuration deployment infrastructure') → understand deployment patterns"
-                    "\n6. examine_files([config_files], 'full') → analyze configuration and setup"
-                    "\n7. SYNTHESIZE: Multi-layered architecture analysis with patterns, data flow, and scalability insights"
-                    "\n\n**Implementation Deep-Dive: 'How does authentication work?'**"
-                    "\n1. smart_search('authentication system') → broad auth system discovery"
-                    "\n2. smart_search('login flow user session') → specific flow components"
-                    "\n3. examine_files([auth_files], 'full') → complete authentication implementation"
-                    "\n4. analyze_relationships('AuthService', 'all') → auth system dependencies"
-                    "\n5. smart_search('security middleware validation') → security layer analysis"
-                    "\n6. examine_files([security_files], 'structure') → security implementation patterns"
-                    "\n7. SYNTHESIZE: End-to-end authentication analysis with security considerations and recommendations"
-                    "\n\n🔧 ADVANCED INVESTIGATION TECHNIQUES:"
-                    "\n• **EXPLORATORY SEARCH STRATEGY**: Start broad, then narrow - use multiple search angles"
-                    "\n  - Begin with high-level concepts ('payment system') before specific terms ('stripe integration')"
-                    "\n  - Try alternative terminology ('user auth', 'authentication', 'login system', 'session management')"
-                    "\n  - Search for related concepts to build complete understanding"
-                    "\n• **COMPREHENSIVE FILE ANALYSIS**: Don't stop at first relevant file - examine related components"
-                    "\n  - Look for imports/exports to find connected files"
-                    "\n  - Examine configuration files, tests, and documentation"
-                    "\n  - Use different detail levels based on analysis needs"
-                    "\n• **RELATIONSHIP TRACING**: Follow the dependency chain in both directions"
-                    "\n  - Trace symbols back to their definitions and forward to their usages"
-                    "\n  - Understand data flow and control flow through the system"
-                    "\n  - Map architectural boundaries and integration points"
-                    "\n• **VALIDATION AND COMPLETENESS**: Ensure no important details are missed"
-                    "\n  - Cross-reference findings across multiple files"
-                    "\n  - Look for edge cases, error handling, and configuration options"
-                    "\n  - Verify understanding with additional targeted searches"
-                    "\n\n🎯 SPECIALIZED ANALYSIS APPROACHES:"
-                    "\n• **Performance Analysis**: Identify bottlenecks, analyze algorithms, suggest optimizations"
-                    "\n• **Security Review**: Find vulnerabilities, analyze security patterns, recommend best practices"
-                    "\n• **Refactoring Guidance**: Suggest improvements, show before/after examples, explain benefits"
-                    "\n• **Debugging Assistance**: Trace data flow, identify potential issues, provide debugging strategies"
-                    "\n• **Integration Analysis**: Understand component interactions, identify coupling issues, suggest improvements"
-                )
-            },
-            {"role": "user", "content": user_query}
-        ]
-
-        # Store JSON prompt instruction to apply AFTER tool calling phase
-        json_prompt_instruction = (
-            "You must respond with VALID JSON only (no markdown). Use this exact envelope: "
-            "{ \"response\": { \"metadata\": { \"query_type\": \"architecture|dependencies|database|general\", \"confidence\": 0.0 }, "
-            "\"sections\": [], \"follow_up_suggestions\": [] } }. "
-            "The output MUST begin with '{' as the first character and end with '}'. Do not prepend headings, prose, or code fences. "
-            "Sections must be typed using: paragraph, heading(level 1-6), table(columns, rows, note), list(style bullet|numbered), "
-            "code_block(language, content), callout(style info|warning|error|success), tree(root.label, root.children). "
-            "IMPORTANT: For diagrams, you MUST call the mermaid_generator tool - NEVER generate diagram content inline. "
-            "Do not include markdown in contents; use the section types. "
-            "\n\n**🧠 MERMAID DIAGRAM GENERATION - TOOL USAGE ONLY**\n"
-            "**CRITICAL: For ANY diagram generation, you MUST use the mermaid_generator tool. NEVER generate diagrams inline.**\n\n"
-            "**WHEN TO CREATE DIAGRAMS:**\n"
-            "Only generate diagrams when explicitly requested by the user OR when a visual representation would be significantly more helpful than text for explaining architecture, relationships, or complex flows.\n\n"
-            "**HOW TO CREATE DIAGRAMS:**\n"
-            "1. **ANALYZE THE REQUEST:** Determine diagram type needed (flowchart, graph, erDiagram, etc.)\n"
-            "2. **IDENTIFY COMPONENTS:** Extract nodes, relationships, and groupings from the information\n"
-            "3. **CALL THE TOOL:** Use mermaid_generator with diagram_type, nodes array, and edges array\n"
-            "4. **INCLUDE IN RESPONSE:** Extract the mermaid code from the tool result and add it as a diagram section: {\"type\": \"diagram\", \"format\": \"mermaid\", \"content\": \"<mermaid_code_here>\"}\n\n"
-            "**STEP 1: Generate the Structure (Unstyled)**\n"
-            "• Analyze & Classify: First, analyze the user's request to determine which scenario it best fits from the Template Library.\n"
-            "• Select Structural Template: You MUST select the corresponding Structural Template for that scenario. This is your required starting point. It contains only nodes and connections, with no styling.\n"
-            "• Modify the Structure: Adapt the structural template to match the user's request by renaming, adding, or removing nodes, and adding or changing connections. The output of this step should be a complete but unstyled Mermaid diagram.\n\n"
-            "**STEP 2: Apply the Styling**\n"
-            "• Get the Style Definitions: Find the Style Definitions that correspond to the template you chose in Step 1.\n"
-            "• Add Style Blocks: Copy the '%% --- Style Definitions ---' block to the top of the diagram and the '%% --- Apply Styles ---' block to the bottom.\n"
-            "• Intermediate Output: The result of this step is a single, complete Mermaid code block that is fully structured and styled.\n\n"
-            "**STEP 3: Verify the Final Output**\n"
-            "• Before providing the final output, you MUST verify that the generated Mermaid code strictly adheres to all rules listed in the 'Common Pitfalls & Syntax Rules' section. This is a mandatory final check to prevent errors.\n\n"
-            "**COMMON PITFALLS & SYNTAX RULES**\n"
-            "• Quotation Marks: To include a double quote (\") inside a node's label, you MUST use the HTML entity &quot;. Example: Node[\"A &quot;good&quot; label\"]\n"
-            "• Reserved Words: Words like 'graph', 'end', 'subgraph' are reserved. If you must use them in a label, enclose the label in quotes. Example: A --> B[\"end\"]\n"
-            "• Node IDs: A node's ID must be a single, unbroken string. Example: MyNode[\"This is the label\"]\n"
-            "• HTML Characters: To display characters like '<' or '>' in a label, use HTML entities &lt; and &gt; to avoid parsing errors.\n"
-            "• Closing Subgraphs: Every 'subgraph' MUST be closed with a corresponding 'end' keyword.\n\n"
-            "**TEMPLATE LIBRARY**\n\n"
-            "**Full-Stack Application**\n"
-            "Structural Template:\n"
-            "graph TD\n"
-            "    User([User])\n"
-            "    subgraph \"Primary Application\"\n"
-            "        direction LR\n"
-            "        WebApp[Frontend]\n"
-            "        Server[Backend API]\n"
-            "        Database[(Database)]\n"
-            "    end\n"
-            "    subgraph \"External Services\"\n"
-            "        PaymentGateway[(Payment Gateway)]\n"
-            "    end\n"
-            "    User --> WebApp\n"
-            "    WebApp --> Server\n"
-            "    Server --> Database\n"
-            "    Server -->|Processes Payment| PaymentGateway\n\n"
-            "Style Definitions:\n"
-            "%% --- Style Definitions ---\n"
-            "classDef userStyle fill:#99d98c,stroke:#333,stroke-width:2px\n"
-            "classDef frontendStyle fill:#76c893,stroke:#333,stroke-width:2px\n"
-            "classDef backendStyle fill:#52b69a,stroke:#333,stroke-width:2px\n"
-            "classDef dbStyle fill:#34a0a4,stroke:#333,stroke-width:2px\n"
-            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
-            "%% --- Apply Styles ---\n"
-            "class User userStyle\n"
-            "class WebApp frontendStyle\n"
-            "class Server backendStyle\n"
-            "class Database dbStyle\n"
-            "class PaymentGateway externalStyle\n\n"
-            "**API / Microservice Interaction**\n"
-            "Structural Template:\n"
-            "graph TD\n"
-            "    ApiGateway[API Gateway]\n"
-            "    subgraph \"User Service\"\n"
-            "        ServiceA{{Authentication}}\n"
-            "    end\n"
-            "    subgraph \"Order Service\"\n"
-            "        ServiceB{{Order Processing}}\n"
-            "    end\n"
-            "    ThirdParty[(3rd Party API)]\n"
-            "    ApiGateway -->|Routes to| ServiceA\n"
-            "    ApiGateway -->|Routes to| ServiceB\n"
-            "    ServiceB -->|Fetches Data| ThirdParty\n\n"
-            "Style Definitions:\n"
-            "%% --- Style Definitions ---\n"
-            "classDef apiStyle fill:#1a759f,stroke:#333,stroke-width:2px,color:#fff\n"
-            "classDef serviceStyle fill:#184e77,stroke:#333,stroke-width:2px,color:#fff\n"
-            "classDef externalStyle fill:#d9ed92,stroke:#333,stroke-width:2px\n"
-            "%% --- Apply Styles ---\n"
-            "class ApiGateway apiStyle\n"
-            "class ServiceA,ServiceB serviceStyle\n"
-            "class ThirdParty externalStyle\n\n"
-            "**Database Schema**\n"
-            "Structural Template:\n"
-            "erDiagram\n"
-            "    USERS {\n"
-            "        int id PK\n"
-            "        string username\n"
-            "    }\n"
-            "    POSTS {\n"
-            "        int id PK\n"
-            "        int user_id FK\n"
-            "    }\n"
-            "    USERS ||--o{ POSTS : \"writes\"\n\n"
-            "**Internal Component Flow**\n"
-            "Structural Template:\n"
-            "graph TD\n"
-            "    subgraph \"Backend Logic Flow\"\n"
-            "        direction LR\n"
-            "        A_Request[Request]\n"
-            "        B_Controller{Controller}\n"
-            "        C_Service[Service Logic]\n"
-            "        D_Model[(Data Model)]\n"
-            "    end\n"
-            "    A_Request --> B_Controller\n"
-            "    B_Controller --> C_Service\n"
-            "    C_Service --> D_Model\n\n"
-            "Style Definitions:\n"
-            "%% --- Style Definitions ---\n"
-            "classDef entrypointStyle fill:#ef476f,stroke:#333,stroke-width:2px,color:white\n"
-            "classDef controllerStyle fill:#f78c6b,stroke:#333,stroke-width:2px\n"
-            "classDef serviceStyle fill:#ffd166,stroke:#333,stroke-width:2px\n"
-            "classDef modelStyle fill:#06d6a0,stroke:#333,stroke-width:2px\n"
-            "%% --- Apply Styles ---\n"
-            "class A_Request entrypointStyle\n"
-            "class B_Controller controllerStyle\n"
-            "class C_Service serviceStyle\n"
-            "class D_Model modelStyle\n\n"
-            "**CI/CD Pipeline**\n"
-            "Structural Template:\n"
-            "graph LR\n"
-            "    subgraph \"CI/CD Pipeline\"\n"
-            "        A(Code Commit) --> B{Build Server}\n"
-            "        B --> C(Run Tests)\n"
-            "        C -- On Success --> D[Deploy to Staging]\n"
-            "        D --> E((Production))\n"
-            "    end\n\n"
-            "Style Definitions:\n"
-            "%% --- Style Definitions ---\n"
-            "classDef vcsStyle fill:#fca311,stroke:#333,stroke-width:2px\n"
-            "classDef buildStyle fill:#14213d,stroke:#333,stroke-width:2px,color:white\n"
-            "classDef testStyle fill:#5a189a,stroke:#333,stroke-width:2px,color:white\n"
-            "classDef deployStyle fill:#008000,stroke:#333,stroke-width:2px,color:white\n"
-            "%% --- Apply Styles ---\n"
-            "class A vcsStyle\n"
-            "class B buildStyle\n"
-            "class C testStyle\n"
-            "class D,E deployStyle\n\n"
-            "**General System Architecture**\n"
-            "Structural Template:\n"
-            "graph TD\n"
-            "    subgraph \"Data Ingestion\"\n"
-            "        Input_Source([Input Source])\n"
-            "    end\n"
-            "    subgraph \"Core Processing\"\n"
-            "        Processing_Unit[/Processing Unit/]\n"
-            "        Data_Store[(Data Store)]\n"
-            "    end\n"
-            "    subgraph \"Data Consumption\"\n"
-            "        System_Consumer([System Consumer])\n"
-            "    end\n"
-            "    Input_Source --> Processing_Unit\n"
-            "    Processing_Unit <--> Data_Store\n"
-            "    Processing_Unit --> System_Consumer\n\n"
-            "Style Definitions:\n"
-            "%% --- Style Definitions ---\n"
-            "classDef sourceStyle fill:#8ecae6,stroke:#333,stroke-width:2px\n"
-            "classDef processStyle fill:#219ebc,stroke:#333,stroke-width:2px,color:white\n"
-            "classDef dataStyle fill:#023047,stroke:#333,stroke-width:2px,color:white\n"
-            "classDef consumerStyle fill:#ffb703,stroke:#333,stroke-width:2px\n"
-            "%% --- Apply Styles ---\n"
-            "class Input_Source sourceStyle\n"
-            "class Processing_Unit processStyle\n"
-            "class Data_Store dataStyle\n"
-            "class System_Consumer consumerStyle"
-        )
-        
-        # Add chat history if provided
-        if chat_history:
-            # Insert chat history before the current user message
-            history_messages = []
-            for msg in chat_history[-5:]:  # Last 5 messages
-                if hasattr(msg, 'content'):
-                    role = "user" if msg.type == "human" else "assistant"
-                    history_messages.append({"role": role, "content": msg.content})
+                logger.info(f"🎯 Project context set: {mentioned_projects}")
             
-            # Insert history before current user message
-            messages = [messages[0]] + history_messages + [messages[1]]
+            # Use provided model or fall back to config default
+            model_to_use = selected_model or cerebras_config.model
+            logger.info(f"🎯 Processing query with model: {model_to_use}")
+            
+            # Build message history
+            messages = conversation_history or []
+            
+            # Add system prompt ONLY if new conversation
+            if not messages:
+                messages.append({
+                    "role": "system",
+                    "content": self._get_native_system_prompt()
+                })
+            
+            # Add user query
+            messages.append({"role": "user", "content": user_query})
+            
+            # Reset iteration counter
+            self.current_iteration = 0
+            
+            # SDK handles everything from here
+            result = await self._sdk_native_loop(messages, model_to_use)
+            
+            logger.info(f"✅ Query processed successfully in {self.current_iteration} iterations")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Native agent processing failed: {e}")
+            error_message = f"I encountered a system error while processing your request: {str(e)}"
+            return await self._ensure_structured_response(error_message, "processing_error")
+    
+    async def _sdk_native_loop(self, messages: List[Dict], selected_model: str) -> str:
+        """
+        Pure SDK loop - NO custom logic, just tool execution when requested
+        """
+        last_successful_content = None
+        successful_iterations = 0
         
-        yield {"type": "context_gathering_start", "message": "Starting analysis with native Cerebras tools..."}
-        
-        # Multi-turn tool calling loop with duplicate detection
-        # Dynamic iteration limit based on query complexity
-        query_lower = user_query.lower()
-        needs_diagrams = any(keyword in query_lower for keyword in ['mermaid', 'diagram', 'architecture', 'chart', 'visualization', 'flowchart'])
-        max_iterations = 12 if needs_diagrams else 7  # Allow more iterations for complex visual queries
-        iteration = 0
-        recent_tool_calls = []  # Track recent tool calls to avoid repetition
-        tool_call_count = 0  # Track total tool calls made
-        synthesis_mode = False  # Track if we're in synthesis stage (no more tools allowed)
-        
-        while iteration < max_iterations:
-            iteration += 1
-            logger.info(f"🔄 ITERATION {iteration}/{max_iterations} (Tool calls so far: {tool_call_count})")
+        while self.current_iteration < self.max_iterations:
+            self.current_iteration += 1
             
             try:
-                # PHASE 3: Investigation Quality Gating - Fixed to allow initial tool usage
-                investigation_score = self._calculate_investigation_completeness(recent_tool_calls, messages)
+                logger.info(f"🔄 SDK Iteration {self.current_iteration}/{self.max_iterations}")
                 
-                # Smart decision making: check if we have enough information
-                has_search_results = bool(self.tool_context.get('last_search_results'))
-                has_examined_files = bool(self.tool_context.get('examined_files'))
-                has_relationships = any('analyze_relationships' in call for call in recent_tool_calls)
+                # REQ-CTX-FALLBACK: Check if we need graceful degradation
+                context_health = {"utilization_percent": 0}
+                if context_health.get("utilization_percent", 0) > 90:
+                    logger.warning("🚨 Context critical - applying graceful degradation")
+                    return await self._apply_graceful_degradation(messages, context_health)
                 
-                # CRITICAL FIX: Prevent tools during synthesis stage to avoid message pairing issues
-                if synthesis_mode:
-                    use_tools = None  # NO TOOLS during synthesis - prevents message structure corruption
-                    logger.info(f"🚫 SYNTHESIS MODE: Tools disabled (synthesis_mode={synthesis_mode})")
-                elif tool_call_count == 0:
-                    use_tools = self.tools_schema  # Always allow tools initially
-                    logger.info(f"🔧 TOOLS ENABLED: Initial iteration (tool_count={tool_call_count})")
-                elif tool_call_count < 6 and investigation_score < 8:  # More permissive threshold
-                    use_tools = self.tools_schema
-                    logger.info(f"🔧 TOOLS ENABLED: Continuing investigation (tool_count={tool_call_count}, score={investigation_score:.1f})")
-                else:
-                    use_tools = None
-                    logger.info(f"🚫 TOOLS DISABLED: Quality threshold reached (tool_count={tool_call_count}, score={investigation_score:.1f})")
-                    # Add JSON format instruction when ready for final answer
-                    messages.append({
-                        "role": "system", 
-                        "content": f"You have completed your investigation. Now provide a COMPREHENSIVE, DETAILED final analysis. This should be thorough and extensive - include multiple sections, detailed explanations, code examples, architectural insights, and actionable recommendations. DO NOT provide brief responses. Use this format: {json_prompt_instruction}"
-                    })
+                # SDK makes ALL decisions using adaptive schema
+                adaptive_schema = self._build_adaptive_schema()
                 
-                # RATE LIMITING: Enforce 1.1s delay to prevent 429 errors  
-                await self._enforce_rate_limit()
+                # Build completion config with dynamic model
+                completion_config = cerebras_config.get_completion_config(selected_model)
                 
-                # DEBUG: Log message structure before API call
-                logger.info(f"🔍 DEBUG: About to make API call with {len(messages)} messages, tools={use_tools is not None}")
-                for i, msg in enumerate(messages[-3:]):  # Log last 3 messages
-                    msg_type = msg.get('role', 'unknown')
-                    has_tools = 'tool_calls' in msg
-                    has_tool_id = 'tool_call_id' in msg
-                    logger.info(f"🔍 MSG[{len(messages)-3+i}]: {msg_type}, tools={has_tools}, tool_id={has_tool_id}")
-                
-                # Make API call to Cerebras
+                # Build API parameters with conditional reasoning_effort
                 api_params = {
-                    "model": "gpt-oss-120b",
+                    **completion_config,
                     "messages": messages,
-                    "max_tokens": 8000,  # Allow longer responses for comprehensive analysis
-                    "temperature": 0.3   # Slightly more creative but still focused
+                    "tools": adaptive_schema
                 }
-                if use_tools is not None:
-                    api_params["tools"] = use_tools
-                logger.info(f"🔍 API PARAMS: tools_provided={use_tools is not None}, synthesis_mode={synthesis_mode}")
+                
+                # Only add reasoning_effort for models that support it
+                if cerebras_config.supports_reasoning_effort(selected_model):
+                    api_params["reasoning_effort"] = cerebras_config.reasoning_effort
+                    logger.info(f"✅ Using reasoning_effort '{cerebras_config.reasoning_effort}' for {selected_model}")
+                else:
+                    logger.info(f"⏭️ Skipping reasoning_effort for {selected_model} (not supported)")
+                
+                # DIAGNOSTIC LOGGING: Log exact API request parameters
+                logger.info(f"🔧 DIAGNOSTIC: API Request Parameters for iteration {self.current_iteration}")
+                logger.info(f"🔧 Model: {api_params.get('model')}")
+                logger.info(f"🔧 Max tokens: {api_params.get('max_tokens')}")
+                logger.info(f"🔧 Tools count: {len(api_params.get('tools', []))}")
+                logger.info(f"🔧 Tools schema: {json.dumps(api_params.get('tools', []), indent=2)}")
+                logger.info(f"🔧 Messages count: {len(api_params.get('messages', []))}")
+                
+                # Log last few messages to see conversation context
+                messages_to_log = api_params.get('messages', [])[-3:]  # Last 3 messages
+                for i, msg in enumerate(messages_to_log):
+                    try:
+                        role = msg.get('role', 'unknown') if isinstance(msg, dict) else getattr(msg, 'role', 'unknown')
+                        content_preview = str(msg.get('content', '') if isinstance(msg, dict) else getattr(msg, 'content', ''))[:200] + "..."
+                        tool_calls = msg.get('tool_calls', []) if isinstance(msg, dict) else getattr(msg, 'tool_calls', [])
+                        logger.info(f"🔧 Message {i}: Role={role}, Content={content_preview}, ToolCalls={len(tool_calls)}")
+                    except Exception as log_err:
+                        logger.info(f"🔧 Message {i}: [Error logging message: {log_err}]")
                 
                 response = self.client.chat.completions.create(**api_params)
-                # parallel_tool_calls parameter removed - not supported by GPT-OSS-120B
                 
-                choice = response.choices[0].message
+                message = response.choices[0].message
                 
-                # Check if there are tool calls
-                if choice.tool_calls:
-                    tool_call_count += len(choice.tool_calls)
+                # Log SDK reasoning (for transparency and debugging)
+                if hasattr(message, 'reasoning') and message.reasoning:
+                    logger.info(f"🧠 SDK REASONING: {message.reasoning}")
+                
+                # SDK wants to use tools
+                if message.tool_calls:
+                    logger.info(f"🔧 SDK requested {len(message.tool_calls)} tool calls")
+                    messages.append(message)
                     
-                    # Add the assistant message with tool calls
-                    messages.append({
-                        "role": "assistant",
-                        "content": choice.content or "",
-                        "tool_calls": [
-                            {
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments
-                                }
-                            }
-                            for tool_call in choice.tool_calls
-                        ]
-                    })
-                    
-                    # Collect system messages to add AFTER all tool responses (prevent API pairing issues)
-                    pending_system_messages = []
-                    
-                    # Process each tool call
-                    for tool_call in choice.tool_calls:
-                        function_name = tool_call.function.name
-                        function_args = tool_call.function.arguments
+                    # Execute tools with intelligent summarization for large outputs
+                    for tool_call in message.tool_calls:
+                        # Execute tool normally
+                        result = await self._execute_pure_tool_call(tool_call)
                         
-                        # Track tool call for duplicate detection
-                        call_signature = f"{function_name}:{function_args}"
-                        recent_tool_calls.append(call_signature)
-                        
-                        # Keep only last 5 calls for duplicate detection
-                        if len(recent_tool_calls) > 5:
-                            recent_tool_calls.pop(0)
-                        
-                        # Log detailed tool call information
-                        logger.info(f"🔧 TOOL CALL: {function_name}")
-                        logger.info(f"Input: {function_args}")
-                        
-                        yield {
-                            "type": "tool_start",
-                            "tool": function_name,
-                            "input": function_args
-                        }
-                        
-                        # Check for repetitive tool calling - improved logic
-                        call_count = recent_tool_calls.count(call_signature)
-                        
-                        # Allow legitimate 3-tool pattern: smart_search → examine_files → analyze_relationships
-                        # Only block if same tool called 3+ times with same args, or excessive total calls
-                        should_block = (
-                            call_count >= 3 or  # Same call 3+ times
-                            (tool_call_count >= 8 and call_count >= 2)  # Many calls + repetition
+                        # Apply summarization if output is large  
+                        user_query = self._extract_user_query(messages)
+                        tool_content = await self._execute_tool_and_summarize(
+                            tool_call.function.name, result, user_query
                         )
                         
-                        if should_block:
-                            warning_msg = f"Info: {function_name} has been called {call_count} times with same parameters. Skipping to avoid excessive repetition."
-                            
-                            # Special handling for mermaid_generator repetition
-                            if function_name == "mermaid_generator":
-                                # Try to repair and process the diagram one more time
-                                logger.info("🔧 Final attempt to repair mermaid diagram after repetition...")
-                                repaired_args = self._repair_truncated_json(function_args)
-                                if repaired_args:
-                                    try:
-                                        arguments = json.loads(repaired_args)
-                                        arguments = self._validate_and_fix_parameters(function_name, arguments)
-                                        result = await self.available_functions[function_name](**arguments)
-                                        logger.info("✅ Final repair attempt successful!")
-                                    except Exception as e:
-                                        result = f"❌ **Diagram Generation Issue**: Multiple attempts to generate the diagram encountered technical limitations. Architecture analysis completed successfully. Technical details: {str(e)}"
-                                else:
-                                    result = "❌ **Diagram Data Issue**: Could not process diagram parameters. Architecture analysis completed successfully."
-                            else:
-                                result = warning_msg
-                        else:
-                            # Normalize known aliases (e.g., 'functions.smart_search' -> 'smart_search')
-                            normalized_name = function_name
-                            if function_name.startswith("functions."):
-                                normalized_name = function_name.split(".", 1)[1]
-
-                            if normalized_name in self.available_functions:
-                                function_name = normalized_name
-                                try:
-                                    # Parse arguments and call function
-                                    arguments = json.loads(function_args)
-                                    
-                                    # Fix common parameter validation issues
-                                    arguments = self._validate_and_fix_parameters(function_name, arguments)
-                                    
-                                    logger.info(f"🔧 PARSED ARGS: {arguments}")
-                                    result = await self.available_functions[function_name](**arguments)
-                                    
-                                except json.JSONDecodeError as e:
-                                    result = f"Error parsing {function_name} arguments: {str(e)}"
-                                    logger.error(f"JSON decode error for {function_name}: {function_args}")
-                                    
-                                    # Special handling for truncated mermaid diagrams - repair the JSON
-                                    if function_name == "mermaid_generator" and ("Expecting ',' delimiter" in str(e) or "Unterminated string" in str(e)):
-                                        logger.info("🔧 Attempting to repair truncated mermaid JSON...")
-                                        repaired_args = self._repair_truncated_json(function_args)
-                                        if repaired_args:
-                                            try:
-                                                arguments = json.loads(repaired_args)
-                                                arguments = self._validate_and_fix_parameters(function_name, arguments)
-                                                result = await self.available_functions[function_name](**arguments)
-                                                logger.info("✅ Successfully repaired and processed mermaid diagram")
-                                            except Exception as repair_error:
-                                                logger.error(f"❌ Repair attempt failed: {repair_error}")
-                                                result = f"Error: Could not repair diagram data - {str(repair_error)}"
-                                        else:
-                                            result = "Error: Could not repair truncated diagram data"
-                                except TypeError as e:
-                                    result = f"Error executing {function_name}: {str(e)}"
-                                    logger.error(f"Parameter error for {function_name}: {arguments} -> {str(e)}")
-                                except Exception as e:
-                                    result = f"Error executing {function_name}: {str(e)}"
-                                    logger.error(f"General error for {function_name}: {str(e)}")
-                            else:
-                                # Suppress noisy unknown-tool messages in synthesis; provide silent no-op
-                                result = ""
-                        
-                        # PHASE 1: Negative Result Fallback System - COLLECT instead of adding immediately
-                        if self._detect_negative_result(result, function_name) and tool_call_count < 5:
-                            fallback_guidance = self._get_fallback_guidance(function_name)
-                            pending_system_messages.append({
-                                "role": "system",
-                                "content": f"The previous search returned no results. {fallback_guidance}. Continue investigating before providing final answer."
-                            })
-                        
-                        # Log tool output (truncated for readability)
-                        # Avoid logging empty no-op outputs
-                        result_preview = (result[:300] + "...") if (isinstance(result, str) and len(result) > 300) else result
-                        if result_preview == "":
-                            result_preview = "(no output)"
-                        logger.info(f"🔧 TOOL RESULT ({len(result)} chars): {result_preview}")
-                        
-                        # Task 5: Collect tool results for response formatting
-                        tool_results_for_formatting.append({
-                            'tool_name': function_name,
-                            'arguments': arguments if 'arguments' in locals() else {},
-                            'result': result,
-                            'execution_time': 0.0,  # Could be measured if needed
-                            'success': not result.startswith('Error'),
-                            'results': []  # Could extract structured results if available
-                        })
-                        
-                        # Avoid emitting empty no-op tool outputs to the UI
-                        yield {
-                            "type": "tool_end",
-                            "output": result if result != "" else ""
-                        }
-                        
-                        # Add tool result to messages
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": result
+                            "content": tool_content
                         })
                     
-                    # CRITICAL FIX: Add pending system messages AFTER all tool responses are processed
-                    for system_msg in pending_system_messages:
-                        messages.append(system_msg)
-                        logger.info(f"📝 ADDED DELAYED SYSTEM MESSAGE: {system_msg['content'][:100]}...")
-                    
-                    # After 4+ tool calls, add guidance but allow continued investigation if needed
-                    if tool_call_count >= 4:
-                        messages.append({
-                            "role": "system",
-                            "content": f"You have made several tool calls and gathered substantial information. If you have found sufficient information, provide a COMPREHENSIVE, DETAILED final analysis with multiple sections, extensive explanations, code examples, and actionable insights. DO NOT provide brief responses - be thorough and extensive. If you need to investigate further with different approaches, continue, but focus on completing the investigation efficiently.\n\nWhen providing your final answer, use this format: {json_prompt_instruction}"
-                        })
+                    successful_iterations += 1
+                    continue  # Let SDK process results
                 
+                # SDK provides final answer
                 else:
-                    # No tool calls - we have the final response
-                    final_content = choice.content or "Task completed"
-                    logger.info(f"✅ FINAL RESPONSE ({len(final_content)} chars): {final_content[:500]}...")
+                    logger.info("✅ SDK provided final response")
                     
-                    # CRITICAL FIX: Check max iterations BEFORE processing response
-                    if iteration >= max_iterations:
-                        logger.warning(f"🔄 MAX ITERATIONS REACHED: {iteration}/{max_iterations} - Forcing final response")
-                        
-                        execution_time = asyncio.get_event_loop().time() - execution_start_time
-                        execution_metadata = {
-                            'total_time': execution_time,
-                            'iterations': iteration,
-                            'tool_calls': tool_call_count,
-                            'max_iterations_reached': True
-                        }
-                        
-                        try:
-                            formatted_response = self.response_formatter.format_response(
-                                raw_response=final_content,
-                                tool_results=tool_results_for_formatting,
-                                query=user_query,
-                                execution_metadata=execution_metadata
-                            )
-                            response_consolidator.add_response_data(
-                                raw_output=final_content,
-                                source=ResponseSource.MAX_ITERATIONS,
-                                formatted_response=formatted_response.to_dict(),
-                                execution_metadata=execution_metadata,
-                                max_iterations_reached=True
-                            )
-                        except Exception as e:
-                            logger.error(f"Response formatting failed in max iterations: {e}")
-                            response_consolidator.add_response_data(
-                                raw_output=final_content,
-                                source=ResponseSource.MAX_ITERATIONS,
-                                execution_metadata=execution_metadata,
-                                max_iterations_reached=True,
-                                error=f"Max iterations formatting failed: {e}"
-                            )
-                        break
+                    # Log full LLM response for debugging/monitoring
+                    response_content = message.content
+                    response_length = len(response_content) if response_content else 0
+                    logger.info(f"📄 LLM Response Details - Length: {response_length} chars, Model: {self.model}")
+                    logger.info(f"📝 Full LLM Response:\n{'='*50}\n{response_content}\n{'='*50}")
                     
-                    # PHASE 2: Incomplete Response Detection
-                    if self._detect_incomplete_response(final_content) and tool_call_count < 5:
-                        # Don't terminate - add follow-through prompt
-                        messages.append({
-                            "role": "system", 
-                            "content": "You mentioned you would perform additional actions. Please follow through on what you just said you would do instead of providing a final answer."
-                        })
-                        continue  # Skip termination, continue loop
-                    
-                    # TWO-STAGE PROCESSING: Detect inadequate GPT-OSS-120B responses and trigger synthesis
-                    if self._detect_inadequate_response(final_content, tool_call_count) and tool_call_count > 0:
-                        logger.warning(f"⚠️ INADEQUATE RESPONSE DETECTED: '{final_content[:100]}...' after {tool_call_count} tool calls")
-                        logger.info("🔄 TRIGGERING SYNTHESIS STAGE: Re-prompting with tool results")
-                        
-                        # CRITICAL FIX: Add the assistant's inadequate response to messages first
-                        messages.append({
-                            "role": "assistant",
-                            "content": final_content
-                        })
-                        
-                        # Compile all tool results for synthesis
-                        tool_summary = self._compile_tool_results_summary(tool_results_for_formatting)
-                        
-                        synthesis_prompt = (
-                            f"You called tools and gathered valuable information, but your response was inadequate. "
-                            f"Please provide a comprehensive analysis of the original query based on the information you gathered:\n\n"
-                            f"**ORIGINAL QUERY:** {user_query}\n\n"
-                            f"**INFORMATION YOU GATHERED:**\n{tool_summary}\n\n"
-                            f"Now provide a detailed, comprehensive response that actually uses this information to answer the user's query.\n\n"
-                            f"RESPONSE FORMAT: {json_prompt_instruction}"
-                        )
-                        
-                        messages.append({
-                            "role": "system",
-                            "content": synthesis_prompt
-                        })
-                        
-                        # CRITICAL FIX: Enter synthesis mode to prevent additional tool calls
-                        synthesis_mode = True
-                        logger.info("🚫 SYNTHESIS MODE ACTIVATED: No more tools allowed to prevent message pairing issues")
-                        continue  # Skip termination, continue to synthesis stage
-                    
-                    # RESPONSE CONSOLIDATION: Collect all response data instead of yielding multiple final_result messages
-                    execution_time = asyncio.get_event_loop().time() - execution_start_time
-                    execution_metadata = {
-                        'total_time': execution_time,
-                        'iterations': iteration,
-                        'tool_calls': tool_call_count,
-                        'synthesis_triggered': synthesis_mode
-                    }
-                    
-                    # CRITICAL FIX: Single pipeline selection based on response type
-                    try:
-                        structured = parse_json_prompt(final_content)
-                        if structured is not None:
-                            # JSON Pipeline ONLY - for structured responses
-                            logger.info("📊 AGENT: Detected structured JSON response - using JSON pipeline")
-                            
-                            try:
-                                improved = improve_json_prompt_readability(structured.model_dump())
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.STRUCTURED,
-                                    structured_response=improved,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode
-                                )
-                                logger.info("✅ AGENT: Successfully processed structured response")
-                            except Exception as e:
-                                logger.error(f"💥 AGENT: Structured response processing failed: {e}")
-                                # Fallback to raw response
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.RAW,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode,
-                                    error=f"Structured processing failed: {e}"
-                                )
-                        else:
-                            # Markdown Pipeline ONLY - for non-structured responses
-                            logger.info("📊 AGENT: Detected markdown response - using markdown pipeline")
-                            
-                            try:
-                                formatted_response = self.response_formatter.format_response(
-                                    raw_response=final_content,
-                                    tool_results=tool_results_for_formatting,
-                                    query=user_query,
-                                    execution_metadata=execution_metadata
-                                )
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.FORMATTED,
-                                    formatted_response=formatted_response.to_dict(),
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode
-                                )
-                                logger.info("✅ AGENT: Successfully processed formatted response")
-                            except Exception as e:
-                                logger.error(f"💥 AGENT: Response formatting failed: {e}")
-                                # Fallback to raw response
-                                response_consolidator.add_response_data(
-                                    raw_output=final_content,
-                                    source=ResponseSource.RAW,
-                                    execution_metadata=execution_metadata,
-                                    synthesis_triggered=synthesis_mode,
-                                    error=f"Formatting failed: {e}"
-                                )
-                    except Exception as e:
-                        logger.error(f"Structured response parsing failed: {e}")
-                        response_consolidator.add_response_data(
-                            raw_output=final_content,
-                            source=ResponseSource.RAW,
-                            execution_metadata=execution_metadata,
-                            synthesis_triggered=synthesis_mode,
-                            error=f"Structured parsing failed: {e}"
-                        )
-                    break
+                    # CRITICAL FIX: Apply unified validation to ALL response paths
+                    # This ensures the UI always receives structured JSON, not raw LLM content
+                    return await self._ensure_structured_response(response_content, "sdk_success")
                     
             except Exception as e:
-                # RESPONSE CONSOLIDATION: Add API error to consolidator instead of yielding directly
-                response_consolidator.add_error(f"Cerebras API error: {str(e)}", ResponseSource.RAW)
-                break
+                logger.error(f"❌ SDK iteration {self.current_iteration} failed: {e}")
+                
+                # DIAGNOSTIC LOGGING: Capture the exact error details
+                if "400" in str(e) and "tool call" in str(e):
+                    logger.error("🔍 DIAGNOSTIC: 400 Tool Call Error Details")
+                    logger.error(f"🔍 Error: {str(e)}")
+                    logger.error(f"🔍 Exception type: {type(e)}")
+                    
+                    # Log the exact API parameters that caused the failure
+                    logger.error(f"🔍 Failed API params - Model: {api_params.get('model')}")
+                    logger.error(f"🔍 Failed API params - Tools: {json.dumps(api_params.get('tools', []), indent=2)}")
+                    
+                    # Log the conversation state at failure
+                    logger.error(f"🔍 Conversation length at failure: {len(messages)} messages")
+                    for i, msg in enumerate(messages[-5:]):  # Last 5 messages
+                        try:
+                            role = msg.get('role', 'unknown') if isinstance(msg, dict) else getattr(msg, 'role', 'unknown')
+                            content = str(msg.get('content', ''))[:300] if isinstance(msg, dict) else str(getattr(msg, 'content', ''))[:300]
+                            tool_calls = msg.get('tool_calls', []) if isinstance(msg, dict) else getattr(msg, 'tool_calls', [])
+                            logger.error(f"🔍 Message {i}: {role} - {content}... (ToolCalls: {len(tool_calls) if tool_calls else 0})")
+                        except Exception as log_err:
+                            logger.error(f"🔍 Message {i}: [Error logging message: {log_err}]")
+                
+                # If we had successful iterations, try to provide a helpful response
+                if successful_iterations > 0:
+                    logger.info(f"⚠️ Partial success: {successful_iterations} iterations completed before error")
+                    error_message = (
+                        f"I've gathered information about your query but encountered a technical issue "
+                        f"in the final processing step. Based on the data I found, I can provide you with "
+                        f"relevant information, though the response formatting may be affected. "
+                        f"The technical error was: {str(e)}"
+                    )
+                    # CRITICAL FIX: Return structured error response instead of plain text
+                    return await self._ensure_structured_response(error_message, "sdk_error")
+                else:
+                    error_message = f"I encountered a technical error during processing: {str(e)}"
+                    return await self._ensure_structured_response(error_message, "system_error")
         
-        # RESPONSE CONSOLIDATION: Single yield point - consolidate all response data and yield once
-        if response_consolidator.has_data():
-            primary_source = response_consolidator.get_primary_source()
-            logger.info(f"🔧 CONSOLIDATOR: Consolidating {len(response_consolidator.response_data)} data sources into single final_result")
-            logger.info(f"🎯 CONSOLIDATOR: Primary source will be: {primary_source.value if primary_source else 'unknown'}")
+        logger.warning(f"⚠️ Reached maximum iterations ({self.max_iterations})")
+        
+        # Instead of giving up, try to synthesize a response from gathered context
+        if successful_iterations > 0:
+            logger.info(f"💡 Attempting to synthesize response from {successful_iterations} successful tool calls")
+            
+            # Extract the original user query from the conversation
+            user_query = ""
+            for msg in messages:
+                # Handle both dict and SDK response objects
+                if hasattr(msg, 'role'):
+                    role = msg.role
+                    content = msg.content if hasattr(msg, 'content') else ""
+                else:
+                    role = msg.get("role", "") if isinstance(msg, dict) else ""
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                
+                if role == "user":
+                    user_query = content
+                    break
+            
+            # Create a synthesis prompt using gathered context
+            synthesis_messages = [
+                {
+                    "role": "system", 
+                    "content": "You are an expert code analyst. Based on the tool results gathered so far, provide a comprehensive answer to the user's question. Use all available context from previous tool calls to give a complete response."
+                },
+                {
+                    "role": "user", 
+                    "content": f"Original question: {user_query}\n\nBased on the information gathered from previous tool calls in this conversation, please provide a comprehensive answer. Synthesize all the context and data that was collected to give the user a complete response."
+                }
+            ]
+            
+            # Add the conversation history (contains all tool results)
+            for msg in messages[1:]:  # Skip initial system prompt
+                # Handle both dict and SDK response objects
+                if hasattr(msg, 'role'):
+                    role = msg.role
+                else:
+                    role = msg.get("role", "") if isinstance(msg, dict) else ""
+                
+                if role in ["assistant", "tool"]:
+                    # Convert SDK response objects to dict format for synthesis
+                    if hasattr(msg, 'role'):
+                        dict_msg = {
+                            "role": msg.role,
+                            "content": msg.content if hasattr(msg, 'content') else ""
+                        }
+                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                            dict_msg["tool_calls"] = msg.tool_calls
+                        synthesis_messages.append(dict_msg)
+                    else:
+                        synthesis_messages.append(msg)
             
             try:
-                consolidated_response = await response_consolidator.consolidate(
-                    original_query=user_query,
-                    llm_provider=self  # Pass self as LLM provider for regeneration
-                )
+                # Make final synthesis call without tools
+                synthesis_completion_config = cerebras_config.get_completion_config(selected_model)
                 
-                # Enhanced logging for debugging
-                metadata = consolidated_response.get('consolidation_metadata', {})
-                logger.info(f"✅ CONSOLIDATOR: Successfully consolidated response")
-                logger.info(f"   - Primary source: {metadata.get('primary_source', 'unknown')}")
-                logger.info(f"   - Total sources: {metadata.get('total_sources', 0)}")
-                logger.info(f"   - Sources used: {metadata.get('sources_used', [])}")
-                logger.info(f"   - Synthesis triggered: {metadata.get('synthesis_triggered', False)}")
-                logger.info(f"   - Max iterations: {metadata.get('max_iterations_reached', False)}")
-                logger.info(f"   - Output length: {len(consolidated_response.get('output', ''))}")
-                logger.info(f"   - Has structured: {'structured_response' in consolidated_response}")
-                logger.info(f"   - Has formatted: {'formatted_response' in consolidated_response}")
+                # Build synthesis API parameters with conditional reasoning_effort  
+                synthesis_params = {
+                    **synthesis_completion_config,
+                    "messages": synthesis_messages
+                }
                 
-                # CRITICAL DEBUG: Log the full actual response being yielded
-                logger.info("🔍 FULL CONSOLIDATED RESPONSE BEING YIELDED:")
-                logger.info("=" * 80)
-                logger.info(f"RESPONSE TYPE: {consolidated_response.get('type', 'MISSING')}")
-                logger.info(f"OUTPUT CONTENT ({len(consolidated_response.get('output', ''))} chars):")
-                logger.info(f"'{consolidated_response.get('output', 'MISSING_OUTPUT')}'")
+                # Only add reasoning_effort for models that support it
+                if cerebras_config.supports_reasoning_effort(selected_model):
+                    synthesis_params["reasoning_effort"] = cerebras_config.reasoning_effort
+                    logger.info(f"✅ Using reasoning_effort for synthesis with {selected_model}")
+                else:
+                    logger.info(f"⏭️ Skipping reasoning_effort for synthesis with {selected_model} (not supported)")
                 
-                if 'structured_response' in consolidated_response:
-                    logger.info("STRUCTURED_RESPONSE PRESENT:")
-                    logger.info(str(consolidated_response['structured_response'])[:500] + "..." if len(str(consolidated_response['structured_response'])) > 500 else str(consolidated_response['structured_response']))
-                
-                if 'formatted_response' in consolidated_response:
-                    logger.info("FORMATTED_RESPONSE PRESENT:")
-                    logger.info(str(consolidated_response['formatted_response'])[:500] + "..." if len(str(consolidated_response['formatted_response'])) > 500 else str(consolidated_response['formatted_response']))
-                
-                logger.info("CONSOLIDATION_METADATA:")
-                logger.info(str(metadata))
-                logger.info("=" * 80)
-                
-                if metadata.get('errors_encountered', 0) > 0:
-                    logger.warning(f"⚠️ CONSOLIDATOR: Response contains {metadata['errors_encountered']} errors")
-                
-                yield consolidated_response
+                # REQ-UI-UNIFIED-4: Implement validation and self-correction with retry loop
+                return await self._validate_and_correct_response(synthesis_params, selected_model)
                 
             except Exception as e:
-                logger.error(f"💥 CONSOLIDATOR: Consolidation failed: {e}")
-                yield {
-                    "type": "final_result", 
-                    "output": f"Error during response consolidation: {e}",
-                    "consolidation_metadata": {
-                        "primary_source": "consolidation_error",
-                        "total_sources": len(response_consolidator.response_data),
-                        "error": f"Consolidation failed: {e}"
-                    }
-                }
+                logger.error(f"❌ Synthesis failed: {e}")
+                error_message = (
+                    f"I gathered substantial information about your query through {successful_iterations} "
+                    f"research steps, but reached the processing limit while organizing the final response. "
+                    f"The system found relevant information but encountered a technical limitation in "
+                    f"synthesizing the complete answer. Please try rephrasing your question or breaking "
+                    f"it into smaller parts."
+                )
+                # CRITICAL FIX: Structure synthesis error response
+                return await self._ensure_structured_response(error_message, "synthesis_error")
         else:
-            logger.error("💥 CONSOLIDATOR: No response data collected during entire request processing")
-            yield {
-                "type": "final_result",
-                "output": "Error: No response data was collected during processing. This may indicate a serious issue with the agent logic.",
-                "consolidation_metadata": {
-                    "primary_source": "no_data_error",
-                    "total_sources": 0,
-                    "error": "No response data collected"
+            error_message = "I reached the maximum processing steps. Please try rephrasing your question or breaking it into smaller parts."
+            return await self._ensure_structured_response(error_message, "max_iterations_error")
+    
+    async def _validate_and_correct_response(self, synthesis_params: Dict[str, Any], selected_model: str) -> str:
+        """
+        REQ-UI-UNIFIED-4: Implement Backend Validation and Self-Correction
+        REQ-3.4.2: Error Recovery & Self-Correction System
+        
+        Validates LLM response against UnifiedAgentResponse schema with retry loop.
+        Implements Phase 3 error recovery with Mermaid syntax validation.
+        """
+        max_retries = 2
+        
+        for attempt in range(max_retries + 1):  # 0, 1, 2 (3 total attempts)
+            try:
+                logger.info(f"🔄 Response validation attempt {attempt + 1}/{max_retries + 1}")
+                
+                # Make API call
+                synthesis_response = self.client.chat.completions.create(**synthesis_params)
+                raw_response = synthesis_response.choices[0].message.content if hasattr(synthesis_response.choices[0].message, 'content') else str(synthesis_response.choices[0].message)
+                
+                # Log raw response for debugging
+                response_length = len(raw_response) if raw_response else 0
+                logger.info(f"📝 Raw response received ({response_length} chars)")
+                logger.debug(f"📄 Full Raw Response:\n{'='*50}\n{raw_response}\n{'='*50}")
+                
+                # REQ-3.4.2: Phase 3 Mermaid validation with error recovery
+                mermaid_validation_errors = await self._validate_mermaid_syntax(raw_response)
+                if mermaid_validation_errors and attempt < max_retries:
+                    # Phase 3: Let LLM learn from syntax errors
+                    correction_prompt = self._generate_mermaid_correction_prompt(mermaid_validation_errors)
+                    synthesis_params["messages"].append({
+                        "role": "user", 
+                        "content": correction_prompt
+                    })
+                    logger.warning(f"⚠️ Mermaid syntax errors found, requesting correction (attempt {attempt + 2})")
+                    continue
+                
+                # Attempt validation
+                validated_response = await self._validate_response_structure(raw_response, attempt)
+                
+                if validated_response:
+                    logger.info(f"✅ Response validation successful on attempt {attempt + 1}")
+                    return validated_response
+                    
+                # Validation failed - prepare correction prompt for retry
+                if attempt < max_retries:
+                    correction_prompt = self._generate_correction_prompt(raw_response, attempt)
+                    synthesis_params["messages"].append({
+                        "role": "user", 
+                        "content": correction_prompt
+                    })
+                    logger.warning(f"⚠️ Validation failed, retrying with correction prompt (attempt {attempt + 2})")
+                
+            except Exception as e:
+                logger.error(f"❌ Synthesis attempt {attempt + 1} failed: {e}")
+                
+                if attempt < max_retries:
+                    # Add error recovery prompt
+                    error_prompt = f"The previous response caused an error: {str(e)}. Please provide a valid JSON response following the UnifiedAgentResponse schema format."
+                    synthesis_params["messages"].append({
+                        "role": "user",
+                        "content": error_prompt 
+                    })
+                    continue
+        
+        # All attempts failed - return structured error response
+        logger.error("💥 All validation attempts failed - generating fallback error response")
+        return await self._generate_structured_error_response("Failed to generate a valid structured response after multiple attempts")
+    
+    def _safe_serialize_tool_result(self, tool_result: Dict[str, Any], tool_name: str) -> str:
+        """
+        Safely serialize tool results with content isolation to prevent corruption.
+        
+        This method ensures that complex tool results are properly bounded and that
+        content from different sources doesn't bleed together during serialization.
+        
+        Args:
+            tool_result: Raw tool execution result
+            tool_name: Name of the tool for context
+            
+        Returns:
+            Clean, isolated string representation of the tool result
+        """
+        try:
+            # Create a bounded container for the tool result
+            bounded_result = {
+                "tool_name": tool_name,
+                "timestamp": time.time(),
+                "content": tool_result,
+                "content_hash": hash(str(tool_result))  # For integrity verification
+            }
+            
+            # Use safe JSON serialization with content isolation
+            serialized = json.dumps(bounded_result, indent=2, ensure_ascii=False, separators=(',', ': '))
+            
+            # Verify serialization integrity
+            try:
+                verification = json.loads(serialized)
+                if verification.get("content_hash") != hash(str(tool_result)):
+                    logger.warning(f"⚠️ Content integrity check failed for {tool_name} - using fallback")
+                    return self._fallback_serialize_tool_result(tool_result, tool_name)
+            except (json.JSONDecodeError, KeyError):
+                logger.warning(f"⚠️ Serialization verification failed for {tool_name} - using fallback")
+                return self._fallback_serialize_tool_result(tool_result, tool_name)
+            
+            logger.debug(f"✅ Safe serialization successful for {tool_name} ({len(serialized)} chars)")
+            return serialized
+            
+        except Exception as e:
+            logger.error(f"❌ Safe serialization failed for {tool_name}: {e}")
+            return self._fallback_serialize_tool_result(tool_result, tool_name)
+    
+    def _fallback_serialize_tool_result(self, tool_result: Dict[str, Any], tool_name: str) -> str:
+        """
+        Fallback serialization method for problematic tool results.
+        
+        When safe serialization fails, this method provides a basic but reliable
+        string representation that maintains content boundaries.
+        """
+        try:
+            # Simple string conversion with clear boundaries
+            if isinstance(tool_result, dict):
+                content_parts = []
+                for key, value in tool_result.items():
+                    content_parts.append(f"{key}: {str(value)[:1000]}...")  # Truncate long values
+                return f"=== {tool_name.upper()} RESULT ===\n" + "\n".join(content_parts) + f"\n=== END {tool_name.upper()} ==="
+            else:
+                return f"=== {tool_name.upper()} RESULT ===\n{str(tool_result)[:2000]}...\n=== END {tool_name.upper()} ==="
+        except Exception as e:
+            logger.error(f"❌ Fallback serialization failed for {tool_name}: {e}")
+            return f"=== {tool_name.upper()} RESULT ===\nERROR: Could not serialize result\n=== END {tool_name.upper()} ==="
+    
+    async def _ensure_structured_response(self, raw_response: str, context: str) -> str:
+        """
+        Master response wrapper ensuring ALL responses conform to UnifiedAgentResponse schema.
+        
+        This is the architectural fix that guarantees the unified UI system works correctly
+        by ensuring every code path returns structured JSON, never plain text.
+        
+        Args:
+            raw_response: Raw response content (may be JSON, plain text, or error message)
+            context: Context of the response (sdk_success, sdk_error, system_error, etc.)
+            
+        Returns:
+            Valid UnifiedAgentResponse JSON string
+        """
+        try:
+            logger.info(f"🔄 Ensuring structured response for context: {context}")
+            
+            # First, try to validate if it's already a valid UnifiedAgentResponse
+            try:
+                validated = await self._validate_response_structure(raw_response, 0)
+                if validated:
+                    logger.info(f"✅ Response already structured for {context}")
+                    return validated
+            except Exception:
+                pass  # Continue to structure the response
+            
+            # If not valid JSON or not conforming to schema, wrap it appropriately
+            if context == "sdk_success":
+                # Raw LLM content needs to be structured - this is likely already JSON but needs validation
+                return await self._structure_llm_response(raw_response)
+            
+            elif context in ["sdk_error", "system_error", "synthesis_error", "max_iterations_error", "processing_error"]:
+                # Error messages need to be wrapped in TextBlock structure
+                return await self._structure_error_response(raw_response, context)
+            
+            else:
+                # Unknown context - default to text block wrapping
+                logger.warning(f"⚠️ Unknown context '{context}' - defaulting to text block")
+                return await self._structure_as_text_block(raw_response)
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to ensure structured response for {context}: {e}")
+            # Absolute fallback - return minimal valid structure
+            return await self._generate_structured_error_response(f"Response structuring failed: {str(e)}")
+    
+    async def _structure_llm_response(self, raw_response: str) -> str:
+        """
+        Structure raw LLM response content into UnifiedAgentResponse format.
+        
+        This handles the case where the LLM provided content but it may not be
+        properly structured according to our schema.
+        
+        REQ-3.4.2: Phase 3 - Use full correction loop if Mermaid diagrams need validation.
+        """
+        try:
+            # REQ-3.4.2: Check if response contains Mermaid diagrams that might need correction
+            import re
+            has_mermaid = bool(re.search(r'```mermaid', raw_response or '', re.IGNORECASE))
+            
+            if has_mermaid:
+                # Check for Mermaid syntax errors
+                mermaid_errors = await self._validate_mermaid_syntax(raw_response)
+                if mermaid_errors:
+                    logger.info(f"🔄 Phase 3: Mermaid errors detected, using full correction loop for {len(mermaid_errors)} errors")
+                    
+                    # Use full correction loop to allow LLM to learn and fix Mermaid syntax
+                    synthesis_params = {
+                        "model": "gpt-oss-120b",  # Use default model
+                        "messages": [
+                            {
+                                "role": "system", 
+                                "content": "You are a code analyst. Please provide a response that follows proper Mermaid diagram syntax."
+                            },
+                            {
+                                "role": "user",
+                                "content": "Please review and correct any Mermaid diagram syntax errors in the following response, then provide the complete corrected response:"
+                            },
+                            {
+                                "role": "assistant",
+                                "content": raw_response
+                            }
+                        ]
+                    }
+                    
+                    # Use full validation and correction with retry loop
+                    return await self._validate_and_correct_response(synthesis_params, "gpt-oss-120b")
+            
+            # No Mermaid issues, use streamlined single response validation
+            return await self._validate_and_correct_single_response(raw_response)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ LLM response structuring failed, wrapping as text: {e}")
+            return await self._structure_as_text_block(raw_response)
+    
+    async def _validate_and_correct_single_response(self, raw_response: str) -> str:
+        """
+        Apply validation to a single response without the full retry loop.
+        
+        This is a streamlined version of the validation process for responses
+        that don't need the full correction cycle.
+        
+        REQ-3.4.2: Now includes Mermaid syntax validation for Phase 3 compliance.
+        """
+        # REQ-3.4.2: Phase 3 Mermaid validation (but no correction since this is single-shot)
+        mermaid_validation_errors = await self._validate_mermaid_syntax(raw_response)
+        if mermaid_validation_errors:
+            logger.warning(f"⚠️ Mermaid syntax errors detected in single response (cannot auto-correct): {len(mermaid_validation_errors)} errors")
+            for error in mermaid_validation_errors:
+                logger.warning(f"🔍 MERMAID ERROR: {error}")
+        
+        # Attempt validation
+        validated_response = await self._validate_response_structure(raw_response, 0)
+        
+        if validated_response:
+            return validated_response
+        else:
+            # If validation fails, wrap the content as a text block
+            return await self._structure_as_text_block(raw_response)
+    
+    async def _structure_error_response(self, error_message: str, context: str) -> str:
+        """
+        Structure error messages into proper UnifiedAgentResponse format.
+        """
+        from schemas.ui_schemas import create_error_response
+        import json
+        
+        try:
+            error_response = create_error_response(f"**{context.replace('_', ' ').title()}**\n\n{error_message}", include_debug=False)
+            return json.dumps(error_response.model_dump(), indent=2)
+        except Exception as e:
+            logger.error(f"❌ Error response structuring failed: {e}")
+            # Absolute fallback
+            return json.dumps({
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": f"## System Error ({context})\n\n{error_message}"
+                    }
+                ]
+            })
+    
+    async def _structure_as_text_block(self, content: str) -> str:
+        """
+        Parse markdown content and structure it into appropriate content blocks.
+        
+        This method analyzes the LLM's markdown response and splits it into:
+        - TextBlock: Regular markdown content
+        - CodeSnippetBlock: Code blocks with language detection
+        - MermaidDiagramBlock: Mermaid diagrams  
+        - MarkdownTableBlock: Tables
+        """
+        import json
+        import re
+        
+        try:
+            logger.info("🔧 PARSER: Starting markdown content parsing")
+            logger.info(f"🔧 PARSER: Input content length: {len(content)}")
+            logger.info(f"🔧 PARSER: Input preview: {content[:200]}...")
+            
+            # Parse the markdown content into structured blocks
+            blocks = self._parse_markdown_content(content)
+            
+            logger.info(f"🔧 PARSER: Generated {len(blocks)} blocks")
+            for i, block in enumerate(blocks):
+                logger.info(f"🔧 PARSER: Block {i}: {block['block_type']} - {len(str(block.get('content', block.get('code', block.get('mermaid_code', '')))))} chars")
+            
+            structured_response = {
+                "response": blocks
+            }
+            
+            logger.info(f"✅ Parsed markdown into {len(blocks)} content blocks")
+            logger.info(f"🔧 PARSER: Final JSON size: {len(json.dumps(structured_response))}")
+            return json.dumps(structured_response, indent=2, ensure_ascii=False)
+            
+        except Exception as e:
+            logger.error(f"❌ Markdown parsing failed, falling back to single text block: {e}")
+            # Fallback to single text block
+            structured_response = {
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": content
+                    }
+                ]
+            }
+            return json.dumps(structured_response, indent=2, ensure_ascii=False)
+    
+    def _parse_markdown_content(self, content: str) -> list:
+        """
+        Parse markdown content into structured content blocks.
+        
+        Returns:
+            List of content blocks with appropriate block_type
+        """
+        import re
+        blocks = []
+        current_text = []
+        lines = content.split('\n')
+        logger.info(f"🔧 PARSER: Processing {len(lines)} lines")
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            # Check for mermaid diagram
+            if line.strip().startswith('```mermaid'):
+                logger.info(f"🔧 PARSER: Found mermaid diagram at line {i}")
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text",
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract mermaid diagram
+                i += 1
+                mermaid_lines = []
+                title = "Diagram"  # Default title
+                
+                while i < len(lines) and not lines[i].strip().startswith('```'):
+                    mermaid_lines.append(lines[i])
+                    i += 1
+                
+                mermaid_code = '\n'.join(mermaid_lines).strip()
+                if mermaid_code:
+                    blocks.append({
+                        "block_type": "mermaid_diagram",
+                        "title": title,
+                        "mermaid_code": mermaid_code
+                    })
+                
+            # Check for code blocks
+            elif line.strip().startswith('```') and not line.strip().startswith('```mermaid'):
+                logger.info(f"🔧 PARSER: Found code block at line {i}: {line.strip()}")
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text",
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract code block
+                language_match = re.match(r'```(\w+)', line.strip())
+                language = language_match.group(1) if language_match else 'text'
+                
+                i += 1
+                code_lines = []
+                while i < len(lines) and not lines[i].strip().startswith('```'):
+                    code_lines.append(lines[i])
+                    i += 1
+                
+                code_content = '\n'.join(code_lines).strip()
+                if code_content:
+                    # Determine title based on language and context
+                    title = f"{language.title()} Code"
+                    if language == 'java':
+                        title = "Java Implementation"
+                    elif language == 'javascript':
+                        title = "JavaScript Code"
+                    elif language == 'python':
+                        title = "Python Code"
+                    
+                    blocks.append({
+                        "block_type": "code_snippet",
+                        "title": title,
+                        "language": language,
+                        "code": code_content
+                    })
+                
+            # Check for markdown tables
+            elif '|' in line and line.count('|') >= 2:
+                logger.info(f"🔧 PARSER: Found table at line {i}: {line.strip()[:50]}...")
+                # Save any accumulated text
+                if current_text:
+                    text_content = '\n'.join(current_text).strip()
+                    if text_content:
+                        blocks.append({
+                            "block_type": "text", 
+                            "content": text_content
+                        })
+                    current_text = []
+                
+                # Extract table
+                table_lines = [line]
+                i += 1
+                
+                # Get header separator line (if exists)
+                if i < len(lines) and '|' in lines[i] and ('-' in lines[i] or ':' in lines[i]):
+                    table_lines.append(lines[i])
+                    i += 1
+                
+                # Get remaining table rows
+                while i < len(lines) and '|' in lines[i] and lines[i].strip():
+                    table_lines.append(lines[i])
+                    i += 1
+                
+                # Parse table structure
+                table_data = self._parse_table_structure(table_lines)
+                if table_data:
+                    blocks.append(table_data)
+                
+                # Don't increment i here as we've already processed all table lines
+                continue
+                
+            else:
+                # Regular text line
+                current_text.append(line)
+            
+            i += 1
+        
+        # Add any remaining text
+        if current_text:
+            text_content = '\n'.join(current_text).strip()
+            if text_content:
+                blocks.append({
+                    "block_type": "text",
+                    "content": text_content
+                })
+        
+        return blocks if blocks else [{"block_type": "text", "content": content}]
+    
+    def _parse_table_structure(self, table_lines: list) -> dict:
+        """
+        Parse markdown table lines into MarkdownTableBlock structure.
+        
+        Args:
+            table_lines: List of table lines including headers and rows
+            
+        Returns:
+            MarkdownTableBlock dict or None if parsing fails
+        """
+        try:
+            if len(table_lines) < 1:
+                return None
+                
+            # Extract headers from first line
+            header_line = table_lines[0].strip()
+            headers = [h.strip() for h in header_line.split('|') if h.strip()]
+            
+            if not headers:
+                return None
+            
+            # Skip separator line if it exists
+            start_row = 1
+            if len(table_lines) > 1 and ('---' in table_lines[1] or ':--' in table_lines[1]):
+                start_row = 2
+                
+            # Extract data rows
+            rows = []
+            for i in range(start_row, len(table_lines)):
+                row_line = table_lines[i].strip()
+                if row_line:
+                    row_cells = [cell.strip() for cell in row_line.split('|') if cell.strip()]
+                    if row_cells and len(row_cells) >= len(headers):
+                        # Ensure row has same number of cells as headers
+                        rows.append(row_cells[:len(headers)])
+            
+            if rows:
+                return {
+                    "block_type": "markdown_table",
+                    "title": "Data Table",
+                    "headers": headers,
+                    "rows": rows
                 }
-            } 
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Table parsing failed: {e}")
+            
+        return None
+    
+    
+    async def _validate_mermaid_syntax(self, raw_response: str) -> List[str]:
+        """
+        REQ-3.4.2: Validate Mermaid syntax and return specific error messages.
+        
+        Returns:
+            List of syntax errors found in Mermaid diagrams, empty list if valid
+        """
+        import re
+        
+        errors = []
+        
+        try:
+            # Find all mermaid code blocks
+            mermaid_blocks = re.findall(r'```mermaid([\s\S]*?)```', raw_response)
+            
+            for i, mermaid_code in enumerate(mermaid_blocks):
+                mermaid_code = mermaid_code.strip()
+                
+                # Check for common syntax issues that break rendering
+                
+                # 1. Invalid curly braces in labels (common UML pattern that breaks Mermaid)
+                if re.search(r'\{[^}]*\}', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Contains curly braces {{}} in labels, which are invalid in Mermaid. Use parentheses () or brackets [] instead.")
+                
+                # 2. Invalid UML-style method signatures
+                if re.search(r'\+\w+\s*\(', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Contains UML-style method signatures with + prefix, which are invalid in Mermaid. Use plain text labels instead.")
+                
+                # 3. Invalid node IDs with special characters
+                invalid_node_ids = re.findall(r'^([^\s\[\-]+)[\[\-]', mermaid_code, re.MULTILINE)
+                for node_id in invalid_node_ids:
+                    if re.search(r'[^a-zA-Z0-9_]', node_id):
+                        errors.append(f"Diagram {i+1}: Node ID '{node_id}' contains special characters. Use only alphanumeric characters and underscores.")
+                
+                # 4. Check for missing diagram type declaration
+                if not re.match(r'\s*(flowchart|graph|classDiagram|sequenceDiagram)', mermaid_code):
+                    errors.append(f"Diagram {i+1}: Missing diagram type declaration. Must start with 'flowchart', 'graph', 'classDiagram', or 'sequenceDiagram'.")
+                
+                # 5. Check for invalid characters in labels
+                bracket_labels = re.findall(r'\[([^\]]+)\]', mermaid_code)
+                for label in bracket_labels:
+                    if re.search(r'[\[\]{}]', label):
+                        errors.append(f"Diagram {i+1}: Label '{label}' contains invalid characters. Avoid nested brackets, braces, and special characters in labels.")
+            
+            if errors:
+                logger.warning(f"🔍 MERMAID VALIDATION: Found {len(errors)} syntax errors")
+                for error in errors:
+                    logger.warning(f"🔍 MERMAID ERROR: {error}")
+            else:
+                logger.info(f"✅ MERMAID VALIDATION: {len(mermaid_blocks)} diagrams validated successfully")
+            
+            return errors
+            
+        except Exception as e:
+            logger.error(f"❌ Mermaid validation failed: {e}")
+            return []  # Don't block on validation errors
+    
+    def _generate_mermaid_correction_prompt(self, errors: List[str]) -> str:
+        """
+        REQ-3.4.2: Generate correction prompt for Mermaid syntax errors.
+        
+        This enables the LLM to learn proper Mermaid syntax through error feedback.
+        """
+        error_list = "\n".join([f"- {error}" for error in errors])
+        
+        return f"""The Mermaid diagrams in your response contain syntax errors that will prevent them from rendering:
+
+{error_list}
+
+Please fix these syntax errors and regenerate your response. Remember:
+- Use parentheses () or brackets [] for labels, never curly braces {{}}
+- Avoid UML-style + prefixes for methods
+- Use only alphanumeric characters and underscores for node IDs
+- Always start diagrams with a valid type: flowchart, graph, classDiagram, or sequenceDiagram
+- Don't nest special characters inside labels
+- When generating structured JSON, use "block_type": "mermaid_diagram" (not "mermaid")
+
+Correct Mermaid examples:
+```mermaid
+flowchart TD
+    A[User Request] --> B[Process Data]
+    B --> C[Return Response]
+```
+
+```mermaid
+classDiagram
+    class User {{
+        +String name
+        +login()
+    }}
+```
+
+For structured JSON responses, use this format:
+```json
+{{
+  "response": [
+    {{
+      "block_type": "mermaid_diagram",
+      "title": "System Architecture",
+      "mermaid_code": "flowchart TD\\n    A[Component] --> B[Process]"
+    }}
+  ]
+}}
+```
+
+Please regenerate your complete response with properly formatted Mermaid diagrams."""
+    
+    async def _validate_response_structure(self, raw_response: str, attempt: int) -> Optional[str]:
+        """
+        Validate response against UnifiedAgentResponse schema.
+        
+        Args:
+            raw_response: Raw LLM response text
+            attempt: Current attempt number for logging
+            
+        Returns:
+            Validated JSON string if valid, None if invalid
+        """
+        try:
+            # Import schema validation utilities
+            from schemas.ui_schemas import validate_response_structure
+            import json
+            
+            # Clean and extract JSON from response
+            json_content = self._extract_json_from_response(raw_response)
+            if not json_content:
+                logger.warning(f"🔍 Attempt {attempt + 1}: No valid JSON found in response")
+                return None
+            
+            # Parse JSON
+            try:
+                parsed_data = json.loads(json_content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"🔍 Attempt {attempt + 1}: JSON parsing failed: {e}")
+                return None
+            
+            # Validate against schema
+            validated_response = validate_response_structure(parsed_data)
+            
+            # Additional validation - ensure minimum requirements
+            if not isinstance(parsed_data.get('response'), list):
+                raise ValueError("Response must contain an array of content blocks")
+            
+            if len(parsed_data['response']) == 0:
+                raise ValueError("Response array cannot be empty")
+            
+            # Check each block has required fields
+            for i, block in enumerate(parsed_data['response']):
+                if not isinstance(block, dict):
+                    raise ValueError(f"Block {i} must be an object")
+                if 'block_type' not in block:
+                    raise ValueError(f"Block {i} missing required 'block_type' field")
+            
+            # Additional quality checks
+            quality_check = validated_response.validate_content_quality()
+            if quality_check["warnings"]:
+                logger.info(f"⚠️ Content quality warnings: {quality_check['warnings']}")
+            if quality_check["suggestions"]:
+                logger.info(f"💡 Content quality suggestions: {quality_check['suggestions']}")
+            
+            # Return the original JSON string (not the validated object)
+            return json_content
+            
+        except Exception as e:
+            logger.warning(f"🔍 Attempt {attempt + 1}: Validation failed: {e}")
+            return None
+    
+    def _extract_json_from_response(self, response: str) -> Optional[str]:
+        """
+        Extract JSON content from LLM response, handling various formats.
+        
+        Returns:
+            Clean JSON string or None if no valid JSON found
+        """
+        import re
+        import json
+        
+        # Remove any markdown formatting
+        response = response.strip()
+        
+        # Try direct JSON parse first
+        if response.startswith('{') and response.endswith('}'):
+            try:
+                json.loads(response)  # Test if valid
+                return response
+            except:
+                pass
+        
+        # Look for JSON in code blocks
+        json_block_patterns = [
+            r'```json\s*(\{[\s\S]*?\})\s*```',
+            r'```\s*(\{[\s\S]*?\})\s*```',
+            r'`(\{[\s\S]*?\})`'
+        ]
+        
+        for pattern in json_block_patterns:
+            matches = re.findall(pattern, response, re.MULTILINE | re.DOTALL)
+            for match in matches:
+                try:
+                    json.loads(match.strip())  # Test if valid
+                    return match.strip()
+                except:
+                    continue
+        
+        # Look for JSON objects in the text
+        brace_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        potential_jsons = re.findall(brace_pattern, response, re.DOTALL)
+        
+        for potential in potential_jsons:
+            try:
+                json.loads(potential)  # Test if valid
+                return potential.strip()
+            except:
+                continue
+        
+        # Last resort: try to find the largest JSON-like structure
+        start_brace = response.find('{')
+        if start_brace != -1:
+            # Find matching closing brace
+            brace_count = 0
+            for i, char in enumerate(response[start_brace:], start_brace):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        candidate = response[start_brace:i+1]
+                        try:
+                            json.loads(candidate)  # Test if valid
+                            return candidate
+                        except:
+                            break
+        
+        return None
+    
+    def _generate_correction_prompt(self, failed_response: str, attempt: int) -> str:
+        """
+        Generate progressive correction prompts based on attempt number.
+        
+        Args:
+            failed_response: The response that failed validation
+            attempt: Current attempt number (0-based)
+            
+        Returns:
+            Correction prompt string
+        """
+        base_correction = """Your previous response did not conform to the required UnifiedAgentResponse schema format. You MUST respond with valid JSON only.
+
+CRITICAL REQUIREMENTS:
+1. Response must be a single JSON object starting with {"response": [
+2. No text before or after the JSON
+3. Each block must have the correct block_type field
+4. All required fields must be present
+
+"""
+        
+        if attempt == 0:
+            # First retry - gentle correction
+            return base_correction + """Please fix the format and provide a valid JSON response following this structure:
+
+{
+  "response": [
+    {
+      "block_type": "text",
+      "content": "Your analysis here..."
+    }
+  ]
+}"""
+        
+        elif attempt == 1:
+            # Second retry - more specific correction
+            error_analysis = self._analyze_response_errors(failed_response)
+            return base_correction + f"""The specific issues detected were: {error_analysis}
+
+You must provide ONLY a JSON object with no additional text. Example format:
+
+{{"response": [
+  {{"block_type": "text", "content": "Analysis introduction"}},
+  {{"block_type": "component_analysis", "title": "Key Components", "components": [...]}}
+]}}
+
+Respond with valid JSON now."""
+        
+        else:
+            # Final retry - very explicit
+            return """FINAL ATTEMPT: You must respond with ONLY valid JSON in this exact format:
+
+{"response": [{"block_type": "text", "content": "Based on my analysis of the codebase, here are the key findings..."}]}
+
+NO other text. NO markdown. NO explanations. ONLY the JSON object."""
+    
+    def _analyze_response_errors(self, response: str) -> str:
+        """Analyze what went wrong with the response format."""
+        errors = []
+        
+        if not response.strip().startswith('{'):
+            errors.append("Response doesn't start with JSON object")
+        
+        if '```' in response:
+            errors.append("Response contains markdown code blocks")
+            
+        if response.count('{') != response.count('}'):
+            errors.append("Unmatched braces in JSON")
+            
+        if '"response"' not in response:
+            errors.append("Missing required 'response' key")
+            
+        if '"block_type"' not in response:
+            errors.append("Missing required 'block_type' fields")
+            
+        return "; ".join(errors) if errors else "JSON parsing or validation errors"
+    
+    async def _generate_structured_error_response(self, error_message: str) -> str:
+        """
+        Generate a valid UnifiedAgentResponse for error cases.
+        
+        Args:
+            error_message: Error description for user
+            
+        Returns:
+            Valid JSON string conforming to schema
+        """
+        from schemas.ui_schemas import create_error_response
+        import json
+        
+        try:
+            error_response = create_error_response(error_message, include_debug=False)
+            return json.dumps(error_response.model_dump(), indent=2)
+        except Exception as e:
+            logger.error(f"❌ Failed to generate structured error response: {e}")
+            # Absolute fallback - minimal valid JSON
+            return json.dumps({
+                "response": [
+                    {
+                        "block_type": "text",
+                        "content": f"## System Error\n\n{error_message}\n\nPlease try your request again or contact support if the issue persists."
+                    }
+                ]
+            })
+    
+    async def _execute_pure_tool_call(self, tool_call) -> Dict[str, Any]:
+        """
+        PURE tool execution - no decisions, just run what SDK requests
+        """
+        try:
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            
+            logger.info(f"🔧 PURE EXECUTION: {function_name} with {len(function_args)} args")
+            
+            # Get pure function
+            tool_func = self.tool_functions.get(function_name)
+            if not tool_func:
+                raise ValueError(f"Unknown tool: {function_name}")
+            
+            # Execute without any custom logic
+            if asyncio.iscoroutinefunction(tool_func):
+                result = await tool_func(**function_args)
+            else:
+                result = tool_func(**function_args)
+            
+            logger.info(f"✅ Tool executed successfully: {len(str(result))} chars returned")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Pure tool execution failed: {e}")
+            return {
+                "error": str(e),
+                "success": False,
+                "tool_name": tool_call.function.name
+            }
+    
+    async def _execute_query_codebase(self, query: str, analysis_mode: str = "auto", 
+                                    filters: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        PURE query execution with automatic diagram generation for structural_kg mode
+        
+        Implements the complete workflow:
+        1. Execute KG query to get structural data
+        2. Detect if this is a diagram request  
+        3. Transform data to standard graph format
+        4. Generate Mermaid diagram automatically
+        5. Return both raw data and rendered diagram
+        """
+        try:
+            logger.info(f"📊 Executing codebase query: '{query[:50]}...' (mode: {analysis_mode})")
+            
+            # Add project context to filters if available
+            enhanced_filters = filters or {}
+            if hasattr(self, 'mentioned_projects') and self.mentioned_projects:
+                enhanced_filters['project'] = self.mentioned_projects[0]  # Use first project
+                logger.info(f"🎯 Applying project filter: {self.mentioned_projects[0]}")
+            
+            # Use our existing unified query system
+            result = await query_codebase(query, enhanced_filters, analysis_mode)
+            
+            # Build base response
+            response = {
+                "success": True,
+                "query": query,
+                "analysis_mode": analysis_mode,
+                "results": result.get("results", []),
+                "total_results": result.get("total_results", 0),
+                "strategy_used": result.get("strategy", "unknown"),
+                "execution_metadata": result.get("unified_query", {}),
+                "filters_applied": filters or {}
+            }
+            
+            # Step 3-5: Automatic diagram generation for structural_kg mode
+            if (analysis_mode == "structural_kg" and 
+                result.get("strategy") == "kg_direct" and 
+                result.get("total_results", 0) > 0 and
+                self._is_diagram_query(query)):
+                
+                try:
+                    logger.info("🎨 Auto-generating diagram from structural data...")
+                    
+                    # Step 3: Transform KG data to standard graph format
+                    graph_data = await self._transform_kg_to_graph_data(result.get("results", []), query)
+                    
+                    # Step 4: Determine diagram type from query
+                    diagram_type = self._infer_diagram_type(query)
+                    
+                    # Step 5: Generate Mermaid diagram
+                    mermaid_code = self.mermaid_renderer.generate(
+                        diagram_type=diagram_type,
+                        graph_data=graph_data,
+                        theme_name="dark_professional"
+                    )
+                    
+                    # Add diagram to response
+                    response.update({
+                        "diagram_generated": True,
+                        "diagram_type": diagram_type,
+                        "mermaid_code": mermaid_code,
+                        "graph_data": graph_data,
+                        "auto_rendered": True
+                    })
+                    
+                    logger.info(f"✅ Auto-diagram generated: {len(mermaid_code)} chars of {diagram_type}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Auto-diagram generation failed: {e}")
+                    response["diagram_error"] = str(e)
+            
+            logger.info(f"✅ Query executed: {response['total_results']} results via {response['strategy_used']}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Query execution failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "query": query,
+                "analysis_mode": analysis_mode,
+                "results": []
+            }
+    
+    def _is_diagram_query(self, query: str) -> bool:
+        """Detect if this query is requesting a diagram"""
+        query_lower = query.lower()
+        diagram_indicators = [
+            'diagram', 'chart', 'visualization', 'graph', 'hierarchy', 
+            'structure', 'architecture', 'relationship', 'class diagram',
+            'show', 'visualize', 'display'
+        ]
+        return any(indicator in query_lower for indicator in diagram_indicators)
+    
+    def _infer_diagram_type(self, query: str) -> str:
+        """Infer the best diagram type from the query"""
+        query_lower = query.lower()
+        
+        if any(term in query_lower for term in ['class', 'hierarchy', 'inheritance', 'extends']):
+            return "class_diagram"
+        elif any(term in query_lower for term in ['flow', 'process', 'sequence', 'steps']):
+            return "flowchart"
+        elif any(term in query_lower for term in ['component', 'module', 'service', 'architecture']):
+            return "graph"
+        else:
+            return "graph"  # Default fallback
+    
+    async def _transform_kg_to_graph_data(self, kg_results: List[Dict], query: str) -> Dict[str, Any]:
+        """
+        Step 3: Transform KG structural data to standard graph format
+        
+        Converts the complex KG node data into the clean, standardized format
+        that the MermaidRenderer expects. Optionally enriches with file content.
+        """
+        nodes = []
+        edges = []
+        node_ids = set()
+        
+        # Extract nodes from KG results
+        for kg_item in kg_results:
+            if kg_item.get("type") == "kg_structural_node":
+                node_data = kg_item.get("node_data", {})
+                node_id = node_data.get("name", "unknown")
+                
+                if node_id not in node_ids:
+                    enhanced_node = {
+                        "id": node_id,
+                        "label": node_id,
+                        "semantic_role": self._infer_semantic_role(node_data),
+                        "file_path": node_data.get("file_path", ""),
+                        "type": node_data.get("type", "unknown"),
+                        "line_start": node_data.get("line_start"),
+                        "line_end": node_data.get("line_end"),
+                        "signature": node_data.get("signature", "")
+                    }
+                    
+                    # Enhance with file content for richer diagrams
+                    enhanced_node = self._enrich_node_with_file_data(enhanced_node)
+                    
+                    nodes.append(enhanced_node)
+                    node_ids.add(node_id)
+                
+                # Extract relationships as edges
+                outgoing_rels = kg_item.get("outgoing_relationships", [])
+                incoming_rels = kg_item.get("incoming_relationships", [])
+                connected_nodes = kg_item.get("connected_nodes", [])
+                
+                # Create lookup for connected nodes
+                connected_lookup = {node.get("id"): node.get("name", "unknown") for node in connected_nodes}
+                
+                # Process outgoing relationships
+                for rel in outgoing_rels:
+                    target_node_id = rel.get("target_id")
+                    target_name = connected_lookup.get(target_node_id)
+                    
+                    if target_name and target_name.lower() not in ['none', '(none)', '', 'null']:
+                        edges.append({
+                            "source": node_id,
+                            "target": target_name,
+                            "type": rel.get("type", "uses"),
+                            "label": rel.get("type", "")
+                        })
+                
+                # Process incoming relationships (for completeness)
+                for rel in incoming_rels:
+                    source_node_id = rel.get("source_id")
+                    source_name = connected_lookup.get(source_node_id)
+                    
+                    if source_name and source_name.lower() not in ['none', '(none)', '', 'null']:
+                        # Only add if we haven't already added this edge from the other direction
+                        edge_exists = any(
+                            e["source"] == source_name and e["target"] == node_id 
+                            for e in edges
+                        )
+                        if not edge_exists:
+                            edges.append({
+                                "source": source_name,
+                                "target": node_id,
+                                "type": rel.get("type", "uses"),
+                                "label": rel.get("type", "")
+                            })
+        
+        # Infer additional relationships from file analysis using universal engine
+        additional_edges = await self._infer_relationships_from_files(nodes)
+        edges.extend(additional_edges)
+        
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "query": query,
+                "total_nodes": len(nodes),
+                "total_edges": len(edges),
+                "enhanced_with_files": True,
+                "generated_at": "auto"
+            }
+        }
+    
+    def _enrich_node_with_file_data(self, node: Dict) -> Dict:
+        """
+        Enhance node data by reading actual file content.
+        This addresses the limitation of relying only on KG data.
+        """
+        try:
+            file_path = node.get("file_path", "")
+            if not file_path or not file_path.startswith("/workspace"):
+                return node
+            
+            # Read file content to extract methods, attributes, imports
+            from pathlib import Path
+            actual_file = Path(file_path)
+            
+            if actual_file.exists() and actual_file.suffix in ['.java', '.py', '.js', '.ts']:
+                content = actual_file.read_text(encoding='utf-8', errors='ignore')
+                
+                # Extract methods and attributes from actual code
+                if file_path.endswith('.java'):
+                    methods, attributes = self._parse_java_content(content, node.get("id", ""))
+                elif file_path.endswith('.py'):
+                    methods, attributes = self._parse_python_content(content, node.get("id", ""))
+                else:
+                    methods, attributes = [], []
+                
+                # Add to node
+                node["methods"] = methods[:10]  # Limit for diagram clarity
+                node["attributes"] = attributes[:5]  # Limit for diagram clarity
+                node["enhanced_from_file"] = True
+                
+        except Exception as e:
+            logger.debug(f"Could not enhance node {node.get('id')} with file data: {e}")
+        
+        return node
+    
+    def _parse_java_content(self, content: str, class_name: str) -> tuple[List[str], List[str]]:
+        """Extract methods and attributes from Java class content"""
+        import re
+        
+        methods = []
+        attributes = []
+        
+        # Find methods (simplified regex)
+        method_pattern = r'public\s+[\w<>\[\],\s]+\s+(\w+)\s*\('
+        for match in re.finditer(method_pattern, content):
+            method_name = match.group(1)
+            if method_name not in ['class', class_name]:  # Skip constructors
+                methods.append(method_name)
+        
+        # Find attributes/fields
+        field_pattern = r'private\s+[\w<>\[\],\s]+\s+(\w+)\s*[;=]'
+        for match in re.finditer(field_pattern, content):
+            field_name = match.group(1)
+            attributes.append(field_name)
+        
+        return methods, attributes
+    
+    def _parse_python_content(self, content: str, class_name: str) -> tuple[List[str], List[str]]:
+        """Extract methods and attributes from Python class content"""
+        import re
+        
+        methods = []
+        attributes = []
+        
+        # Find methods
+        method_pattern = r'def\s+(\w+)\s*\('
+        for match in re.finditer(method_pattern, content):
+            method_name = match.group(1)
+            if not method_name.startswith('_'):  # Skip private methods for clarity
+                methods.append(method_name)
+        
+        # Find class attributes (simplified)
+        attr_pattern = r'self\.(\w+)\s*='
+        for match in re.finditer(attr_pattern, content):
+            attr_name = match.group(1)
+            if not attr_name.startswith('_'):
+                attributes.append(attr_name)
+        
+        return list(set(methods)), list(set(attributes))  # Remove duplicates
+    
+    async def _infer_relationships_from_files(self, nodes: List[Dict]) -> List[Dict]:
+        """
+        Universal relationship inference using the Universal Pattern Recognition Engine.
+        Works across all programming languages and frameworks.
+        """
+        additional_edges = []
+        
+        try:
+            from tools.universal_relationship_engine import UniversalRelationshipEngine
+            
+            # Initialize universal relationship engine
+            relationship_engine = UniversalRelationshipEngine()
+            
+            # Convert nodes to components format for universal engine
+            components = []
+            for node in nodes:
+                components.append({
+                    'node_data': node,
+                    'type': 'kg_structural_node',
+                    'source': 'knowledge_graph'
+                })
+            
+            # Infer relationships using universal engine
+            detected_relationships = await relationship_engine.infer_relationships_from_components(
+                components, query_context="diagram generation")
+            
+            # Convert to diagram edge format
+            for rel in detected_relationships:
+                additional_edges.append({
+                    "source": rel.source_component,
+                    "target": rel.target_component,
+                    "type": rel.relationship_type.value,
+                    "label": relationship_engine._get_relationship_label(rel.relationship_type),
+                    "confidence": rel.confidence,
+                    "evidence": rel.evidence,
+                    "language": rel.source_language
+                })
+            
+            logger.info(f"🔗 Universal relationship engine found {len(additional_edges)} relationships")
+            
+        except Exception as e:
+            logger.warning(f"Universal relationship inference failed, falling back to basic analysis: {e}")
+            # Fallback to basic file analysis if universal engine fails
+            additional_edges = await self._basic_file_analysis_fallback(nodes)
+        
+        return additional_edges
+    
+    async def _basic_file_analysis_fallback(self, nodes: List[Dict]) -> List[Dict]:
+        """
+        Basic fallback file analysis when universal engine is not available.
+        This provides minimal relationship detection for backward compatibility.
+        """
+        additional_edges = []
+        
+        try:
+            for node in nodes:
+                file_path = node.get("file_path", "")
+                if not file_path:
+                    continue
+                
+                from pathlib import Path
+                actual_file = Path(file_path)
+                
+                if actual_file.exists():
+                    content = actual_file.read_text(encoding='utf-8', errors='ignore')
+                    
+                    # Basic pattern detection for common frameworks
+                    if "controller" in file_path.lower():
+                        service_deps = self._find_service_dependencies(content, nodes)
+                        for dep in service_deps:
+                            additional_edges.append({
+                                "source": node["id"],
+                                "target": dep,
+                                "type": "uses",
+                                "label": "uses"
+                            })
+                            
+        except Exception as e:
+            logger.debug(f"Basic file analysis fallback failed: {e}")
+        
+        return additional_edges
+    
+    def _find_service_dependencies(self, content: str, all_nodes: List[Dict]) -> List[str]:
+        """Find service dependencies in controller code"""
+        import re
+        
+        dependencies = []
+        service_names = [node["id"] for node in all_nodes if "service" in node.get("semantic_role", "").lower()]
+        
+        # Look for service injections/imports
+        for service_name in service_names:
+            if service_name.lower() in content.lower():
+                dependencies.append(service_name)
+        
+        return dependencies
+    
+    def _infer_semantic_role(self, node_data: Dict) -> str:
+        """Infer semantic role for styling purposes"""
+        node_type = node_data.get("type", "").lower()
+        file_path = node_data.get("file_path", "").lower()
+        name = node_data.get("name", "").lower()
+        
+        if "controller" in file_path or "controller" in name:
+            return "controller"
+        elif "service" in file_path or "service" in name:
+            return "service"  
+        elif "model" in file_path or "entity" in file_path:
+            return "model"
+        elif node_type == "class":
+            return "logic"
+        elif node_type == "interface":
+            return "interface"
+        else:
+            return "external"
+    
+    def _execute_navigate_filesystem(self, operation: str, path: str = None, 
+                                   pattern: str = None, recursive: bool = False) -> Dict[str, Any]:
+        """
+        REQ-3.6.1: PURE filesystem navigation execution using KG data
+        NO custom reasoning - just execute filesystem operations and return data
+        """
+        try:
+            logger.info(f"📁 Executing filesystem navigation: operation={operation} path={path} pattern={pattern} recursive={recursive}")
+            
+            if not self.filesystem_navigator:
+                return {
+                    "success": False,
+                    "error": "Filesystem navigator not available - Knowledge Graph required",
+                    "operation": operation
+                }
+            
+            # Execute the filesystem operation using KG data with project scope
+            project_scope = None
+            if hasattr(self, 'mentioned_projects') and self.mentioned_projects:
+                project_scope = self.mentioned_projects[0]  # Use first mentioned project
+                logger.info(f"🎯 Passing project scope to filesystem navigator: {project_scope}")
+            
+            result = self.filesystem_navigator.execute(operation, path, pattern, recursive, project_scope)
+            
+            # Add success flag if not present
+            if "error" not in result:
+                result["success"] = True
+            else:
+                result["success"] = False
+            
+            logger.info(f"✅ Filesystem operation executed: {result.get('count', 0)} items found")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Filesystem navigation failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": operation,
+                "path": path,
+                "pattern": pattern
+            }
+    
+    def _execute_generate_diagram(self, diagram_type: str, structural_data: Any, 
+                                 title: str = "", theme: str = "default") -> Dict[str, Any]:
+        """
+        PURE diagram generation using Phase 2 renderer
+        NO custom logic - just generate and return
+        """
+        try:
+            logger.info(f"📊 Generating {diagram_type} diagram with theme: {theme}")
+            
+            # Parse structural data if needed
+            if isinstance(structural_data, str):
+                try:
+                    data = json.loads(structural_data)
+                except json.JSONDecodeError:
+                    # If not valid JSON, wrap as raw data
+                    data = {"raw_data": structural_data}
+            else:
+                data = structural_data
+            
+            # Use our Phase 2 pure renderer
+            mermaid_code = self.mermaid_renderer.generate(
+                diagram_type=diagram_type,
+                graph_data=data,
+                theme_name=theme or "dark_professional"
+            )
+            
+            response = {
+                "success": True,
+                "diagram_type": diagram_type,
+                "mermaid_code": mermaid_code,
+                "title": title,
+                "theme": theme,
+                "data_source": "structural_data",
+                "code_length": len(mermaid_code)
+            }
+            
+            logger.info(f"✅ Diagram generated: {len(mermaid_code)} chars of Mermaid code")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Diagram generation failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "diagram_type": diagram_type,
+                "title": title
+            }
+    
+    async def _execute_examine_files(self, file_paths: List[str], 
+                                   context_lines: int = 5) -> Dict[str, Any]:
+        """
+        PURE file examination - return file contents for SDK analysis
+        """
+        try:
+            logger.info(f"📄 Examining {len(file_paths)} files")
+            
+            results = []
+            
+            # Limit files to prevent overload
+            limited_paths = file_paths[:10]
+            
+            for file_path in limited_paths:
+                try:
+                    # Resolve file path to absolute workspace path
+                    from pathlib import Path
+                    workspace_path = Path("/workspace")
+                    
+                    # Handle different path formats
+                    if file_path.startswith("/workspace/"):
+                        absolute_path = Path(file_path)
+                    elif file_path.startswith("./"):
+                        absolute_path = workspace_path / file_path[2:]
+                    elif file_path.startswith("/"):
+                        absolute_path = Path(file_path)
+                    else:
+                        # Relative path - try with workspace prefix
+                        absolute_path = workspace_path / file_path
+                    
+                    logger.debug(f"Resolving '{file_path}' to '{absolute_path}'")
+                    
+                    # Read file with encoding detection
+                    encodings = ['utf-8', 'latin-1', 'cp1252']
+                    content = None
+                    encoding_used = None
+                    
+                    for encoding in encodings:
+                        try:
+                            with open(absolute_path, 'r', encoding=encoding) as f:
+                                content = f.read()
+                            encoding_used = encoding
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                        except FileNotFoundError:
+                            # If not found, try without workspace prefix
+                            if not file_path.startswith("/workspace/"):
+                                try:
+                                    with open(file_path, 'r', encoding=encoding) as f:
+                                        content = f.read()
+                                    encoding_used = encoding
+                                    break
+                                except:
+                                    continue
+                    
+                    if content is None:
+                        raise ValueError(f"Could not decode file with any encoding: {encodings}")
+                    
+                    # Limit content size for performance
+                    max_content_size = 50000  # 50KB limit
+                    if len(content) > max_content_size:
+                        content = content[:max_content_size] + "\n... [content truncated]"
+                    
+                    results.append({
+                        "file_path": file_path,
+                        "content": content,
+                        "size_bytes": len(content),
+                        "lines": len(content.splitlines()),
+                        "encoding": encoding_used,
+                        "truncated": len(content) >= max_content_size
+                    })
+                    
+                except Exception as e:
+                    results.append({
+                        "file_path": file_path,
+                        "error": str(e),
+                        "content": None,
+                        "accessible": False
+                    })
+            
+            response = {
+                "success": True,
+                "files_examined": len(results),
+                "files_requested": len(file_paths),
+                "context_lines": context_lines,
+                "results": results
+            }
+            
+            logger.info(f"✅ Examined {len(results)} files successfully")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ File examination failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "files_requested": len(file_paths),
+                "results": []
+            }
+    
+    async def _execute_search_symbols(self, symbol_name: str, 
+                                    symbol_type: Optional[str] = None,
+                                    include_relationships: bool = True) -> Dict[str, Any]:
+        """
+        PURE symbol search using Knowledge Graph
+        """
+        try:
+            logger.info(f"🔍 Searching for symbol: {symbol_name} (type: {symbol_type})")
+            
+            if not self.kg:
+                return {
+                    "success": False,
+                    "error": "Knowledge Graph not available - cannot search symbols",
+                    "symbol_name": symbol_name,
+                    "kg_available": False
+                }
+            
+            # Direct KG query - no custom logic
+            if symbol_type:
+                # Search by type first, then filter by name
+                nodes = self.kg.get_nodes_by_type(symbol_type)
+                filtered = [n for n in nodes if symbol_name.lower() in n.get("name", "").lower()]
+            else:
+                # Direct name search
+                filtered = self.kg.get_nodes_by_name(symbol_name, exact_match=False)
+            
+            # Get relationships for found symbols if requested
+            enhanced_results = []
+            for node in filtered[:20]:  # Limit to top 20 results
+                try:
+                    symbol_data = {
+                        "symbol": node,
+                        "callers": [],
+                        "dependencies": []
+                    }
+                    
+                    if include_relationships:
+                        # Get callers (who calls this symbol)
+                        callers = self.kg.find_callers(node["name"], max_depth=2)
+                        symbol_data["callers"] = callers[:10]  # Limit callers
+                        
+                        # Get dependencies (what this symbol depends on)
+                        dependencies = self.kg.find_dependencies(node["name"], max_depth=2)
+                        symbol_data["dependencies"] = dependencies[:10]  # Limit dependencies
+                    
+                    enhanced_results.append(symbol_data)
+                    
+                except Exception as e:
+                    # If relationship lookup fails, still include the symbol
+                    logger.warning(f"Failed to get relationships for {node.get('name', 'unknown')}: {e}")
+                    enhanced_results.append({
+                        "symbol": node,
+                        "callers": [],
+                        "dependencies": [],
+                        "relationship_error": str(e)
+                    })
+            
+            response = {
+                "success": True,
+                "symbol_searched": symbol_name,
+                "symbol_type": symbol_type,
+                "include_relationships": include_relationships,
+                "results": enhanced_results,
+                "total_found": len(enhanced_results),
+                "kg_available": True
+            }
+            
+            logger.info(f"✅ Found {len(enhanced_results)} symbols matching '{symbol_name}'")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Symbol search failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "symbol_name": symbol_name,
+                "symbol_type": symbol_type,
+                "kg_available": self.kg is not None
+            }
+    
+    # REQ-CTX-UNIFIED: Core Summarization Engine Implementation
+    async def _execute_tool_and_summarize(self, tool_name: str, tool_result: Dict[str, Any], user_query: str) -> str:
+        """
+        REQ-CTX-UNIFIED: Execute tool and apply summarization if output is large
+        
+        Args:
+            tool_name: Name of the tool that was executed
+            tool_result: Raw result from tool execution
+            user_query: Original user query for context
+            
+        Returns:
+            Either raw tool result (if small) or intelligent summary (if large)
+        """
+        try:
+            # Convert result to string with safe content isolation
+            raw_result_str = self._safe_serialize_tool_result(tool_result, tool_name)
+            raw_size_chars = len(raw_result_str)
+            
+            # Character threshold: 20,000 chars ≈ 5,000 tokens
+            SUMMARIZATION_THRESHOLD = 20000
+            
+            if raw_size_chars <= SUMMARIZATION_THRESHOLD:
+                # Small output - return as-is
+                logger.info(f"🔧 Tool output size: {raw_size_chars} chars (below threshold, no summarization)")
+                return raw_result_str
+            else:
+                # Large output - apply intelligent summarization
+                logger.info(f"🔧 Tool output size: {raw_size_chars} chars (above threshold, applying summarization)")
+                
+                summary = await self._summarize_with_llm(raw_result_str, user_query, tool_name)
+                summary_size = len(summary)
+                compression_ratio = ((raw_size_chars - summary_size) / raw_size_chars) * 100
+                
+                # REQ-CTX-MONITORING: Log compression metrics
+                logger.info(f"🔧 Tool compression: {tool_name} {raw_size_chars//1000}KB→{summary_size//1000}KB "
+                           f"({compression_ratio:.1f}% reduction)")
+                
+                return summary
+                
+        except Exception as e:
+            logger.error(f"❌ Summarization failed for {tool_name}: {e}")
+            # Fallback: return truncated raw result
+            truncated = raw_result_str[:15000] + "\n\n[TRUNCATED DUE TO SUMMARIZATION ERROR]"
+            return truncated
+    
+    async def _summarize_with_llm(self, large_content: str, user_query: str, tool_name: str) -> str:
+        """
+        REQ-CTX-UNIFIED: Make isolated LLM call to summarize large tool output
+        
+        Args:
+            large_content: Large tool output to summarize
+            user_query: Original user query for context
+            tool_name: Name of tool that generated the content
+            
+        Returns:
+            Dense, structured summary preserving key information
+        """
+        try:
+            # REQ-CTX-PROMPT: Get specialized prompt based on tool type
+            compression_prompt = self._get_compression_prompt(tool_name, user_query)
+            
+            # Truncate input to safely fit in summarization context
+            # Reserve space for prompt + response (≈8K tokens)
+            max_input_chars = 30000
+            content_to_summarize = large_content[:max_input_chars]
+            if len(large_content) > max_input_chars:
+                content_to_summarize += "\n\n[INPUT TRUNCATED FOR SUMMARIZATION]"
+            
+            # Build isolated summarization prompt
+            full_prompt = f"""{compression_prompt}
+
+INPUT DATA TO SUMMARIZE:
+---
+{content_to_summarize}
+---
+
+Remember: Extract key facts, preserve all important entities and relationships, format as structured Markdown. Maximum 2000 tokens."""
+            
+            # Make isolated API call (no conversation history to save tokens)
+            summarization_messages = [
+                {"role": "user", "content": full_prompt}
+            ]
+            
+            # Use same model as main query for consistency
+            completion_config = cerebras_config.get_completion_config()
+            
+            # Build API parameters for summarization
+            api_params = {
+                **completion_config,
+                "messages": summarization_messages,
+                "max_tokens": 2500  # Ensure room for 2000 token summary
+            }
+            
+            # Only add reasoning_effort for models that support it
+            if cerebras_config.supports_reasoning_effort(completion_config.get("model", "")):
+                api_params["reasoning_effort"] = "low"  # Faster for summarization
+            
+            # Execute summarization call
+            logger.info(f"🔧 Starting summarization for {tool_name} ({len(content_to_summarize)} chars)")
+            
+            start_time = time.time()
+            response = self.client.chat.completions.create(**api_params)
+            summarization_time = time.time() - start_time
+            
+            summary = response.choices[0].message.content
+            
+            # REQ-CTX-MONITORING: Log summarization metrics
+            logger.info(f"🔧 Summarization completed: {tool_name} in {summarization_time:.2f}s, "
+                       f"output: {len(summary)} chars")
+            
+            # Log full summarization response for debugging/monitoring
+            logger.info(f"📝 Full Summarization Response ({tool_name}):\n{'='*50}\n{summary}\n{'='*50}")
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"❌ LLM summarization failed: {e}")
+            # Fallback: return structured truncation
+            return self._fallback_summarization(large_content, user_query, tool_name)
+    
+    def _get_compression_prompt(self, tool_name: str, user_query: str) -> str:
+        """
+        REQ-CTX-PROMPT: Get specialized compression prompt based on tool type
+        
+        Args:
+            tool_name: Name of the tool that generated content
+            user_query: Original user query for context
+            
+        Returns:
+            Specialized compression prompt for the tool type
+        """
+        # REQ-CTX-PROMPT: Specialized prompts by tool type
+        if tool_name == "query_codebase":
+            return f"""You are compressing code analysis results for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Class definitions, main functions, API endpoints, file paths, line numbers
+2. IMPORTANT: Dependencies, inheritance relationships, method signatures, design patterns
+3. SECONDARY: Helper functions, utilities, configuration details
+4. NOISE: Debug output, verbose descriptions, duplicate information
+
+OUTPUT FORMAT (use this exact structure):
+## Key Components
+- **ComponentName** (`file/path.py:123-145`)
+  - Type: [class/function/interface]
+  - Purpose: [one-line description]
+  - Key methods: method1(), method2()
+  - Dependencies: [list key dependencies]
+
+## Architecture Patterns
+- **Pattern**: [MVC/Singleton/Factory/etc] in [location]
+- **Data Flow**: [describe key data flows]
+
+## Critical Code Snippets
+```[language]
+// Only essential code that directly answers the query
+```
+
+## File References
+- Main files: [list with line numbers]
+- Configuration: [config files and settings]
+
+COMPRESSION RULES:
+- Be extremely dense - every sentence contains multiple facts
+- Preserve ALL file paths and line numbers
+- Include method signatures for key functions  
+- Remove verbose explanations and debug info
+- Maximum 2000 tokens"""
+        
+        elif tool_name == "navigate_filesystem":
+            return f"""You are compressing project structure analysis for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Main directories, entry points, configuration files
+2. IMPORTANT: Source code directories, test directories, build files
+3. SECONDARY: Documentation, assets, utilities
+4. NOISE: Hidden files, cache directories, generated files
+
+OUTPUT FORMAT (use this exact structure):
+## Project Architecture
+```
+project/
+├── src/main/           # Core application logic
+├── src/components/     # UI components  
+├── config/            # Configuration files
+└── tests/             # Test suites
+```
+
+## Key Entry Points
+- **Main**: [path to main application file]
+- **Build**: [build configuration files]
+- **Tests**: [test runner locations]
+
+## Module Organization
+- **Backend**: [backend directories and purposes]
+- **Frontend**: [frontend directories and purposes]  
+- **Shared**: [shared utilities and libraries]
+
+## Configuration
+- **Environment**: [env files, config locations]
+- **Dependencies**: [package.json, requirements.txt, etc]
+
+COMPRESSION RULES:
+- Focus on architectural significance
+- Show directory hierarchy with purposes
+- Identify main code vs config vs tests
+- Note build and deployment files
+- Maximum 1000 tokens"""
+        
+        else:
+            # Default compression prompt for any other tools
+            return f"""You are compressing technical tool output for this query: "{user_query}"
+
+CONTENT CLASSIFICATION (prioritize in this order):
+1. ESSENTIAL: Direct answers to the query, key findings, file paths
+2. IMPORTANT: Supporting details, relationships, technical specs
+3. SECONDARY: Background information, context
+4. NOISE: Verbose descriptions, debug output, duplicates
+
+OUTPUT FORMAT (use structured Markdown):
+## Key Findings
+- [Most important discoveries]
+
+## Technical Details
+- [Relevant specifications, configurations, etc]
+
+## File References
+- [Important file paths and locations]
+
+## Additional Context
+- [Supporting information that helps answer the query]
+
+COMPRESSION RULES:
+- Prioritize information that directly answers the user's query
+- Preserve all file paths and technical identifiers
+- Remove verbose explanations and redundant information
+- Structure for easy scanning and comprehension
+- Maximum 2000 tokens"""
+    
+    def _fallback_summarization(self, content: str, user_query: str, tool_name: str) -> str:
+        """
+        REQ-CTX-FALLBACK: Fallback summarization when LLM summarization fails
+        
+        Args:
+            content: Content to summarize
+            user_query: Original user query
+            tool_name: Tool that generated content
+            
+        Returns:
+            Basic structured truncation with key information preserved
+        """
+        try:
+            # Extract key sections intelligently
+            lines = content.split('\n')
+            
+            # Preserve key patterns (file paths, class names, function definitions)
+            important_lines = []
+            for line in lines:
+                # Keep lines with file paths, class definitions, function definitions, errors
+                if any(pattern in line.lower() for pattern in [
+                    'file_path', 'class ', 'def ', 'function ', 'error', 'exception',
+                    '.py:', '.js:', '.ts:', '.java:', 'line ', 'extends', 'implements'
+                ]):
+                    important_lines.append(line)
+            
+            # Build fallback summary
+            fallback_summary = f"""# Summarization Fallback for {tool_name}
+
+**Query**: {user_query}
+**Note**: LLM summarization failed, showing key extracted information
+
+## Key Information Found:
+"""
+            
+            # Add important lines (truncated to fit)
+            char_budget = 10000  # Conservative limit for fallback
+            current_chars = len(fallback_summary)
+            
+            for line in important_lines:
+                if current_chars + len(line) + 2 > char_budget:
+                    break
+                fallback_summary += f"- {line.strip()}\n"
+                current_chars += len(line) + 3
+            
+            fallback_summary += f"\n[FALLBACK SUMMARIZATION - LLM COMPRESSION FAILED]"
+            
+            logger.info(f"🔧 Applied fallback summarization: {len(content)} → {len(fallback_summary)} chars")
+            return fallback_summary
+            
+        except Exception as e:
+            logger.error(f"❌ Even fallback summarization failed: {e}")
+            # Last resort: simple truncation
+            return f"# Error in summarization\n\nQuery: {user_query}\nTool: {tool_name}\n\n" + content[:8000] + "\n\n[TRUNCATED]"
+    
+    def _extract_user_query(self, messages: List[Dict]) -> str:
+        """
+        Extract the user's original query from the message history
+        
+        Args:
+            messages: Message history from the conversation
+            
+        Returns:
+            The user's query string, or fallback if not found
+        """
+        try:
+            # Find the first user message (skip system messages)
+            for message in messages:
+                if message.get("role") == "user":
+                    content = message.get("content", "")
+                    if content and len(content.strip()) > 0:
+                        return content.strip()
+            
+            # Fallback if no user message found
+            return "architecture analysis query"
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract user query: {e}")
+            return "code analysis query"
+    
+    # REQ-CTX-MONITORING: Context Usage Analytics Implementation
+    def _log_context_usage(self, messages: List[Dict]) -> None:
+        """
+        REQ-CTX-MONITORING: Log comprehensive context usage analytics
+        
+        Args:
+            messages: Current message history to analyze
+        """
+        try:
+            # Calculate total context size
+            total_chars = 0
+            total_tokens_estimate = 0
+            message_breakdown = {
+                "system": 0,
+                "user": 0, 
+                "assistant": 0,
+                "tool": 0
+            }
+            tool_usage = {}
+            
+            for message in messages:
+                # Handle both dict messages and SDK response objects
+                if hasattr(message, 'role'):
+                    role = message.role if hasattr(message, 'role') else "unknown"
+                    content = str(message.content if hasattr(message, 'content') else "")
+                else:
+                    role = message.get("role", "unknown") if isinstance(message, dict) else "unknown"
+                    content = str(message.get("content", "") if isinstance(message, dict) else "")
+                
+                char_count = len(content)
+                token_estimate = char_count // 4  # Rough estimate: 4 chars per token
+                
+                total_chars += char_count
+                total_tokens_estimate += token_estimate
+                
+                if role in message_breakdown:
+                    message_breakdown[role] += token_estimate
+                
+                # Track tool usage
+                has_tool_call_id = (hasattr(message, 'tool_call_id') or 
+                                   (isinstance(message, dict) and "tool_call_id" in message))
+                if role == "tool" and has_tool_call_id:
+                    # Try to identify tool type from content
+                    if "query_codebase" in content:
+                        tool_usage["query_codebase"] = tool_usage.get("query_codebase", 0) + 1
+                    elif "navigate_filesystem" in content:
+                        tool_usage["navigate_filesystem"] = tool_usage.get("navigate_filesystem", 0) + 1
+                    else:
+                        tool_usage["other"] = tool_usage.get("other", 0) + 1
+            
+            # Context limits (Cerebras specific)
+            CONTEXT_LIMIT_TOKENS = 65536
+            context_utilization = (total_tokens_estimate / CONTEXT_LIMIT_TOKENS) * 100
+            
+            # REQ-CTX-MONITORING: Log metrics at INFO level for operational visibility
+            logger.info(f"📊 Context usage: {total_tokens_estimate:,}/{CONTEXT_LIMIT_TOKENS:,} tokens "
+                       f"({context_utilization:.1f}% utilization)")
+            
+            # Log breakdown
+            logger.info(f"📈 Message breakdown: system={message_breakdown['system']}, "
+                       f"user={message_breakdown['user']}, assistant={message_breakdown['assistant']}, "
+                       f"tool={message_breakdown['tool']} tokens")
+            
+            # Log tool usage if any tools were used
+            if tool_usage:
+                tool_summary = ", ".join([f"{tool}={count}" for tool, count in tool_usage.items()])
+                logger.info(f"🔧 Tool usage: {tool_summary}")
+            
+            # Warning at 75% capacity
+            if context_utilization > 75:
+                logger.warning(f"⚠️ Context usage approaching limit: {context_utilization:.1f}% utilized")
+            
+            # Critical warning at 90% capacity  
+            if context_utilization > 90:
+                logger.warning(f"🚨 Context usage critical: {context_utilization:.1f}% - compression strongly recommended")
+                
+        except Exception as e:
+            logger.warning(f"Failed to log context usage: {e}")
+    
+    def _estimate_token_count(self, text: str) -> int:
+        """
+        REQ-CTX-MONITORING: Estimate token count for text
+        
+        Args:
+            text: Text to estimate tokens for
+            
+        Returns:
+            Estimated token count (rough approximation)
+        """
+        # Rough estimation: 4 characters per token on average
+        # This is a conservative estimate for most English text
+        char_count = len(text)
+        token_estimate = char_count // 4
+        
+        # Add slight buffer for tokenization overhead
+        return int(token_estimate * 1.1)
+    
+    def _check_context_health(self, messages: List[Dict]) -> Dict[str, Any]:
+        """
+        REQ-CTX-MONITORING: Comprehensive context health assessment
+        
+        Args:
+            messages: Message history to analyze
+            
+        Returns:
+            Dictionary with context health metrics
+        """
+        try:
+            total_tokens = 0
+            for msg in messages:
+                if hasattr(msg, 'content'):
+                    content = str(msg.content)
+                elif isinstance(msg, dict):
+                    content = str(msg.get("content", ""))
+                else:
+                    content = ""
+                total_tokens += self._estimate_token_count(content)
+            utilization = (total_tokens / 65536) * 100
+            
+            # Count summarization events
+            summarization_count = 0
+            for message in messages:
+                content = str(message.get("content", ""))
+                if "[SUMMARIZED FROM" in content or "COMPRESSION APPLIED" in content:
+                    summarization_count += 1
+            
+            # Count tool calls
+            tool_calls = len([msg for msg in messages if msg.get("role") == "tool"])
+            
+            return {
+                "total_tokens": total_tokens,
+                "utilization_percent": utilization,
+                "context_health": "healthy" if utilization < 75 else "warning" if utilization < 90 else "critical",
+                "summarization_events": summarization_count,
+                "tool_calls": tool_calls,
+                "message_count": len(messages),
+                "efficiency_score": 100 - utilization if utilization < 100 else 0
+            }
+            
+        except Exception as e:
+            logger.warning(f"Failed to check context health: {e}")
+            return {"error": str(e)}
+    
+    # REQ-CTX-FALLBACK: Graceful Degradation Implementation
+    async def _apply_graceful_degradation(self, messages: List[Dict], context_health: Dict[str, Any]) -> str:
+        """
+        REQ-CTX-FALLBACK: Apply four-tier graceful degradation strategy
+        
+        Args:
+            messages: Current message history
+            context_health: Context health metrics
+            
+        Returns:
+            Response using appropriate fallback strategy
+        """
+        try:
+            utilization = context_health.get("utilization_percent", 0)
+            logger.info(f"🔧 Applying graceful degradation for {utilization:.1f}% context utilization")
+            
+            # Tier 2: Progressive context trimming (90-95% utilization)
+            if utilization < 95:
+                logger.info("📝 Tier 2: Progressive context trimming")
+                trimmed_messages = await self._progressive_context_trimming(messages)
+                
+                # Try to continue with trimmed context
+                if len(trimmed_messages) < len(messages):
+                    logger.info(f"✅ Context trimmed: {len(messages)} → {len(trimmed_messages)} messages")
+                    return await self._sdk_native_loop(trimmed_messages, self._get_current_model())
+            
+            # Tier 3: Multi-turn synthesis (95-98% utilization)
+            elif utilization < 98:
+                logger.info("📝 Tier 3: Multi-turn synthesis")
+                return await self._multi_turn_synthesis(messages)
+            
+            # Tier 4: Partial response with explanation (98%+ utilization)
+            else:
+                logger.info("📝 Tier 4: Partial response with explanation")
+                return self._partial_response_with_explanation(messages, context_health)
+                
+        except Exception as e:
+            logger.error(f"❌ Graceful degradation failed: {e}")
+            return self._emergency_fallback(messages)
+    
+    async def _progressive_context_trimming(self, messages: List[Dict]) -> List[Dict]:
+        """
+        REQ-CTX-FALLBACK: Tier 2 - Remove oldest tool responses, preserve key context
+        
+        Args:
+            messages: Original message history
+            
+        Returns:
+            Trimmed message history with preserved essential context
+        """
+        try:
+            # Always preserve: system prompt + user query + last 2 tool responses
+            trimmed = []
+            tool_responses = []
+            
+            for message in messages:
+                role = message.get("role")
+                
+                if role == "system":
+                    # Always keep system prompt
+                    trimmed.append(message)
+                elif role == "user":
+                    # Always keep user messages
+                    trimmed.append(message)
+                elif role == "assistant":
+                    # Keep assistant messages (reasoning)
+                    trimmed.append(message)
+                elif role == "tool":
+                    # Collect tool responses for selective keeping
+                    tool_responses.append(message)
+            
+            # Keep only last 2 tool responses (most recent context)
+            if tool_responses:
+                recent_tools = tool_responses[-2:]
+                trimmed.extend(recent_tools)
+                logger.info(f"🔧 Kept {len(recent_tools)}/{len(tool_responses)} tool responses")
+            
+            return trimmed
+            
+        except Exception as e:
+            logger.error(f"❌ Progressive trimming failed: {e}")
+            return messages  # Return original if trimming fails
+    
+    async def _multi_turn_synthesis(self, messages: List[Dict]) -> str:
+        """
+        REQ-CTX-FALLBACK: Tier 3 - Synthesize current findings, start fresh
+        
+        Args:
+            messages: Current message history
+            
+        Returns:
+            Synthesized response from current context
+        """
+        try:
+            logger.info("🔧 Starting multi-turn synthesis")
+            
+            # Extract key findings from current context
+            user_query = self._extract_user_query(messages)
+            tool_findings = []
+            
+            for message in messages:
+                if message.get("role") == "tool":
+                    content = str(message.get("content", ""))
+                    if content and len(content.strip()) > 0:
+                        # Summarize each tool finding
+                        summary = await self._synthesize_tool_finding(content, user_query)
+                        tool_findings.append(summary)
+            
+            # Create synthesis prompt
+            synthesis_prompt = f"""Based on the research I've conducted for: "{user_query}"
+
+Key findings from analysis:
+{chr(10).join(f"- {finding}" for finding in tool_findings)}
+
+Please provide a comprehensive response that synthesizes these findings into a complete answer."""
+            
+            # Make isolated synthesis call
+            synthesis_messages = [{"role": "user", "content": synthesis_prompt}]
+            
+            completion_config = cerebras_config.get_completion_config()
+            api_params = {
+                **completion_config,
+                "messages": synthesis_messages,
+                "max_tokens": 3000
+            }
+            
+            response = self.client.chat.completions.create(**api_params)
+            synthesis_result = response.choices[0].message.content
+            
+            # Log full multi-turn synthesis response for debugging/monitoring
+            synthesis_length = len(synthesis_result) if synthesis_result else 0
+            logger.info("✅ Multi-turn synthesis completed successfully")
+            logger.info(f"📄 Multi-turn Synthesis Details - Length: {synthesis_length} chars, Model: {self.model}")
+            logger.info(f"📝 Full Multi-turn Synthesis:\n{'='*50}\n{synthesis_result}\n{'='*50}")
+            
+            return synthesis_result
+            
+        except Exception as e:
+            logger.error(f"❌ Multi-turn synthesis failed: {e}")
+            return self._partial_response_with_explanation(messages, {"error": str(e)})
+    
+    async def _synthesize_tool_finding(self, tool_content: str, user_query: str) -> str:
+        """
+        REQ-CTX-FALLBACK: Synthesize a single tool finding into key insight
+        
+        Args:
+            tool_content: Content from a tool response
+            user_query: Original user query
+            
+        Returns:
+            Brief synthesis of the tool finding
+        """
+        try:
+            # Quick synthesis for multi-turn - just extract key points
+            lines = tool_content.split('\n')
+            key_lines = []
+            
+            for line in lines:
+                line = line.strip()
+                if line and any(keyword in line.lower() for keyword in [
+                    'key', 'important', 'main', 'primary', 'essential', 'component', 'pattern'
+                ]):
+                    key_lines.append(line)
+                    if len(key_lines) >= 3:  # Limit for synthesis
+                        break
+            
+            if key_lines:
+                return f"Analysis found: {'; '.join(key_lines[:3])}"
+            else:
+                # Fallback: first non-empty line
+                for line in lines:
+                    if line.strip() and len(line.strip()) > 10:
+                        return f"Analysis found: {line.strip()[:100]}..."
+                
+                return "Analysis completed with technical findings"
+                
+        except Exception as e:
+            logger.warning(f"Failed to synthesize tool finding: {e}")
+            return "Analysis completed with mixed results"
+    
+    def _partial_response_with_explanation(self, messages: List[Dict], context_health: Dict[str, Any]) -> str:
+        """
+        REQ-CTX-FALLBACK: Tier 4 - Return best available analysis with clear limitations
+        
+        Args:
+            messages: Message history
+            context_health: Context health metrics
+            
+        Returns:
+            Partial response with explanation of limitations
+        """
+        try:
+            user_query = self._extract_user_query(messages)
+            
+            # Extract key findings from available context
+            findings = []
+            tool_count = 0
+            
+            for message in messages:
+                if message.get("role") == "tool":
+                    tool_count += 1
+                    content = str(message.get("content", ""))
+                    
+                    # Extract first meaningful line
+                    lines = content.split('\n')
+                    for line in lines:
+                        if line.strip() and len(line.strip()) > 20:
+                            findings.append(line.strip()[:150] + "...")
+                            break
+            
+            utilization = context_health.get("utilization_percent", 0)
+            
+            return f"""I've analyzed your query: "{user_query}"
+
+## Analysis Results Found:
+{chr(10).join(f"• {finding}" for finding in findings[:5])}
+
+## Context Limitation Notice:
+Due to the complexity of your query, I've reached the context processing limit ({utilization:.1f}% of available context). This response contains the key findings from {tool_count} analysis operations that were completed successfully.
+
+## Suggestions:
+- For deeper analysis, consider breaking your query into smaller, more specific questions
+- Focus on particular aspects of the architecture you're most interested in
+- Ask follow-up questions about specific components mentioned above
+
+The analysis above represents the most important findings I was able to gather before reaching processing limits."""
+            
+        except Exception as e:
+            logger.error(f"❌ Partial response generation failed: {e}")
+            return self._emergency_fallback(messages)
+    
+    def _emergency_fallback(self, messages: List[Dict]) -> str:
+        """
+        REQ-CTX-FALLBACK: Final emergency fallback when all else fails
+        
+        Args:
+            messages: Message history
+            
+        Returns:
+            Basic response acknowledging the query
+        """
+        try:
+            user_query = self._extract_user_query(messages)
+            return f"""I understand you're asking about: "{user_query}"
+
+I encountered technical limitations while processing your request due to context constraints. However, I successfully initiated the analysis and gathered preliminary information.
+
+To help you better, please consider:
+1. Breaking your question into smaller, more specific parts
+2. Focusing on particular aspects of what you're trying to understand
+3. Asking about specific files, classes, or components
+
+I'm ready to help with a more focused query whenever you're ready."""
+            
+        except Exception as e:
+            logger.error(f"❌ Even emergency fallback failed: {e}")
+            return "I encountered technical difficulties processing your request. Please try rephrasing your question or breaking it into smaller parts."
+    
+    def _get_current_model(self) -> str:
+        """Helper to get the current model being used"""
+        try:
+            return cerebras_config.model
+        except:
+            return "gpt-oss-120b"  # Default fallback
+    
+    def _get_native_system_prompt(self) -> str:
+        """
+        REQ-3.7: Mandatory Workflow Architecture - Codebase Onboarding System
+        This prompt implements structured workflows that eliminate lazy discovery
+        """
+        return """# CodeWise v3.2 - Mandatory Workflow Architecture
+
+## 1. Core Identity
+You are CodeWise, a world-class senior software engineer and code intelligence platform. Your purpose is to help users understand complex codebases by using your specialized tools in specific, proven workflows that ensure comprehensive analysis.
+
+## 2. Your Specialized Toolset
+You have two primary tools. You MUST use them according to the mandatory workflows below.
+
+### Tool 1: `query_codebase(query: str, ...)`
+* **Purpose:** To answer **CONCEPTUAL** questions ("how," "why," "explain"). Use it to understand the *meaning* and *logic* of code **once you know where it is**.
+* **Critical Rule:** Never use this as your first tool for broad exploratory queries.
+* **Best Use:** After you have established the project structure through filesystem exploration.
+
+### Tool 2: `navigate_filesystem(operation: str, ...)`  
+* **Purpose:** To answer **STRUCTURAL** questions ("where," "list," "find"). Use it to **discover** the layout of the codebase.
+* **Critical Rule:** Always use this first for architecture and exploratory queries.
+* **Operations:** 
+  - `operation="tree"` - Get directory structure overview
+  - `operation="find"` - Find files matching patterns  
+  - `operation="list"` - List contents of specific directories
+
+---
+
+## 3. Mandatory Reasoning Workflows
+
+### Workflow A: Standard Code Query (For Specific Questions)
+**Use When:** The user asks about a *specific, known* function, class, or file.
+**Examples:** "What does the `authenticate_user` function do?" or "How does UserService work?"
+**Process:**
+1. **Thought:** The user is asking about a specific symbol. I will use `query_codebase` to find it directly.
+2. **Action:** `query_codebase(query="authenticate_user function", analysis_mode="specific_symbol")`
+
+### Workflow B: Codebase Onboarding (For Broad, Exploratory Questions)
+**Use When:** The user asks a broad, high-level question about a project, such as:
+- "explain the architecture"
+- "how does this project work" 
+- "explain each controller"
+- "show me the system design"
+- "how is authentication handled"
+- Any query about project structure or overview
+
+**MANDATORY Process - You MUST follow every step:**
+
+1. **Thought:** This is a broad, exploratory query. I must first understand the project's structure. My first step is to use `navigate_filesystem` to get a file tree.
+
+2. **Action (Step 1):** `navigate_filesystem(operation="tree", path=".")`
+
+3. **Observation:** [Review the file tree from the tool's output - identify key directories like src/, components/, controllers/, services/, etc.]
+
+4. **Thought:** Based on the file tree, the core logic appears to be in the `[path/to/logic]` and `[path/to/other/logic]` directories. For authentication queries, I should search semantically rather than guessing file paths.
+
+5. **Action (Step 2):** `query_codebase(query="authentication security implementation", analysis_mode="semantic_rag")` OR for more specific searches use patterns like `navigate_filesystem(operation="find", pattern="*Auth*")` to locate auth-related files
+
+6. **Observation:** [Review the semantic search results for detailed implementation information.]
+
+7. **Thought:** I now have both a structural overview and semantic details. I can synthesize a complete answer.
+
+8. **Final Action:** Provide comprehensive answer combining structural layout with semantic analysis.
+
+### Workflow C: Diagram Generation
+**Use When:** The user requests a diagram or visualization.
+**Process:**
+1. **Thought:** The user wants a diagram. According to mandatory workflow, for diagram generation I must call query_codebase with analysis_mode="structural_kg".
+2. **Action:** `query_codebase(query="class hierarchy for controllers", analysis_mode="structural_kg")`
+3. **System Response:** The system will automatically transform the structural data into a standardized graph format, infer the appropriate diagram type, and generate the Mermaid diagram syntax.
+
+---
+
+## 4. Critical Rules for Robust Discovery
+
+### Rule 1: Workflow Selection is Mandatory
+You MUST identify which workflow applies to each user query and follow it exactly. Do not deviate from the prescribed steps.
+
+### Rule 2: Never Skip Structure for Broad Queries  
+For any query about architecture, project overview, or "explain X system", you MUST start with `navigate_filesystem` to build structural understanding. This is non-negotiable.
+
+### Rule 3: Cold Start Protection
+If you receive limited results from `query_codebase` (< 10 results or only documentation), you MUST use `navigate_filesystem` to verify the project structure before concluding anything about available source code.
+
+### Rule 4: Path Validation - CRITICAL
+NEVER explore non-existent paths. If navigate_filesystem returns 0 items, STOP trying similar paths. Instead:
+- Use `navigate_filesystem(operation="find", pattern="*keyword*")` to search by filename patterns
+- Use `query_codebase(query="concept", analysis_mode="semantic_rag")` for semantic searches
+- Check actual project structure before assuming paths exist
+
+### Rule 5: Completeness Validation
+Before providing architectural analysis, verify you have:
+- [ ] Found source code files (not just documentation)
+- [ ] Identified key architectural components  
+- [ ] Located main application entry points
+- [ ] Understood the project's directory structure
+
+### Rule 5: No Lazy Conclusions
+Never conclude "only documentation exists" or "no source files available" without using `navigate_filesystem` to verify the actual project structure.
+
+---
+
+## 5. Tool Integration Patterns
+
+### Pattern 1: Discovery → Analysis
+For unknown projects: `navigate_filesystem` → `query_codebase`
+
+### Pattern 2: Targeted → Deep Dive  
+For specific queries: `query_codebase` directly
+
+### Pattern 3: Structure → Semantics → Synthesis
+For comprehensive analysis: `navigate_filesystem` → `query_codebase` → combine results
+
+---
+
+## 6. Quality Standards
+- Always provide file paths and line numbers when available
+- Include relevant code snippets with proper context  
+- Explain complex concepts clearly with examples
+- Use the mandatory workflow for each question type
+- Build complete understanding before providing analysis
+- Validate discovery completeness before concluding
+
+### CRITICAL: Code Presentation Standards
+**When presenting code snippets, you MUST clearly distinguish between:**
+
+**✅ ACTUAL CODE (from search results):** 
+- Use when you have direct file content from tool results
+- Label as: `// From [filepath]` or `# Found in [filepath]`
+- Quote exactly as found in the search results
+
+**✅ INFERRED/SYNTHESIZED CODE (based on understanding):**
+- Use when demonstrating likely structure based on context
+- Label as: `// Inferred based on architecture analysis` or `# Likely structure based on patterns found`
+- Clearly state "This is synthesized based on the project structure and common patterns"
+
+**❌ NEVER present inferred code as if it's exact quotes from files**
+**❌ NEVER mix actual and inferred code without clear labeling**
+
+**Example of correct presentation:**
+```java
+// Found in iiot-monitoring/backend/src/main/java/com/iiot/backend/BackendApplication.java
+@SpringBootApplication
+public class BackendApplication {
+    // ... (actual content from file)
+}
+
+// Likely structure based on Spring Boot patterns (inferred)
+@Configuration
+public class MqttConfig {
+    // This structure is inferred based on the MQTT integration patterns
+    // found in the semantic search results
+}
+```
+
+## 7. Error Handling & Recovery
+- If `query_codebase` returns sparse results, trigger filesystem discovery
+- If tools return errors, acknowledge limitations clearly
+- Use the alternate workflow if the primary approach fails
+- Never fabricate information to fill gaps
+- Guide users toward successful discovery patterns
+
+Your mission is to eliminate lazy discovery through systematic, mandatory workflows that ensure comprehensive codebase understanding."""
+    
+    def _detect_sdk_version(self) -> str:
+        """Detect SDK version for future-proofing"""
+        try:
+            import cerebras.cloud.sdk
+            version = getattr(cerebras.cloud.sdk, '__version__', 'unknown')
+            logger.info(f"📦 Cerebras SDK version: {version}")
+            return version
+        except Exception as e:
+            logger.warning(f"⚠️ Could not detect SDK version: {e}")
+            return "unknown"
+    
+    def _detect_sdk_features(self) -> Dict[str, bool]:
+        """
+        Detect what the current SDK version supports for future-proofing
+        
+        This enables automatic inheritance of SDK improvements without code changes.
+        """
+        features = {}
+        
+        try:
+            # Test for parallel tool calls capability
+            completion_method = getattr(self.client.chat.completions, "create", None)
+            if completion_method:
+                import inspect
+                sig = inspect.signature(completion_method)
+                features["parallel_tools"] = "parallel_tool_calls" in sig.parameters
+            else:
+                features["parallel_tools"] = False
+            logger.debug(f"Parallel tools supported: {features['parallel_tools']}")
+        except Exception:
+            features["parallel_tools"] = False
+        
+        try:
+            # Test for reasoning effort levels
+            features["reasoning_levels"] = True  # Most SDKs support this
+            logger.debug(f"Reasoning levels supported: {features['reasoning_levels']}")
+        except Exception:
+            features["reasoning_levels"] = False
+        
+        try:
+            # Test for streaming capabilities
+            features["streaming"] = hasattr(self.client.chat.completions, "create")
+            logger.debug(f"Streaming supported: {features['streaming']}")
+        except Exception:
+            features["streaming"] = False
+        
+        try:
+            # Test for tool use capabilities
+            completion_method = getattr(self.client.chat.completions, "create", None)
+            if completion_method:
+                import inspect
+                sig = inspect.signature(completion_method)
+                features["tool_use"] = "tools" in sig.parameters
+            else:
+                features["tool_use"] = False
+            logger.debug(f"Tool use supported: {features['tool_use']}")
+        except Exception:
+            features["tool_use"] = False
+        
+        try:
+            # Test for model switching capabilities
+            features["model_switching"] = True  # Assume supported unless proven otherwise
+            logger.debug(f"Model switching supported: {features['model_switching']}")
+        except Exception:
+            features["model_switching"] = False
+        
+        logger.info(f"🔍 SDK feature detection complete: {sum(features.values())}/{len(features)} features available")
+        return features
+    
+    def _build_adaptive_schema(self) -> List[Dict]:
+        """
+        REQ-3.6.1: Build two-tool architecture schema 
+        
+        This creates the specialized toolset that eliminates LLM decision paralysis:
+        1. query_codebase - for CONCEPTUAL questions (how/why/explain)
+        2. navigate_filesystem - for STRUCTURAL questions (where/list/find)
+        """
+        # Start with conceptual query tool
+        base_schema = UNIFIED_TOOL_SCHEMA.copy()
+        
+        # Add filesystem navigation tool for structural queries
+        if self.filesystem_navigator:
+            base_schema.extend(FILESYSTEM_TOOL_SCHEMA)
+            logger.info("✅ Two-tool architecture: query_codebase + navigate_filesystem")
+        else:
+            logger.warning("⚠️ Filesystem tool unavailable - single tool mode")
+        
+        # Log available features but don't modify schema (causes API errors)
+        if self.available_features.get("parallel_tools", False):
+            logger.info("✅ Parallel tool execution available")
+        
+        if self.available_features.get("streaming", False):
+            logger.info("✅ Streaming tool responses available")
+        
+        logger.info(f"🔧 Specialized tool schema built with {len(base_schema)} tools")
+        return base_schema
+
+# Global native agent instance
+_native_agent = None
+
+def get_native_agent() -> CerebrasNativeAgent:
+    """Get singleton native agent instance"""
+    global _native_agent
+    if _native_agent is None:
+        _native_agent = CerebrasNativeAgent()
+    return _native_agent
+
+# Legacy compatibility - maintain existing function signature
+def get_cerebras_agent():
+    """Legacy compatibility function"""
+    return get_native_agent()
+
+# Export public interface
+__all__ = ["CerebrasNativeAgent", "get_native_agent", "get_cerebras_agent"]

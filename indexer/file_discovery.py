@@ -58,6 +58,8 @@ class FileDiscoveryEngine:
             # Code files - Modern Languages
             ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".swift", ".go", ".rs", ".dart",
             ".scala", ".clj", ".cljs", ".rb", ".php", ".lua", ".r", ".jl",
+            # JavaScript/Node.js variants
+            ".mjs", ".cjs", ".es6", ".es", ".jsm",
             # Code files - Systems Programming  
             ".c", ".cpp", ".h", ".hpp", ".cc", ".cxx", ".c++", ".h++", ".hh", ".hxx",
             ".m", ".mm", ".asm", ".s", ".S",
@@ -83,14 +85,20 @@ class FileDiscoveryEngine:
             ".meson", ".ninja", ".bazel", ".bzl", ".buck", ".pants", ".nix", ".rake",
             # Other text formats
             ".xml", ".csv", ".sql", ".sh", ".bat", ".ps1", ".fish", ".zsh", ".bash",
-            ".makefile", ".mk", ".am", ".in", ".m4", ".spec", ".desktop"
+            ".makefile", ".mk", ".am", ".in", ".m4", ".spec", ".desktop", ".patch"
         }
         
         # Files to include even without extensions (by name patterns)
         self.special_files = {
             "dockerfile", "makefile", "rakefile", "gemfile", "procfile",
             "readme", "license", "changelog", "contributing", "authors",
-            "requirements", "pipfile", "poetry", "package", "composer"
+            "requirements", "pipfile", "poetry", "package", "composer",
+            # Configuration files
+            "eslint", "prettier", "babel", "webpack", "rollup", "vite", 
+            "postcss", "tailwind", "tsconfig", "jsconfig", "next",
+            "jest", "vitest", "cypress", "playwright",
+            # Package/dependency files
+            "package-lock", "yarn.lock", "pnpm-lock", "bun.lockb"
         }
         
         # Directories to skip entirely

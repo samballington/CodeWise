@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
 import time
-from backend.smart_search import smart_search
+try:
+    from smart_search import smart_search
+except ImportError:
+    from backend.smart_search import smart_search
 
 async def quick_test():
     start = time.time()

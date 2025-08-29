@@ -24,11 +24,11 @@ def choose_chunk_size(text: str) -> int:
     scs = semantic_complexity_score(text)
 
     if scs < 0.05:
-        base = 1200
+        base = 2000  # Large chunks for repetitive code
     elif scs < 0.15:
-        base = 600
+        base = 1200  # Medium chunks for mixed content
     else:
-        base = 300
+        base = 800   # Smaller chunks for complex code
 
     # Always return at least the base size; do not shrink small inputs below base
-    return max(base, len(text)) 
+    return max(base, min(len(text), base)) 

@@ -51,6 +51,8 @@ class ResponseSanitizer:
         
         if text != original_text:
             self.logger.warning("🚫 MERMAID SANITIZER: Removed placeholder text to prevent UI corruption")
+        
+        # Removed bandage fix - using diagnosis to find root cause instead
             
         return text
     

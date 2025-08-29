@@ -14,8 +14,18 @@ from collections import defaultdict
 import numpy as np
 from pathlib import Path
 
-from backend.bm25_index import BM25Index, BM25Result
-from backend.vector_store import get_vector_store
+from bm25_index import BM25Index, BM25Result
+from vector_store import get_vector_store
+
+# Phase 3.1: Import Query Intent Classifier for dynamic search weighting
+try:
+    from search.query_classifier import QueryClassifier, QueryAnalysis
+    QUERY_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    # Fallback when classifier not available
+    QUERY_CLASSIFIER_AVAILABLE = False
+    QueryClassifier = None
+    QueryAnalysis = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -120,6 +130,17 @@ class ResultFusion:
         Args:
             vector_weight: Weight for vector similarity scores (0-1)
             bm25_weight: Weight for BM25 scores (0-1)
+        """
+        self.vector_weight = vector_weight
+        self.bm25_weight = bm25_weight
+    
+    def update_weights(self, vector_weight: float, bm25_weight: float):
+        """
+        Update fusion weights dynamically.
+        
+        Args:
+            vector_weight: New weight for vector similarity scores (0-1)
+            bm25_weight: New weight for BM25 scores (0-1)
         """
         self.vector_weight = vector_weight
         self.bm25_weight = bm25_weight
@@ -243,16 +264,30 @@ class ResultFusion:
         
         return normalized
     
-    def _apply_query_boosts(self, results: Dict[str, SearchResult], query_analysis: Dict):
+    def _apply_query_boosts(self, results: Dict[str, SearchResult], query_analysis):
         """Apply query-specific boosts to results"""
+        
+        # Handle both QueryAnalysis object (Phase 3.1) and Dict (legacy)
+        if hasattr(query_analysis, 'technical_terms'):
+            # Phase 3.1: QueryAnalysis object
+            technical_terms = query_analysis.technical_terms
+            detected_symbols = query_analysis.detected_symbols
+            is_exact_match = any('exact_match' in reasoning for reasoning in query_analysis.reasoning)
+            file_type_hints = []  # Not supported in QueryAnalysis yet
+        else:
+            # Legacy: Dictionary format
+            technical_terms = query_analysis.get('technical_terms', [])
+            detected_symbols = query_analysis.get('detected_symbols', [])
+            is_exact_match = query_analysis.get('is_exact_match_query', False)
+            file_type_hints = query_analysis.get('file_type_hints', [])
+        
         # Boost exact match queries for BM25 results
-        if query_analysis.get('is_exact_match_query', False):
+        if is_exact_match:
             for result in results.values():
                 if result.search_type in ['bm25', 'hybrid'] and result.matched_terms:
                     result.relevance_score *= 1.2
         
         # Boost results matching file type hints
-        file_type_hints = query_analysis.get('file_type_hints', [])
         if file_type_hints:
             for result in results.values():
                 file_ext = result.file_path.split('.')[-1].lower()
@@ -260,18 +295,20 @@ class ResultFusion:
                        for hint in file_type_hints):
                     result.relevance_score *= 1.15
         
-        # Boost technical term matches
-        if query_analysis.get('has_technical_terms', False):
+        # Boost technical term matches with detected symbols
+        has_technical_terms = len(technical_terms) > 0 if hasattr(query_analysis, 'technical_terms') else query_analysis.get('has_technical_terms', False)
+        if has_technical_terms:
             for result in results.values():
                 if result.search_type in ['bm25', 'hybrid']:
                     # Check if matched terms include technical terms
+                    all_terms = technical_terms + detected_symbols if hasattr(query_analysis, 'technical_terms') else query_analysis.get('query_terms', [])
                     technical_matches = len([term for term in result.matched_terms 
-                                           if term in query_analysis.get('query_terms', [])])
+                                           if term in all_terms])
                     if technical_matches > 0:
                         result.relevance_score *= (1.0 + 0.1 * technical_matches)
 
         # HARD GUARD: Filename-focused queries should prefer exact filename/path matches
-        filename_token = (query_analysis.get('filename_token') or '').lower()
+        filename_token = '' if hasattr(query_analysis, 'technical_terms') else (query_analysis.get('filename_token') or '').lower()
         if filename_token:
             # Determine if any result exactly matches the filename (basename equality)
             exact_matches = set()
@@ -329,11 +366,29 @@ class HybridSearchEngine:
         
         self.bm25_index = bm25_index
         self.query_processor = QueryProcessor()
+        
+        # Phase 3.1: Initialize Query Intent Classifier for dynamic weighting
+        if QUERY_CLASSIFIER_AVAILABLE:
+            self.query_classifier = QueryClassifier()
+            logger.info("🧠 QueryClassifier initialized - dynamic search weighting enabled")
+        else:
+            self.query_classifier = None
+            logger.warning("⚠️  QueryClassifier not available - using static 50/50 weighting")
+        
         self.result_fusion = ResultFusion()
         
         # Search parameters (tuned)
         self.min_relevance_threshold = 0.25  # default threshold
         self.max_results = 20
+        
+        # Search statistics for monitoring dynamic weighting effectiveness
+        self.search_stats = {
+            'total_searches': 0,
+            'dynamic_weight_searches': 0,
+            'avg_vector_weight': 0.5,
+            'avg_bm25_weight': 0.5,
+            'intent_distribution': {}
+        }
         
     def build_bm25_index(self, documents: List[Dict]) -> bool:
         """
@@ -370,9 +425,30 @@ class HybridSearchEngine:
         
         logger.info(f"🔍 HYBRID SEARCH: '{query}' (k={k}, min_relevance={min_relevance})")
         
-        # Analyze query to determine search strategy
-        query_analysis = self.query_processor.analyze_query(query)
-        logger.debug(f"Query analysis: {query_analysis}")
+        # Phase 3.1: Dynamic Weight Calculation using Query Intent Classifier
+        if self.query_classifier:
+            # Use intelligent query classification for dynamic weights
+            intent_analysis = self.query_classifier.classify_query(query)
+            vector_weight = intent_analysis.vector_weight
+            bm25_weight = intent_analysis.bm25_weight
+            
+            # Update result fusion weights dynamically
+            self.result_fusion.update_weights(vector_weight, bm25_weight)
+            
+            # Update search statistics
+            self._update_search_stats(intent_analysis)
+            
+            logger.info(f"🧠 DYNAMIC WEIGHTS: {vector_weight:.2f} vector / {bm25_weight:.2f} keyword "
+                       f"(intent: {intent_analysis.intent.value}, confidence: {intent_analysis.confidence:.2f})")
+            logger.debug(f"Reasoning: {', '.join(intent_analysis.reasoning)}")
+            
+            # Use intent_analysis as query_analysis for result fusion
+            query_analysis = intent_analysis
+        else:
+            # Fallback to original query analysis and static weights
+            query_analysis = self.query_processor.analyze_query(query)
+            logger.debug(f"Static query analysis: {query_analysis}")
+            logger.info("📊 STATIC WEIGHTS: 0.50 vector / 0.50 keyword (classifier unavailable)")
         
         # Perform vector and BM25 searches in parallel
         logger.info("🚀 Starting parallel vector and BM25 searches")
@@ -474,18 +550,61 @@ class HybridSearchEngine:
         
         bm25_stats = self.bm25_index.get_statistics()
         
-        return {
+        # Phase 3.1: Include dynamic weighting statistics
+        stats = {
             'vector_store': vector_stats,
             'bm25_index': bm25_stats,
             'fusion_weights': {
-                'vector_weight': self.result_fusion.vector_weight,
-                'bm25_weight': self.result_fusion.bm25_weight
+                'current_vector_weight': self.result_fusion.vector_weight,
+                'current_bm25_weight': self.result_fusion.bm25_weight
             },
             'search_parameters': {
                 'min_relevance_threshold': self.min_relevance_threshold,
                 'max_results': self.max_results
             }
         }
+        
+        # Add dynamic weighting statistics if classifier is available
+        if self.query_classifier:
+            stats['dynamic_weighting'] = {
+                'classifier_enabled': True,
+                'total_searches': self.search_stats['total_searches'],
+                'dynamic_weight_searches': self.search_stats['dynamic_weight_searches'],
+                'avg_vector_weight': self.search_stats['avg_vector_weight'],
+                'avg_bm25_weight': self.search_stats['avg_bm25_weight'],
+                'intent_distribution': self.search_stats['intent_distribution'],
+                'dynamic_usage_rate': (
+                    self.search_stats['dynamic_weight_searches'] / 
+                    max(self.search_stats['total_searches'], 1)
+                )
+            }
+        else:
+            stats['dynamic_weighting'] = {
+                'classifier_enabled': False,
+                'reason': 'QueryClassifier not available - using static 50/50 weighting'
+            }
+        
+        return stats
+    
+    def _update_search_stats(self, intent_analysis: 'QueryAnalysis'):
+        """Update search statistics for monitoring dynamic weighting effectiveness."""
+        self.search_stats['total_searches'] += 1
+        self.search_stats['dynamic_weight_searches'] += 1
+        
+        # Update running averages
+        total = self.search_stats['total_searches']
+        self.search_stats['avg_vector_weight'] = (
+            (self.search_stats['avg_vector_weight'] * (total - 1) + intent_analysis.vector_weight) / total
+        )
+        self.search_stats['avg_bm25_weight'] = (
+            (self.search_stats['avg_bm25_weight'] * (total - 1) + intent_analysis.bm25_weight) / total
+        )
+        
+        # Track intent distribution
+        intent = intent_analysis.intent.value
+        if intent not in self.search_stats['intent_distribution']:
+            self.search_stats['intent_distribution'][intent] = 0
+        self.search_stats['intent_distribution'][intent] += 1
     
     def update_fusion_weights(self, vector_weight: float, bm25_weight: float):
         """Update result fusion weights"""

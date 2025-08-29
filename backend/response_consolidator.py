@@ -16,10 +16,11 @@ logger = logging.getLogger(__name__)
 
 class ResponseSource(Enum):
     """Source of response data for priority handling"""
-    STRUCTURED = "structured"           # Highest priority - JSON prompt format
-    FORMATTED = "formatted"            # Medium priority - response_formatter output  
-    RAW = "raw"                       # Lowest priority - plain text fallback
-    SYNTHESIS = "synthesis"           # Enhanced - from synthesis stage
+    UNIFIED = "unified"               # Highest priority - unified pipeline output
+    STRUCTURED = "structured"         # High priority - JSON prompt format
+    FORMATTED = "formatted"           # Medium priority - response_formatter output  
+    RAW = "raw"                      # Lowest priority - plain text fallback
+    SYNTHESIS = "synthesis"          # Enhanced - from synthesis stage
     MAX_ITERATIONS = "max_iterations" # Special case - iteration limit reached
 
 
@@ -233,7 +234,12 @@ class ResponseConsolidator:
         """
         Generate readable text output from normalized sections for frontend display.
         This maintains the frontend contract while providing internal structure.
+        
+        NOTE: This method is now deprecated in favor of canonical response contract.
+        Structured responses should be handled by frontend directly.
         """
+        self.logger.warning("⚠️ CONSOLIDATOR: _generate_readable_output called - this should not happen with canonical contract")
+        
         readable_parts = []
         
         try:
@@ -306,8 +312,9 @@ class ResponseConsolidator:
             self.logger.error("💥 CONSOLIDATOR: No response data to consolidate")
             return self._create_error_response("No response data available")
         
-        # Sort by priority: STRUCTURED > FORMATTED > RAW
+        # Sort by priority: UNIFIED > STRUCTURED > FORMATTED > RAW
         priority_order = [
+            ResponseSource.UNIFIED,
             ResponseSource.STRUCTURED,
             ResponseSource.SYNTHESIS,  
             ResponseSource.FORMATTED,
@@ -332,21 +339,19 @@ class ResponseConsolidator:
         for data in self.response_data:
             all_errors.extend(data.errors)
         
-        # NEW LOGIC: Handle structured responses differently
+        # CANONICAL RESPONSE CONTRACT: Enforce single source of truth
+        # Either 'content' OR 'structuredResponse' is populated, never both
         if primary_data.source == ResponseSource.STRUCTURED:
-            # Use structured data directly - no sanitization needed
+            # Use structured data directly - ONLY populate structuredResponse
             structured_data = primary_data.structured_response
             
-            if structured_data:
-                self.logger.info("📊 CONSOLIDATOR: Using structured response data directly")
-                
-                # Generate readable output from structured data
-                readable_output = self._generate_readable_output(structured_data.get('response', {}).get('sections', []))
+            if structured_data and self._has_renderable_structured_data(structured_data):
+                self.logger.info("📊 CONSOLIDATOR: Using STRUCTURED response - nullifying content")
                 
                 final_response = {
                     "type": "final_result",
-                    "output": readable_output,
-                    "structured_response": structured_data,
+                    "output": None,  # EXPLICIT NULL - prevents frontend ambiguity
+                    "structuredResponse": structured_data,
                     "consolidation_metadata": {
                         "primary_source": primary_data.source.value,
                         "total_sources": len(self.response_data),
@@ -359,51 +364,63 @@ class ResponseConsolidator:
                     }
                 }
             else:
-                # Fallback for missing structured data
-                self.logger.error("💥 CONSOLIDATOR: Structured response missing data")
+                # Structured data is invalid/empty - fallback to content
+                self.logger.warning("⚠️ CONSOLIDATOR: Structured data invalid, falling back to content")
                 final_response = {
                     "type": "final_result",
-                    "output": "Error: Structured response data is missing",
+                    "output": primary_data.raw_output or "Error: No valid response data",
+                    "structuredResponse": None,  # EXPLICIT NULL
                     "consolidation_metadata": {
                         "primary_source": primary_data.source.value,
-                        "error": "Missing structured data"
+                        "error": "Structured data invalid, used raw output",
+                        "response_type": "fallback_content"
                     }
                 }
         else:
-            # Handle non-structured responses (existing logic)
-            self.logger.info(f"📊 CONSOLIDATOR: Using {primary_data.source.value} response with sanitization")
+            # Use content-based response - ONLY populate content
+            # Priority: UNIFIED > FORMATTED > RAW
+            content_source = None
+            content_data = None
             
-            # Apply sanitization for non-structured responses
-            from response_sanitizer import get_response_sanitizer
-            sanitizer = get_response_sanitizer()
-            
-            success, readable_text, structured_data = sanitizer.sanitize_llm_response(
-                primary_data.raw_output
-            )
-            
-            if success and structured_data:
-                # Sanitizer found structured data in markdown response
-                output_content = readable_text
-                enhanced_content = {"structured_response": structured_data}
+            if primary_data.source == ResponseSource.UNIFIED:
+                content_data = primary_data.raw_output
+                content_source = "unified"
+                self.logger.info(f"🔍 DEBUG UNIFIED: raw_output length={len(primary_data.raw_output or '')} chars")
+                self.logger.info(f"🔍 DEBUG UNIFIED: raw_output preview='{(primary_data.raw_output or '')[:100]}'")
+                self.logger.info(f"🔍 DEBUG UNIFIED: content_data length={len(content_data or '')} chars")
+            elif primary_data.source in [ResponseSource.FORMATTED, ResponseSource.SYNTHESIS]:
+                # Apply sanitization for formatted responses
+                try:
+                    from response_sanitizer import get_response_sanitizer
+                    sanitizer = get_response_sanitizer()
+                    success, readable_text, _ = sanitizer.sanitize_llm_response(primary_data.raw_output)
+                    content_data = readable_text if success else primary_data.raw_output
+                    content_source = f"{primary_data.source.value}_sanitized" if success else primary_data.source.value
+                except Exception as e:
+                    self.logger.warning(f"⚠️ CONSOLIDATOR: Sanitization failed: {e}")
+                    content_data = primary_data.raw_output
+                    content_source = primary_data.source.value
             else:
-                # Pure markdown/text response
-                output_content = primary_data.raw_output
-                enhanced_content = self._select_best_enhanced_content(sorted_data)
+                # RAW or other fallback
+                content_data = primary_data.raw_output
+                content_source = primary_data.source.value
+            
+            self.logger.info(f"📝 CONSOLIDATOR: Using CONTENT response from {content_source} - nullifying structuredResponse")
             
             final_response = {
                 "type": "final_result",
-                "output": output_content,
-                **enhanced_content,
+                "output": content_data or "No content available",
+                "structuredResponse": None,  # EXPLICIT NULL - prevents frontend ambiguity  
                 "consolidation_metadata": {
                     "primary_source": primary_data.source.value,
+                    "content_source": content_source,
                     "total_sources": len(self.response_data),
                     "sources_used": [d.source.value for d in self.response_data],
                     "synthesis_triggered": any(d.synthesis_triggered for d in self.response_data),
                     "max_iterations_reached": any(d.max_iterations_reached for d in self.response_data),
                     "errors_encountered": len(all_errors),
                     "execution_metadata": consolidated_metadata,
-                    "sanitization_applied": success,
-                    "response_type": "markdown"
+                    "response_type": "content"
                 }
             }
         
@@ -427,26 +444,26 @@ class ResponseConsolidator:
         
         return final_response
     
-    def _select_best_enhanced_content(self, sorted_data: List[ResponseData]) -> Dict[str, Any]:
-        """Select the best enhanced content from available sources - SIMPLE VERSION"""
-        enhanced_content = {}
-        
-        # Try to get structured response first
-        for data in sorted_data:
-            if data.structured_response:
-                enhanced_content["structured_response"] = data.structured_response
-                self.logger.info("📋 CONSOLIDATOR: Using structured_response")
-                break
-        
-        # If no structured response, try formatted response
-        if "structured_response" not in enhanced_content:
-            for data in sorted_data:
-                if data.formatted_response:
-                    enhanced_content["formatted_response"] = data.formatted_response
-                    self.logger.info("📊 CONSOLIDATOR: Using formatted_response")
-                    break
-        
-        return enhanced_content
+    def _has_renderable_structured_data(self, structured_data: Dict[str, Any]) -> bool:
+        """Check if structured data contains valid, renderable content"""
+        try:
+            # Check for response.sections structure
+            if isinstance(structured_data, dict):
+                response = structured_data.get('response', {})
+                if isinstance(response, dict):
+                    sections = response.get('sections', [])
+                    if isinstance(sections, list) and len(sections) > 0:
+                        # At least one section with content
+                        for section in sections:
+                            if isinstance(section, dict) and section.get('content', '').strip():
+                                return True
+            
+            self.logger.warning("⚠️ CONSOLIDATOR: Structured data has no renderable sections")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"💥 CONSOLIDATOR: Error validating structured data: {e}")
+            return False
     
     def _merge_metadata(self, metadata_list: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
         """Merge metadata from all sources"""
@@ -493,6 +510,7 @@ class ResponseConsolidator:
             return None
         
         priority_order = [
+            ResponseSource.UNIFIED,
             ResponseSource.STRUCTURED,
             ResponseSource.SYNTHESIS,
             ResponseSource.FORMATTED,

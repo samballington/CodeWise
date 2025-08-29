@@ -20,18 +20,18 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
-      - DEFAULT_PROVIDER_MODEL=${DEFAULT_PROVIDER_MODEL}
       - PRIMARY_PROVIDER=cerebras
       - MCP_SERVER_URL=http://mcp_server:8001
-      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
-      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
       - PYTHONMALLOC=malloc
     depends_on:
       - mcp_server
     volumes:
       - ./workspace:/workspace
       - ./backend:/app/backend
+      - ./storage:/app/storage
+      - ./knowledge_graph:/app/knowledge_graph
+      - ./indexer:/app/indexer
+      - ./tests:/app/tests
       - vector_cache:/workspace/.vector_cache
     networks:
       - codewise-network
@@ -55,6 +55,9 @@ services:
     volumes:
       - ./workspace:/workspace
       - vector_cache:/workspace/.vector_cache
+      - ./storage:/app/storage
+      - ./indexer:/app/indexer
+      - ./knowledge_graph:/app/knowledge_graph
     networks:
       - codewise-network
 

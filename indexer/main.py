@@ -22,8 +22,8 @@ except ImportError as e:
     print(f"[indexer] Warning: BM25Index not available: {e}", flush=True)
     BM25_AVAILABLE = False
 
-# Load local embedder once
-_local_embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# Load local embedder once - MUST match backend VectorStore model
+_local_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
 
 WORKSPACE = Path(os.getenv("WORKSPACE_DIR", "/workspace"))
 CACHE_DIR = WORKSPACE / ".vector_cache"
@@ -31,7 +31,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 INDEX_FILE = CACHE_DIR / "index.faiss"
 META_FILE = CACHE_DIR / "meta.json"
 STATS_FILE = CACHE_DIR / "discovery_stats.json"
-CHUNK_SIZE = 400
+CHUNK_SIZE = 200
 EMBED_MODEL = "text-embedding-3-small"
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -74,11 +74,11 @@ def discover_files() -> List[FileInfo]:
     return discovered_files
 
 def embed_batch(texts: List[str], batch_size: int = 100):
-    """Generate embeddings locally using MiniLM with batch processing; returns float32 numpy array."""
+    """Generate embeddings locally using BGE-large-en-v1.5 with batch processing; returns float32 numpy array."""
     import numpy as np
     
     if not texts:
-        return np.zeros((0, 384), dtype="float32")
+        return np.zeros((0, 1024), dtype="float32")
     
     all_vectors = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
@@ -101,7 +101,7 @@ def embed_batch(texts: List[str], batch_size: int = 100):
         except Exception as e:
             print(f"[indexer] Batch {batch_num} embedding error: {e}, using zero vectors", flush=True)
             # Create zero vectors for failed batch
-            zero_vectors = np.zeros((len(batch), 384), dtype="float32")
+            zero_vectors = np.zeros((len(batch), 1024), dtype="float32")
             all_vectors.append(zero_vectors)
     
     if all_vectors:
@@ -110,7 +110,7 @@ def embed_batch(texts: List[str], batch_size: int = 100):
         return result
     else:
         print(f"[indexer] No embeddings generated, returning zero array", flush=True)
-        return np.zeros((len(texts), 384), dtype="float32")
+        return np.zeros((len(texts), 1024), dtype="float32")
 
 def build_bm25_index_from_chunks(texts: List[str], enhanced_meta: List[dict]) -> bool:
     """
@@ -185,6 +185,458 @@ def build_bm25_index_from_chunks(texts: List[str], enhanced_meta: List[dict]) ->
         print(f"[indexer] Error building BM25 index: {e}", flush=True)
         return False
 
+def build_knowledge_graph_from_chunks(enhanced_meta: List[dict], build_mode: str, project: str = None) -> bool:
+    """
+    Build Knowledge Graph from indexed metadata.
+    
+    Args:
+        enhanced_meta: List of metadata dictionaries for each chunk
+        build_mode: "full" or "incremental" 
+        project: Project name for incremental builds
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        print(f"[KG] ========== KNOWLEDGE GRAPH BUILDING START ==========", flush=True)
+        print(f"[KG] Mode: {build_mode}, Project: {project}, Chunks: {len(enhanced_meta)}", flush=True)
+        
+        # Import KG components - bypass relative import issues
+        import sys
+        sys.path.append('/app')
+        sys.path.append('/app/storage')
+        try:
+            # Import directly from file
+            import sqlite3
+            import json
+            from pathlib import Path
+            
+            # Complete inline DatabaseManager implementation
+            class DatabaseManager:
+                def __init__(self, db_path):
+                    self.db_path = db_path
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                    self.connection = sqlite3.connect(db_path)
+                    self._create_tables()
+                
+                def _create_tables(self):
+                    cursor = self.connection.cursor()
+                    cursor.executescript('''
+                        CREATE TABLE IF NOT EXISTS nodes (
+                            id TEXT PRIMARY KEY,
+                            type TEXT NOT NULL,
+                            name TEXT NOT NULL,
+                            file_path TEXT NOT NULL,
+                            line_start INTEGER,
+                            line_end INTEGER,
+                            signature TEXT,
+                            docstring TEXT,
+                            properties JSON,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        
+                        CREATE TABLE IF NOT EXISTS edges (
+                            id TEXT PRIMARY KEY,
+                            source_id TEXT NOT NULL,
+                            target_id TEXT NOT NULL,
+                            type TEXT NOT NULL,
+                            properties JSON,
+                            file_path TEXT,
+                            line_number INTEGER,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        
+                        CREATE TABLE IF NOT EXISTS files (
+                            file_path TEXT PRIMARY KEY,
+                            language TEXT,
+                            last_modified TIMESTAMP,
+                            processing_status TEXT DEFAULT 'pending',
+                            error_message TEXT,
+                            nodes_count INTEGER DEFAULT 0,
+                            chunks_count INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        
+                        CREATE TABLE IF NOT EXISTS chunks (
+                            id TEXT PRIMARY KEY,
+                            content TEXT NOT NULL,
+                            file_path TEXT NOT NULL,
+                            chunk_type TEXT,
+                            line_start INTEGER,
+                            line_end INTEGER,
+                            metadata JSON,
+                            node_id TEXT,
+                            embedding_vector BLOB,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    ''')
+                    self.connection.commit()
+                
+                def insert_node(self, node_id, node_type, name, file_path, line_start=None, line_end=None, signature=None, docstring=None, properties=None):
+                    """Insert a node into the knowledge graph"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO nodes 
+                            (id, type, name, file_path, line_start, line_end, signature, docstring, properties)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (node_id, node_type, name, file_path, line_start, line_end, signature, docstring, json.dumps(properties) if properties else None))
+                        self.connection.commit()
+                        return True
+                    except Exception as e:
+                        print(f"[KG] Error inserting node {node_id}: {e}")
+                        return False
+                
+                def insert_edge(self, edge_id, source_id, target_id, edge_type, properties=None, file_path=None, line_number=None):
+                    """Insert an edge into the knowledge graph"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO edges 
+                            (id, source_id, target_id, type, properties, file_path, line_number)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (edge_id, source_id, target_id, edge_type, json.dumps(properties) if properties else None, file_path, line_number))
+                        self.connection.commit()
+                        return True
+                    except Exception as e:
+                        print(f"[KG] Error inserting edge {edge_id}: {e}")
+                        return False
+                
+                def get_nodes_by_file(self, file_path):
+                    """Get all nodes for a specific file"""
+                    cursor = self.connection.cursor()
+                    cursor.execute("SELECT * FROM nodes WHERE file_path LIKE ?", (f"%{file_path}%",))
+                    return cursor.fetchall()
+                
+                def insert_chunk(self, chunk_id, content, file_path, chunk_type=None, line_start=None, line_end=None, metadata=None, node_id=None):
+                    """Insert a chunk into the database"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO chunks 
+                            (id, content, file_path, chunk_type, line_start, line_end, metadata, node_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (chunk_id, content, file_path, chunk_type, line_start, line_end, json.dumps(metadata) if metadata else None, node_id))
+                        self.connection.commit()
+                        return True
+                    except Exception as e:
+                        print(f"[DB] Error inserting chunk {chunk_id}: {e}")
+                        return False
+                
+                def clear_chunks_for_project(self, project):
+                    """Remove all chunks for a specific project"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("DELETE FROM chunks WHERE file_path LIKE ?", (f"%{project}%",))
+                        deleted_count = cursor.rowcount
+                        self.connection.commit()
+                        print(f"[DB] Cleared {deleted_count} chunks for project '{project}'")
+                        return deleted_count
+                    except Exception as e:
+                        print(f"[DB] Error clearing chunks for project {project}: {e}")
+                        return 0
+                
+                def close(self):
+                    """Close database connection"""
+                    if self.connection:
+                        self.connection.close()
+            
+            print(f"[KG] ✅ Using inline DatabaseManager implementation", flush=True)
+        except Exception as e:
+            print(f"[KG] ❌ Failed to setup DatabaseManager: {e}", flush=True)
+            return False
+        
+        # Initialize database in shared workspace (accessible by both containers)
+        db_path = '/workspace/.vector_cache/codewise.db'
+        print(f"[KG] Initializing database at: {db_path}", flush=True)
+        
+        try:
+            db = DatabaseManager(db_path)
+            print(f"[KG] ✅ Database connection established", flush=True)
+        except Exception as e:
+            print(f"[KG] ❌ Database connection failed: {e}", flush=True)
+            return False
+        
+        # Check existing data
+        try:
+            cursor = db.connection.cursor()
+            existing_nodes = cursor.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            existing_edges = cursor.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            print(f"[KG] Existing data: {existing_nodes} nodes, {existing_edges} edges", flush=True)
+        except Exception as e:
+            print(f"[KG] Warning: Could not check existing data: {e}", flush=True)
+        
+        # For incremental builds, remove existing nodes for this project
+        if build_mode == "incremental" and project:
+            try:
+                print(f"[KG] Incremental build: cleaning existing data for project '{project}'", flush=True)
+                # Get all nodes for this project
+                cursor = db.connection.cursor()
+                nodes_to_delete = cursor.execute(
+                    "SELECT id FROM nodes WHERE file_path LIKE ?", 
+                    (f"%{project}%",)
+                ).fetchall()
+                
+                print(f"[KG] Found {len(nodes_to_delete)} existing nodes to delete", flush=True)
+                
+                # Delete nodes and related edges
+                deleted_edges = 0
+                for (node_id,) in nodes_to_delete:
+                    edges_result = cursor.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+                    deleted_edges += edges_result.rowcount
+                    cursor.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+                
+                db.connection.commit()
+                print(f"[KG] ✅ Cleaned {len(nodes_to_delete)} nodes and {deleted_edges} edges for project '{project}'", flush=True)
+                
+            except Exception as e:
+                print(f"[KG] ❌ Warning: Could not clean existing KG data for project '{project}': {e}", flush=True)
+        
+        # Process chunks and extract symbols
+        print(f"[KG] Starting symbol extraction from {len(enhanced_meta)} chunks", flush=True)
+        nodes_added = 0
+        edges_added = 0
+        chunks_processed = 0
+        
+        for meta in enhanced_meta:
+            chunks_processed += 1
+            chunk_type = meta.get('chunk_type', '')
+            function_name = meta.get('function_name')
+            class_name = meta.get('class_name')
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            
+            if chunks_processed % 1000 == 0:
+                print(f"[KG] Progress: {chunks_processed}/{len(enhanced_meta)} chunks processed, {nodes_added} nodes added", flush=True)
+            
+            # Add function nodes
+            if function_name and chunk_type == 'function':
+                node_id = f"{file_path}::{function_name}::{meta.get('start_line', 0)}"
+                if chunks_processed <= 10:  # Log first 10 for debugging
+                    print(f"[KG] Adding function node: {function_name} in {file_path}", flush=True)
+                
+                success = db.insert_node(
+                    node_id=node_id,
+                    node_type='function',
+                    name=function_name,
+                    file_path=file_path,
+                    line_start=meta.get('start_line'),
+                    line_end=meta.get('end_line'),
+                    signature=meta.get('chunk_text', '').split('\\n')[0] if meta.get('chunk_text') else '',
+                    docstring=meta.get('docstring'),
+                    properties={}
+                )
+                if success:
+                    nodes_added += 1
+                elif chunks_processed <= 10:
+                    print(f"[KG] ❌ Failed to add function node: {function_name}", flush=True)
+            
+            # Add class nodes
+            if class_name and chunk_type == 'class':
+                node_id = f"{file_path}::{class_name}::{meta.get('start_line', 0)}"
+                if chunks_processed <= 10:  # Log first 10 for debugging
+                    print(f"[KG] Adding class node: {class_name} in {file_path}", flush=True)
+                
+                success = db.insert_node(
+                    node_id=node_id,
+                    node_type='class',
+                    name=class_name,
+                    file_path=file_path,
+                    line_start=meta.get('start_line'),
+                    line_end=meta.get('end_line'),
+                    signature=meta.get('chunk_text', '').split('\\n')[0] if meta.get('chunk_text') else '',
+                    docstring=meta.get('docstring'),
+                    properties={}
+                )
+                if success:
+                    nodes_added += 1
+                elif chunks_processed <= 10:
+                    print(f"[KG] ❌ Failed to add class node: {class_name}", flush=True)
+            
+            # Add module-level imports as nodes
+            imports = meta.get('imports', [])
+            if imports and chunks_processed <= 5:  # Log first 5 imports for debugging
+                print(f"[KG] Processing {len(imports)} imports for {file_path}: {imports[:3]}...", flush=True)
+            
+            for import_name in imports:
+                if import_name and isinstance(import_name, str):
+                    node_id = f"{file_path}::import::{import_name}"
+                    success = db.insert_node(
+                        node_id=node_id,
+                        node_type='import',
+                        name=import_name,
+                        file_path=file_path,
+                        line_start=meta.get('start_line'),
+                        line_end=meta.get('start_line'),
+                        signature=f"import {import_name}",
+                        properties={}
+                    )
+                    if success:
+                        nodes_added += 1
+        
+        # Enhanced relationship extraction 
+        edges_added = 0  # Initialize the missing variable
+        
+        print(f"[KG] 🔗 Starting relationship extraction from {len(enhanced_meta)} chunks", flush=True)
+        
+        # Create import relationships
+        for meta in enhanced_meta:
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            imports = meta.get('imports', [])
+            
+            # Create edges from file to its imports
+            if imports:
+                for import_name in imports:
+                    if import_name and isinstance(import_name, str):
+                        source_id = f"{file_path}::file::0"
+                        target_id = f"{import_name}::module::0"
+                        edge_id = f"{source_id}::imports::{target_id}"
+                        
+                        success = db.insert_edge(
+                            edge_id=edge_id,
+                            source_id=source_id,
+                            target_id=target_id,
+                            edge_type='imports',
+                            properties={'import_type': 'module'},
+                            file_path=file_path,
+                            line_number=meta.get('start_line', 0)
+                        )
+                        if success:
+                            edges_added += 1
+        
+        # Create function call relationships
+        for meta in enhanced_meta:
+            function_name = meta.get('function_name')
+            dependencies = meta.get('dependencies', [])
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            
+            if function_name and dependencies:
+                source_id = f"{file_path}::{function_name}::{meta.get('start_line', 0)}"
+                
+                for dep in dependencies:
+                    if dep and isinstance(dep, str):
+                        # Enhanced heuristics for different relationship types
+                        
+                        # Function calls (contains parentheses)
+                        if '(' in dep or dep.endswith('()'):
+                            dep_clean = dep.replace('()', '').replace('(', '').strip()
+                            target_id = f"{file_path}::{dep_clean}::0"
+                            edge_id = f"{source_id}::calls::{target_id}"
+                            
+                            success = db.insert_edge(
+                                edge_id=edge_id,
+                                source_id=source_id,
+                                target_id=target_id,
+                                edge_type='calls',
+                                properties={'call_type': 'function_call'},
+                                file_path=file_path,
+                                line_number=meta.get('start_line', 0)
+                            )
+                            if success:
+                                edges_added += 1
+                        
+                        # Variable references (simple names without operators)
+                        elif dep.replace('_', '').replace('.', '').isalnum():
+                            target_id = f"{file_path}::{dep}::0"
+                            edge_id = f"{source_id}::uses::{target_id}"
+                            
+                            success = db.insert_edge(
+                                edge_id=edge_id,
+                                source_id=source_id,
+                                target_id=target_id,
+                                edge_type='uses',
+                                properties={'usage_type': 'variable_reference'},
+                                file_path=file_path,
+                                line_number=meta.get('start_line', 0)
+                            )
+                            if success:
+                                edges_added += 1
+        
+        # Create class inheritance relationships (look for extends/implements keywords in content)
+        for meta in enhanced_meta:
+            content = meta.get('content', '') or meta.get('chunk_text', '')
+            class_name = meta.get('class_name')
+            file_path = meta.get('relative_path', meta.get('file_path', ''))
+            
+            if class_name and content:
+                # Look for inheritance patterns
+                import re
+                
+                # Java/Swift extends pattern
+                extends_match = re.search(r'class\s+' + re.escape(class_name) + r'\s*:\s*(\w+)', content)
+                if not extends_match:
+                    extends_match = re.search(r'class\s+' + re.escape(class_name) + r'\s+extends\s+(\w+)', content)
+                
+                if extends_match:
+                    parent_class = extends_match.group(1)
+                    source_id = f"{file_path}::{class_name}::{meta.get('start_line', 0)}"
+                    target_id = f"{file_path}::{parent_class}::0"
+                    edge_id = f"{source_id}::extends::{target_id}"
+                    
+                    success = db.insert_edge(
+                        edge_id=edge_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        edge_type='extends',
+                        properties={'inheritance_type': 'class_inheritance'},
+                        file_path=file_path,
+                        line_number=meta.get('start_line', 0)
+                    )
+                    if success:
+                        edges_added += 1
+                
+                # Interface implementation pattern
+                implements_matches = re.findall(r'implements\s+([^{]+)', content)
+                for impl_match in implements_matches:
+                    interfaces = [i.strip() for i in impl_match.split(',')]
+                    for interface in interfaces:
+                        if interface:
+                            source_id = f"{file_path}::{class_name}::{meta.get('start_line', 0)}"
+                            target_id = f"{file_path}::{interface}::0"
+                            edge_id = f"{source_id}::implements::{target_id}"
+                            
+                            success = db.insert_edge(
+                                edge_id=edge_id,
+                                source_id=source_id,
+                                target_id=target_id,
+                                edge_type='implements',
+                                properties={'inheritance_type': 'interface_implementation'},
+                                file_path=file_path,
+                                line_number=meta.get('start_line', 0)
+                            )
+                            if success:
+                                edges_added += 1
+        
+        print(f"[KG] 🔗 Relationship extraction complete: {edges_added} edges created", flush=True)
+        
+        print(f"[KG] Symbol extraction complete: {nodes_added} nodes, {edges_added} edges", flush=True)
+        
+        # Get final statistics
+        try:
+            cursor = db.connection.cursor()
+            final_nodes = cursor.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            final_edges = cursor.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            node_types = cursor.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type").fetchall()
+            
+            print(f"[KG] Final statistics: {final_nodes} total nodes, {final_edges} total edges", flush=True)
+            print(f"[KG] Node types: {dict(node_types)}", flush=True)
+            
+        except Exception as e:
+            print(f"[KG] Warning: Could not get final statistics: {e}", flush=True)
+        
+        print(f"[KG] ========== KNOWLEDGE GRAPH BUILDING COMPLETE ==========", flush=True)
+        return True
+        
+    except ImportError as e:
+        print(f"[KG] ❌ Knowledge Graph components not available: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[KG] ❌ Error building Knowledge Graph: {e}", flush=True)
+        import traceback
+        print(f"[KG] ❌ Traceback: {traceback.format_exc()}", flush=True)
+        return False
+
 def build_index(project: str | None = None):
     global _build_lock, _pending_rebuild
     if _build_lock:
@@ -214,19 +666,31 @@ def build_index(project: str | None = None):
             with META_FILE.open("r", encoding="utf-8") as f:
                 existing_meta = json.load(f)
             
-            # Remove existing chunks for this project to avoid duplicates
+            # Remove existing chunks for this project AND validate other projects exist
             filtered_meta = []
             removed_count = 0
+            ghost_projects_removed = 0
+            
             for meta in existing_meta:
                 meta_project = meta.get("project", "")
-                if meta_project != project:
+                
+                # Remove chunks from the current project (normal incremental behavior)
+                if meta_project == project:
+                    removed_count += 1
+                    continue
+                
+                # Validate that other projects actually exist in workspace
+                project_path = WORKSPACE / meta_project if meta_project else None
+                if project_path and project_path.exists():
+                    # Project exists, keep its chunks
                     filtered_meta.append(meta)
                     existing_texts.append(meta.get("chunk_text", ""))
                 else:
-                    removed_count += 1
+                    # Ghost project (deleted), remove its chunks
+                    ghost_projects_removed += 1
             
             existing_meta = filtered_meta
-            print(f"[indexer] Loaded {len(existing_meta)} existing chunks, removed {removed_count} chunks from project '{project}'", flush=True)
+            print(f"[indexer] Loaded {len(existing_meta)} existing chunks, removed {removed_count} chunks from project '{project}', removed {ghost_projects_removed} ghost chunks from deleted projects", flush=True)
             
         except Exception as e:
             print(f"[indexer] Warning: Could not load existing index for incremental build: {e}. Falling back to full rebuild.", flush=True)
@@ -279,8 +743,8 @@ def build_index(project: str | None = None):
             continue
         
         # Optionally add a file-level summary chunk for large files
-        if len(content) > 2500:
-            summary_len = 1200
+        if len(content) > 1000:
+            summary_len = 500
             summary_text = content[:summary_len]
 
             try:
@@ -386,14 +850,20 @@ def build_index(project: str | None = None):
                 total_chunks += 1
     
     # Combine with existing data for incremental builds
-    if build_mode == "incremental" and existing_texts:
+    # BUT force full rebuild when project-specific indexing to avoid metadata corruption
+    if build_mode == "incremental" and existing_texts and project is None:
+        # Only use incremental for full workspace rebuilds, not project-specific
         all_texts = existing_texts + texts
         all_meta = existing_meta + enhanced_meta
         print(f"[indexer] Incremental build: {len(existing_texts)} existing + {len(texts)} new = {len(all_texts)} total chunks", flush=True)
     else:
+        # Force full rebuild for project-specific indexing to avoid metadata corruption
         all_texts = texts
         all_meta = enhanced_meta
-        print(f"[indexer] Full build: {len(all_texts)} total chunks", flush=True)
+        if project:
+            print(f"[indexer] FORCED FULL BUILD for project '{project}': {len(all_texts)} total chunks (avoiding metadata corruption)", flush=True)
+        else:
+            print(f"[indexer] Full build: {len(all_texts)} total chunks", flush=True)
     
     if not all_texts:
         print("[indexer] no text files found")
@@ -495,10 +965,10 @@ def build_index(project: str | None = None):
         print(f"[indexer] Final embedding array shape: {embs.shape}", flush=True)
     else:
         print("[indexer] No embeddings generated, creating empty index", flush=True)
-        embs = np.zeros((0, 384), dtype="float32")
+        embs = np.zeros((0, 1024), dtype="float32")
     
     # Create and save final index
-    dim = embs.shape[1] if embs.size > 0 else 384
+    dim = embs.shape[1] if embs.size > 0 else 1024
     index = faiss.IndexFlatL2(dim)
     if embs.size > 0:
         index.add(embs)
@@ -523,6 +993,87 @@ def build_index(project: str | None = None):
             print("[indexer] Vector index built successfully, BM25 index failed (continuing)", flush=True)
     else:
         print("[indexer] No data available for BM25 index building", flush=True)
+    
+    # Save chunks to database for query compatibility - MOVED BEFORE KG for reliability
+    print(f"[indexer] DEBUG: all_texts={len(all_texts) if all_texts else 0}, all_meta={len(all_meta) if all_meta else 0}", flush=True)
+    if all_texts and all_meta and len(all_texts) == len(all_meta):
+        try:
+            print(f"[indexer] Saving {len(all_texts)} chunks to database...", flush=True)
+            
+            # Initialize database connection
+            import sqlite3
+            import json as json_lib
+            from pathlib import Path
+            import hashlib
+            
+            db_path = '/workspace/.vector_cache/codewise.db'
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Ensure chunks table exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    chunk_type TEXT,
+                    line_start INTEGER,
+                    line_end INTEGER,
+                    metadata JSON,
+                    node_id TEXT,
+                    embedding_vector BLOB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Clear existing chunks for this project if incremental
+            if build_mode == "incremental" and project:
+                cursor.execute("DELETE FROM chunks WHERE file_path LIKE ?", (f"%{project}%",))
+                deleted_count = cursor.rowcount
+                print(f"[indexer] Cleared {deleted_count} existing chunks for project '{project}'", flush=True)
+            
+            # Insert chunks
+            chunks_saved = 0
+            for i, (text, meta) in enumerate(zip(all_texts, all_meta)):
+                chunk_id = hashlib.md5(f"{meta.get('file_path', '')}:{meta.get('start_line', 0)}:{i}".encode()).hexdigest()
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO chunks 
+                    (id, content, file_path, chunk_type, line_start, line_end, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    chunk_id,
+                    text,
+                    meta.get('file_path', ''),
+                    meta.get('chunk_type', 'unknown'),
+                    meta.get('start_line', 0),
+                    meta.get('end_line', 0),
+                    json.dumps(meta)
+                ))
+                chunks_saved += 1
+                
+                if chunks_saved % 1000 == 0:
+                    print(f"[indexer] Progress: {chunks_saved}/{len(all_texts)} chunks saved", flush=True)
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"[indexer] ✅ Successfully saved {chunks_saved} chunks to database", flush=True)
+            
+        except Exception as e:
+            print(f"[indexer] ❌ Failed to save chunks to database: {e}", flush=True)
+            import traceback
+            print(f"[indexer] ❌ Traceback: {traceback.format_exc()}", flush=True)
+    
+    # Build Knowledge Graph from the same data (Phase 2.1 integration) 
+    if all_texts and all_meta:
+        kg_success = build_knowledge_graph_from_chunks(all_meta, build_mode, project)
+        if kg_success:
+            print("[indexer] Successfully built Knowledge Graph", flush=True)
+        else:
+            print("[indexer] Knowledge Graph build failed (continuing)", flush=True)
+    else:
+        print("[indexer] No data available for Knowledge Graph building", flush=True)
     
     # Log chunking statistics
     chunk_types = {}

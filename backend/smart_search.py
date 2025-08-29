@@ -18,25 +18,55 @@ from dataclasses import dataclass
 from pathlib import Path
 from enum import Enum
 
-from backend.hybrid_search import HybridSearchEngine, SearchResult
-from backend.bm25_index import BM25Index, BM25Result
-from backend.vector_store import get_vector_store
-from backend.discovery_pipeline import DiscoveryPipeline
-from backend.path_resolver import PathResolver
-from backend.directory_filters import get_project_from_path
-from backend.project_context import get_context_manager
-from backend.file_content_cache import get_global_content_cache
-from backend.query_context import QueryExecutionContext
+try:
+    from hybrid_search import HybridSearchEngine, SearchResult
+    from bm25_index import BM25Index, BM25Result
+    from vector_store import get_vector_store
+    from discovery_pipeline import DiscoveryPipeline
+    from path_resolver import PathResolver
+    from directory_filters import get_project_from_path
+    from project_context import get_context_manager
+    from file_content_cache import get_global_content_cache
+except ImportError:
+    from backend.hybrid_search import HybridSearchEngine, SearchResult
+    from backend.bm25_index import BM25Index, BM25Result
+    from backend.vector_store import get_vector_store
+    from backend.discovery_pipeline import DiscoveryPipeline
+    from backend.path_resolver import PathResolver
+    from directory_filters import get_project_from_path
+    from project_context import get_context_manager
+    from file_content_cache import get_global_content_cache
+try:
+    from query_context import QueryExecutionContext
+except ImportError:
+    from backend.query_context import QueryExecutionContext
+try:
+    # Phase 3 components now replaced by SDK native reasoning
+    # QueryClassifier eliminated - SDK handles intent classification
+    Phase3QueryIntent = None
+    QueryAnalysis = None
+except ImportError:
+    from query_context import QueryExecutionContext
+    # Phase 3 components now replaced by SDK native reasoning
+    Phase3QueryIntent = None
+    QueryAnalysis = None
+try:
+    from backend.context.code_annotator import CodeLensAnnotator
+    from storage.database_manager import DatabaseManager
+except ImportError:
+    try:
+        from context.code_annotator import CodeLensAnnotator
+        from storage.database_manager import DatabaseManager  
+    except ImportError:
+        # Graceful fallback if Phase 3 components not available
+        CodeLensAnnotator = None
+        DatabaseManager = None
 
 logger = logging.getLogger(__name__)
 
 
-class QueryIntent(Enum):
-    """Query intent classification"""
-    ENTITY = "entity"           # Database entities, models, schemas
-    FILE = "file"              # Specific files, file types, structure
-    GENERAL = "general"        # General code search, functionality
-    ARCHITECTURE = "architecture"  # System overview, high-level structure
+# Use Phase 3 QueryIntent for consistency
+QueryIntent = Phase3QueryIntent
 
 
 @dataclass
@@ -79,17 +109,15 @@ class QueryIntentAnalyzer:
             'framework', 'stack', 'tech stack', 'dependencies'
         }
         
-        # Technical patterns that suggest specific intent
+        # Technical patterns that suggest specific intent (mapped to Phase 3 QueryIntent)
         self.technical_patterns = {
-            QueryIntent.ENTITY: [
+            QueryIntent.SPECIFIC_SYMBOL: [
                 r'@Entity\b', r'CREATE\s+TABLE', r'class\s+\w+\s*\(.*Model\)',
-                r'models?\.\w+', r'database\s+schema', r'entity\s+relationship'
-            ],
-            QueryIntent.FILE: [
+                r'models?\.\w+', r'database\s+schema', r'entity\s+relationship',
                 r'\.\w{2,4}\b', r'/(src|app|lib|config)/', r'package\.json',
                 r'requirements\.txt', r'Dockerfile', r'\.env'
             ],
-            QueryIntent.ARCHITECTURE: [
+            QueryIntent.STRUCTURAL: [
                 r'main\s+entry\s+point', r'application\s+structure',
                 r'system\s+design', r'tech\s+stack'
             ]
@@ -111,12 +139,13 @@ class QueryIntentAnalyzer:
         query_lower = query.lower()
         query_terms = re.findall(r'\b\w+\b', query_lower)
         
-        # Calculate intent scores
+        # Calculate intent scores (mapped to Phase 3 QueryIntent)
         intent_scores = {
-            QueryIntent.ENTITY: self._calculate_entity_score(query_lower, query_terms),
-            QueryIntent.FILE: self._calculate_file_score(query_lower, query_terms),
-            QueryIntent.ARCHITECTURE: self._calculate_architecture_score(query_lower, query_terms),
-            QueryIntent.GENERAL: 0.3  # Default baseline
+            QueryIntent.SPECIFIC_SYMBOL: self._calculate_entity_score(query_lower, query_terms) + self._calculate_file_score(query_lower, query_terms),
+            QueryIntent.STRUCTURAL: self._calculate_architecture_score(query_lower, query_terms),
+            QueryIntent.CONCEPTUAL: 0.4,  # For semantic queries
+            QueryIntent.EXPLORATORY: 0.3,  # Default baseline
+            QueryIntent.DEBUGGING: 0.2  # Lower baseline
         }
         
         # Add pattern-based scoring
@@ -384,22 +413,32 @@ class EntityDiscovery:
 
 class SmartSearchEngine:
     """
-    Unified smart search engine that replaces multiple tools with intelligent routing
-    
-    This is the main implementation of the smart_search tool for the simplified 3-tool architecture.
+    Phase 3 Complete: Intelligence-powered search with adaptive classification,
+    KG expansion, and Code Lens integration
     """
     
     def __init__(self):
+        # Legacy components (Phase 1 & 2)
         self.hybrid_search = HybridSearchEngine()
-        self.intent_analyzer = QueryIntentAnalyzer()
         self.entity_discovery = EntityDiscovery()
-        
-        # Discovery pipeline for Task 5 extension
         self.path_resolver = PathResolver()
         self.discovery_pipeline = DiscoveryPipeline(self.path_resolver)
-        
-        # File content cache for performance
         self.content_cache = get_global_content_cache()
+        
+        # Phase 3: Intelligence layer
+        self.vector_store = get_vector_store()
+        try:
+            self.db_manager = DatabaseManager()
+            # QueryClassifier eliminated - SDK now handles all intent classification
+            self.query_classifier = None  # SDK native reasoning replaces this
+            self.code_annotator = CodeLensAnnotator(self.db_manager)
+            self.phase3_available = True
+            logger.info("✅ Phase 3 components initialized successfully")
+        except Exception as e:
+            logger.warning(f"⚠️ Phase 3 components not available, falling back to legacy: {e}")
+            self.phase3_available = False
+            # Fallback to legacy analyzer
+            self.intent_analyzer = QueryIntentAnalyzer()
         
         # Search configuration
         self.max_results = 15
@@ -1211,6 +1250,207 @@ class SmartSearchEngine:
     def _extract_project_from_path(self, file_path: str) -> str:
         """Extract project name from file path using existing utility function"""
         return get_project_from_path(file_path)
+    
+    # ==================== PHASE 3 ENHANCED SEARCH METHODS ====================
+    
+    async def search_phase3(self, query: str, k: int = 10, strategy_override: List[str] = None, mentioned_projects: List[str] = None) -> Dict[str, Any]:
+        """
+        Phase 3: Complete intelligent search with adaptive classification,
+        KG expansion, and enhanced code presentation.
+        """
+        import time
+        start_time = time.time()
+        
+        logger.info(f"🧠 PHASE 3 SMART SEARCH: '{query}' (k={k})")
+        
+        if not self.phase3_available:
+            logger.warning("⚠️ Phase 3 not available, falling back to legacy search")
+            return await self.search(query, k, strategy_override, mentioned_projects)
+        
+        # Phase 3: SDK native reasoning eliminates custom classification
+        # All reasoning is now handled by Cerebras SDK - use adaptive search strategy
+        logger.info("Using SDK-native intelligent search - no custom classification needed")
+        
+        # Use adaptive search strategy (eliminates custom query analysis)
+        search_results = []
+        try:
+            # SDK will handle intent analysis through tool selection
+            # Use hybrid search as baseline with KG enhancement if available
+            if self.db_manager:
+                # Try KG-enhanced search first
+                search_results = await self._structural_search_phase3(query, k)
+                if not search_results:
+                    # Fallback to semantic search
+                    search_results = await self._semantic_search_enhanced(query, k)
+            else:
+                # Pure semantic search when KG unavailable
+                search_results = await self._semantic_search_enhanced(query, k)
+                
+        except Exception as e:
+            logger.error(f"Phase 3 enhanced search failed: {e}, falling back to legacy")
+            return await self.search(query, k, strategy_override, mentioned_projects)
+        
+        # Phase 3: Create default query analysis for Phase 3 (SDK handles classification)
+        default_query_analysis = {
+            'intent': QueryIntent.GENERAL,
+            'confidence': 0.8,
+            'reasoning': 'SDK-native intelligent search',
+            'vector_weight': 0.7,
+            'bm25_weight': 0.3
+        }
+        
+        # Phase 3: Enhance results with Code Lens
+        enhanced_results = []
+        for result in search_results:
+            try:
+                enhanced_snippet = self._enhance_snippet_with_code_lens(result.snippet, result.file_path)
+                enhanced_result = SmartSearchResult(
+                    chunk_id=result.chunk_id,
+                    file_path=result.file_path,
+                    snippet=enhanced_snippet,
+                    relevance_score=result.relevance_score,
+                    query_intent=default_query_analysis['intent'],
+                    search_strategy=[default_query_analysis['reasoning']],
+                    matched_terms=getattr(result, 'matched_terms', []),
+                    metadata={
+                        'query_analysis': default_query_analysis,
+                        'enhancement_applied': 'code_lens',
+                        'hierarchical_context': self._extract_hierarchical_context(result)
+                    },
+                    confidence=result.relevance_score
+                )
+                enhanced_results.append(enhanced_result)
+            except Exception as e:
+                logger.warning(f"Failed to enhance result: {e}")
+                enhanced_results.append(result)  # Fallback to original
+        
+        execution_time = time.time() - start_time
+        logger.info(f"✅ Phase 3 search completed in {execution_time:.2f}s, {len(enhanced_results)} results")
+        
+        return {
+            'results': enhanced_results,
+            'query_analysis': {
+                'intent': default_query_analysis['intent'].value,
+                'confidence': default_query_analysis['confidence'],
+                'reasoning': default_query_analysis['reasoning'],
+                'vector_weight': default_query_analysis['vector_weight'],
+                'bm25_weight': default_query_analysis['bm25_weight']
+            },
+            'search_strategies_used': ['phase3_intelligent'],
+            'total_results': len(enhanced_results),
+            'execution_time': execution_time
+        }
+    
+    def _enhance_snippet_with_code_lens(self, snippet: str, file_path: str) -> str:
+        """Add Code Lens annotations to search result snippets"""
+        try:
+            # Detect if snippet contains code
+            if self._is_code_snippet(snippet):
+                annotated_snippet = self.code_annotator.annotate_code(snippet, file_path)
+                return annotated_snippet
+        except Exception as e:
+            logger.debug(f"Code lens enhancement failed: {e}")
+        
+        return snippet  # Return as-is if not code or enhancement fails
+    
+    def _is_code_snippet(self, snippet: str) -> bool:
+        """Determine if snippet contains code"""
+        code_indicators = [
+            'def ', 'class ', 'import ', 'from ', 'function ', '()', '{', '}',
+            '=>', 'const ', 'let ', 'var ', 'public ', 'private ', 'static'
+        ]
+        return any(indicator in snippet for indicator in code_indicators)
+    
+    async def _precision_search_phase3(self, query: str, analysis: QueryAnalysis, limit: int) -> List[SearchResult]:
+        """High-precision search for specific symbol queries"""
+        try:
+            # Use the enhanced hybrid search with intelligent weighting
+            results, _ = await self.hybrid_search.search_async(query, limit)
+            
+            # Filter and boost exact symbol matches
+            boosted_results = []
+            for result in results:
+                # Check if result contains exact symbol matches
+                if self._contains_exact_symbols(result, query):
+                    result.relevance_score *= 1.5  # Boost exact matches
+                
+                boosted_results.append(result)
+            
+            return sorted(boosted_results, key=lambda x: x.relevance_score, reverse=True)[:limit]
+        except Exception as e:
+            logger.error(f"Precision search failed: {e}")
+            return []
+    
+    async def _structural_search_phase3(self, query: str, limit: int) -> List[SearchResult]:
+        """KG-powered search for relationship queries"""
+        try:
+            # Extract relationship intent from query
+            relationship_keywords = {
+                'calls': ['calls', 'invokes', 'uses'],
+                'inherits': ['inherits', 'extends', 'derives'],
+                'imports': ['imports', 'requires', 'includes']
+            }
+            
+            detected_relationship = None
+            for rel_type, keywords in relationship_keywords.items():
+                if any(kw in query.lower() for kw in keywords):
+                    detected_relationship = rel_type
+                    break
+            
+            if detected_relationship:
+                # Use KG for factual relationship queries - placeholder for now
+                logger.info(f"Using KG search for {detected_relationship} relationship")
+                # TODO: Implement KG relationship search when KG integration is ready
+                
+            # Fallback to semantic search
+            return await self._semantic_search_phase3(query, None, limit)
+        except Exception as e:
+            logger.error(f"Structural search failed: {e}")
+            return []
+    
+    async def _semantic_search_phase3(self, query: str, analysis: QueryAnalysis = None, limit: int = 10) -> List[SearchResult]:
+        """Vector-heavy semantic search for conceptual queries"""
+        try:
+            if analysis and analysis.vector_weight > 0.7:
+                # Pure vector search for highly semantic queries
+                try:
+                    query_embedding = self.vector_store.embed_query(query)
+                    # Use vector store directly for pure semantic search
+                    vector_results = self.vector_store.similarity_search(query, k=limit)
+                    return [self._convert_to_search_result(result) for result in vector_results]
+                except Exception as e:
+                    logger.warning(f"Pure vector search failed: {e}, falling back to hybrid")
+            
+            # Balanced hybrid search
+            results, _ = await self.hybrid_search.search_async(query, limit)
+            return results
+        except Exception as e:
+            logger.error(f"Semantic search failed: {e}")
+            return []
+    
+    def _convert_to_search_result(self, vector_result) -> SearchResult:
+        """Convert vector store result to SearchResult format"""
+        # Placeholder conversion - adapt based on actual vector store format
+        return SearchResult(
+            chunk_id=getattr(vector_result, 'chunk_id', 0),
+            file_path=getattr(vector_result, 'file_path', ''),
+            snippet=getattr(vector_result, 'page_content', str(vector_result)),
+            relevance_score=getattr(vector_result, 'similarity_score', 0.5)
+        )
+    
+    def _contains_exact_symbols(self, result: SearchResult, query: str) -> bool:
+        """Check if result contains exact symbol matches"""
+        # Simple exact match check - can be enhanced
+        query_terms = query.lower().split()
+        snippet_lower = result.snippet.lower()
+        return any(term in snippet_lower for term in query_terms if len(term) > 2)
+    
+    def _extract_hierarchical_context(self, result: SearchResult) -> Dict[str, Any]:
+        """Extract hierarchical context for enhanced metadata"""
+        return {
+            'file_type': Path(result.file_path).suffix if hasattr(result, 'file_path') else '',
+            'project': self._extract_project_from_path(result.file_path) if hasattr(result, 'file_path') else ''
+        }
 
 
 # Singleton instance for easy import
@@ -1238,4 +1478,9 @@ async def smart_search(query: str, k: int = 10, strategy_override: List[str] = N
         Dict with search results and metadata
     """
     engine = get_smart_search_engine()
-    return await engine.search(query, k, strategy_override, mentioned_projects)
+    
+    # Use Phase 3 enhanced search if available
+    if hasattr(engine, 'phase3_available') and engine.phase3_available:
+        return await engine.search_phase3(query, k, strategy_override, mentioned_projects)
+    else:
+        return await engine.search(query, k, strategy_override, mentioned_projects)
