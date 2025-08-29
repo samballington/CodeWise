@@ -306,18 +306,43 @@ class FilesystemNavigator:
             query, query_params = self._build_project_filter(base_query, [like_pattern], project_scope)
             results = cursor.execute(query, query_params).fetchall()
         else:
-            # Non-recursive: only immediate directory contents
-            # Match files that start with path/ but don't have additional slashes
+            # Non-recursive: show immediate contents (files and first-level subdirectories)
+            # For path 'src', show both direct files in src/ and first-level directories like src/app/, src/components/
             base_query = """
                 SELECT DISTINCT file_path FROM nodes 
-                WHERE file_path LIKE ? 
-                AND file_path NOT LIKE ?
+                WHERE file_path LIKE ?
                 ORDER BY file_path
             """
+            # Match all files under the path
             path_prefix = f"%{path}/%"
-            path_with_subdir = f"%{path}/%/%"
-            query, query_params = self._build_project_filter(base_query, [path_prefix, path_with_subdir], project_scope)
-            results = cursor.execute(query, query_params).fetchall()
+            query, query_params = self._build_project_filter(base_query, [path_prefix], project_scope)
+            all_results = cursor.execute(query, query_params).fetchall()
+            
+            # Process results to show directory structure appropriately
+            # For non-recursive, show representative files from each immediate subdirectory
+            directory_contents = set()
+            direct_files = []
+            
+            for row in all_results:
+                file_path = row[0]
+                # Extract the part after our target path
+                if f"/{path}/" in file_path:
+                    after_path = file_path.split(f"/{path}/", 1)[1]
+                    if '/' in after_path:
+                        # This is in a subdirectory - add the subdirectory
+                        subdir = after_path.split('/', 1)[0]
+                        # Add a representative file from this subdirectory
+                        directory_contents.add(file_path)
+                    else:
+                        # This is a direct file in the target directory
+                        direct_files.append(file_path)
+            
+            # Combine direct files and representative files from subdirectories
+            results = [(f,) for f in direct_files] + [(f,) for f in sorted(directory_contents)]
+            
+            # Limit results for non-recursive to avoid overwhelming output
+            if len(results) > 50:
+                results = results[:50]
         
         files = [row[0] for row in results]
         
