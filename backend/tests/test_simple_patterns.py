@@ -9,7 +9,7 @@ from pathlib import Path
 # Add backend to path
 sys.path.append(str(Path(__file__).parent))
 
-from backend.tools.universal_pattern_recognizer import UniversalPatternRecognizer
+from tools.universal_pattern_recognizer import UniversalPatternRecognizer
 
 async def test_python_patterns():
     """Test Python pattern recognition"""

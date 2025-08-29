@@ -21,15 +21,6 @@ from cerebras.cloud.sdk import Cerebras
 
 # Import our existing Phase 1/2 infrastructure (PRESERVE these)
 try:
-    from .tools.unified_query_pure import query_codebase_pure as query_codebase
-    from .tools.mermaid_renderer import MermaidRenderer
-    from .smart_search import get_smart_search_engine
-    from .vector_store import VectorStore
-    from .tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
-    from .tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
-    from .tools.filesystem_navigator import FilesystemNavigator
-    from .config.cerebras_config import cerebras_config
-except ImportError:
     from tools.unified_query_pure import query_codebase_pure as query_codebase
     from tools.mermaid_renderer import MermaidRenderer
     from smart_search import get_smart_search_engine
@@ -38,6 +29,15 @@ except ImportError:
     from tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
     from tools.filesystem_navigator import FilesystemNavigator
     from config.cerebras_config import cerebras_config
+except ImportError:
+    from .tools.unified_query_pure import query_codebase_pure as query_codebase
+    from .tools.mermaid_renderer import MermaidRenderer
+    from .smart_search import get_smart_search_engine
+    from .vector_store import VectorStore
+    from .tools.unified_tool_schema import UNIFIED_TOOL_SCHEMA
+    from .tools.filesystem_tool_schema import FILESYSTEM_TOOL_SCHEMA
+    from .tools.filesystem_navigator import FilesystemNavigator
+    from .config.cerebras_config import cerebras_config
 
 # Import Phase 2 KG with fallback
 try:

@@ -13,7 +13,7 @@ import pytest
 import asyncio
 import json
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
-from backend.cerebras_agent import CerebrasNativeAgent
+from cerebras_agent import CerebrasNativeAgent
 
 
 class TestContextManagement:

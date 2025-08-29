@@ -11,7 +11,7 @@ import json
 from typing import Dict, Any
 from pydantic import ValidationError
 
-from backend.schemas.ui_schemas import (
+from schemas.ui_schemas import (
     UnifiedAgentResponse,
     TextBlock,
     ComponentAnalysisBlock,
