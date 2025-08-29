@@ -11,7 +11,7 @@ from pathlib import Path
 # Add backend to path
 sys.path.append(str(Path(__file__).parent))
 
-from cerebras_agent import CerebrasAgent
+from backend.cerebras_agent import CerebrasNativeAgent as CerebrasAgent
 
 async def test_diagram_generation():
     """Test end-to-end diagram generation with universal engine"""
