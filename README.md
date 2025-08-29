@@ -5,6 +5,10 @@
 
 Code intelligence platform for understanding large codebases. Combines semantic search, knowledge graphs, and LLM reasoning to answer questions about complex software systems.
 
+## 🚀 [Quick Setup](#setup)
+
+Get CodeWise running in 5 minutes with Docker. [Jump to setup instructions](#setup) ↓
+
 ## What It Does
 
 **Hybrid Search**: Combines FAISS vector similarity with knowledge graph structure queries. Vector search finds semantically similar code, knowledge graph provides architectural relationships.
@@ -160,5 +164,54 @@ open http://localhost:3000
 - SQLite write concurrency bottleneck  
 - Manual project onboarding (no git integration)
 - Read-only analysis (no code modification)
+
+## Setup
+
+### Prerequisites
+
+- **Docker & Docker Compose** (for containerized deployment)
+- **Cerebras API Key** from [cloud.cerebras.ai](https://cloud.cerebras.ai/)
+
+### Quick Start
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-org/codewise.git
+   cd codewise
+   ```
+
+2. **Get your Cerebras API key**
+   - Visit [https://cloud.cerebras.ai/](https://cloud.cerebras.ai/)
+   - Sign up/login and generate an API key
+   - Copy the key for the next step
+
+3. **Configure environment**
+   ```bash
+   cp .env.example .env
+   # Edit .env and add your Cerebras API key:
+   # CEREBRAS_API_KEY=your_api_key_here
+   ```
+
+4. **Start the application**
+   ```bash
+   docker-compose up -d
+   ```
+
+5. **Access CodeWise**
+   - Frontend: [http://localhost:3000](http://localhost:3000)
+   - Backend API: [http://localhost:8000](http://localhost:8000)
+   - Indexer API: [http://localhost:8002](http://localhost:8002)
+
+### Production Deployment
+
+Production deployment packages are automatically built through GitHub CI/CD when all checks pass. See the [Actions tab](../../actions) for build status and deployment artifacts.
+
+### Troubleshooting
+
+- **Indexer connection failed**: Ensure all containers are running with `docker-compose ps`
+- **No search results**: Wait for indexing to complete, check progress at `/indexer/status`
+- **Performance issues**: Increase Docker memory allocation to 4GB+
+
+For additional help, check the GitHub Issues or Discussions tabs.
 
 The system processes queries by combining semantic vector search with structured knowledge graph queries, then uses an LLM to synthesize responses with proper code context.
