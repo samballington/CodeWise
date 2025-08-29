@@ -9,6 +9,18 @@ Code intelligence platform for understanding large codebases. Combines semantic 
 
 Get CodeWise running in 5 minutes with Docker. [Jump to setup instructions](#setup) ↓
 
+## Screenshots
+
+<div align="center">
+
+![CodeWise Interface Example 1](example1.png)
+*CodeWise analyzing a complex codebase with semantic search and knowledge graph integration*
+
+![CodeWise Interface Example 2](example2.png)  
+
+
+</div>
+
 ## What It Does
 
 **Hybrid Search**: Combines FAISS vector similarity with knowledge graph structure queries. Vector search finds semantically similar code, knowledge graph provides architectural relationships.
