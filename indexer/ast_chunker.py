@@ -316,7 +316,7 @@ class PythonASTChunker(BaseChunker):
         logger.info(f"Using fallback chunking for {file_path}")
         
         # Simple character-based chunking
-        chunk_size = 1000
+        chunk_size = 400
         chunks = []
         
         for i in range(0, len(content), chunk_size):
@@ -852,7 +852,7 @@ class JavaScriptASTChunker(BaseChunker):
         """Fallback to character-based chunking"""
         logger.info(f"Using fallback chunking for {file_path}")
         
-        chunk_size = 1000
+        chunk_size = 400
         chunks = []
         file_type = "typescript" if str(file_path).endswith(('.ts', '.tsx')) else "javascript"
         
@@ -999,7 +999,7 @@ class MarkdownChunker(BaseChunker):
 class SmallFileChunker(BaseChunker):
     """Chunker for small files that should be kept as single chunks"""
     
-    def __init__(self, max_size: int = 500):
+    def __init__(self, max_size: int = 300):
         self.max_size = max_size
     
     def chunk_content(self, content: str, file_path: Path) -> List[CodeChunk]:
@@ -1225,7 +1225,7 @@ class ASTChunker:
                 if chunks:
                     # If the result is just a fallback and file is small, prefer small_file chunker
                     if (
-                        len(content) <= 500 and
+                        len(content) <= 300 and
                         len(chunks) == 1 and
                         chunks[0].metadata.chunk_type == "fallback"
                     ):
@@ -1233,7 +1233,7 @@ class ASTChunker:
                     return chunks
 
             # Fallback to small file heuristic
-            if len(content) <= 500:
+            if len(content) <= 300:
                 return self.chunkers['small_file'].chunk_content(content, file_path)
             
             # Fallback to character-based chunking
@@ -1262,7 +1262,7 @@ class ASTChunker:
     
     def _fallback_chunk(self, content: str, file_path: Path) -> List[CodeChunk]:
         """Fallback to character-based chunking"""
-        chunk_size = 1000
+        chunk_size = 400
         chunks = []
         file_type = file_path.suffix[1:] if file_path.suffix else "text"
         

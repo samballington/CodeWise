@@ -31,7 +31,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 INDEX_FILE = CACHE_DIR / "index.faiss"
 META_FILE = CACHE_DIR / "meta.json"
 STATS_FILE = CACHE_DIR / "discovery_stats.json"
-CHUNK_SIZE = 400
+CHUNK_SIZE = 200
 EMBED_MODEL = "text-embedding-3-small"
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -309,6 +309,34 @@ def build_knowledge_graph_from_chunks(enhanced_meta: List[dict], build_mode: str
                     cursor = self.connection.cursor()
                     cursor.execute("SELECT * FROM nodes WHERE file_path LIKE ?", (f"%{file_path}%",))
                     return cursor.fetchall()
+                
+                def insert_chunk(self, chunk_id, content, file_path, chunk_type=None, line_start=None, line_end=None, metadata=None, node_id=None):
+                    """Insert a chunk into the database"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO chunks 
+                            (id, content, file_path, chunk_type, line_start, line_end, metadata, node_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (chunk_id, content, file_path, chunk_type, line_start, line_end, json.dumps(metadata) if metadata else None, node_id))
+                        self.connection.commit()
+                        return True
+                    except Exception as e:
+                        print(f"[DB] Error inserting chunk {chunk_id}: {e}")
+                        return False
+                
+                def clear_chunks_for_project(self, project):
+                    """Remove all chunks for a specific project"""
+                    try:
+                        cursor = self.connection.cursor()
+                        cursor.execute("DELETE FROM chunks WHERE file_path LIKE ?", (f"%{project}%",))
+                        deleted_count = cursor.rowcount
+                        self.connection.commit()
+                        print(f"[DB] Cleared {deleted_count} chunks for project '{project}'")
+                        return deleted_count
+                    except Exception as e:
+                        print(f"[DB] Error clearing chunks for project {project}: {e}")
+                        return 0
                 
                 def close(self):
                     """Close database connection"""
@@ -715,8 +743,8 @@ def build_index(project: str | None = None):
             continue
         
         # Optionally add a file-level summary chunk for large files
-        if len(content) > 2500:
-            summary_len = 1200
+        if len(content) > 1000:
+            summary_len = 500
             summary_text = content[:summary_len]
 
             try:
@@ -966,7 +994,78 @@ def build_index(project: str | None = None):
     else:
         print("[indexer] No data available for BM25 index building", flush=True)
     
-    # Build Knowledge Graph from the same data (Phase 2.1 integration)
+    # Save chunks to database for query compatibility - MOVED BEFORE KG for reliability
+    print(f"[indexer] DEBUG: all_texts={len(all_texts) if all_texts else 0}, all_meta={len(all_meta) if all_meta else 0}", flush=True)
+    if all_texts and all_meta and len(all_texts) == len(all_meta):
+        try:
+            print(f"[indexer] Saving {len(all_texts)} chunks to database...", flush=True)
+            
+            # Initialize database connection
+            import sqlite3
+            import json as json_lib
+            from pathlib import Path
+            import hashlib
+            
+            db_path = '/workspace/.vector_cache/codewise.db'
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Ensure chunks table exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    chunk_type TEXT,
+                    line_start INTEGER,
+                    line_end INTEGER,
+                    metadata JSON,
+                    node_id TEXT,
+                    embedding_vector BLOB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Clear existing chunks for this project if incremental
+            if build_mode == "incremental" and project:
+                cursor.execute("DELETE FROM chunks WHERE file_path LIKE ?", (f"%{project}%",))
+                deleted_count = cursor.rowcount
+                print(f"[indexer] Cleared {deleted_count} existing chunks for project '{project}'", flush=True)
+            
+            # Insert chunks
+            chunks_saved = 0
+            for i, (text, meta) in enumerate(zip(all_texts, all_meta)):
+                chunk_id = hashlib.md5(f"{meta.get('file_path', '')}:{meta.get('start_line', 0)}:{i}".encode()).hexdigest()
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO chunks 
+                    (id, content, file_path, chunk_type, line_start, line_end, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    chunk_id,
+                    text,
+                    meta.get('file_path', ''),
+                    meta.get('chunk_type', 'unknown'),
+                    meta.get('start_line', 0),
+                    meta.get('end_line', 0),
+                    json.dumps(meta)
+                ))
+                chunks_saved += 1
+                
+                if chunks_saved % 1000 == 0:
+                    print(f"[indexer] Progress: {chunks_saved}/{len(all_texts)} chunks saved", flush=True)
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"[indexer] ✅ Successfully saved {chunks_saved} chunks to database", flush=True)
+            
+        except Exception as e:
+            print(f"[indexer] ❌ Failed to save chunks to database: {e}", flush=True)
+            import traceback
+            print(f"[indexer] ❌ Traceback: {traceback.format_exc()}", flush=True)
+    
+    # Build Knowledge Graph from the same data (Phase 2.1 integration) 
     if all_texts and all_meta:
         kg_success = build_knowledge_graph_from_chunks(all_meta, build_mode, project)
         if kg_success:

@@ -337,6 +337,7 @@ class ProjectService:
     def clone_any_github_repo(repo_url: str, target_name: str = None) -> Dict[str, Any]:
         """Clone any public GitHub repository"""
         import subprocess
+        import os
         
         # Parse repository URL or user/repo format
         if repo_url.startswith("http"):
@@ -364,12 +365,17 @@ class ProjectService:
             raise HTTPException(status_code=400, detail=f"Project '{target_name}' already exists")
         
         try:
-            # Clone the repository
+            # Clone the repository with environment to disable credential prompts
+            env = os.environ.copy()
+            env['GIT_TERMINAL_PROMPT'] = '0'
             result = subprocess.run([
                 "git", "clone", clone_url, str(target_path)
-            ], capture_output=True, text=True, timeout=300)  # 5 minute timeout
+            ], capture_output=True, text=True, timeout=300, env=env)  # 5 minute timeout
             
             if result.returncode != 0:
+                print(f"[backend] ❌ Git clone failed with return code: {result.returncode}")
+                print(f"[backend] ❌ Git clone stderr: {result.stderr}")
+                print(f"[backend] ❌ Git clone stdout: {result.stdout}")
                 raise HTTPException(
                     status_code=400, 
                     detail=f"Failed to clone repository: {result.stderr}"
@@ -413,6 +419,10 @@ class ProjectService:
             # Clean up partial clone on error
             if target_path.exists():
                 shutil.rmtree(target_path)
+            print(f"[backend] ❌ Clone error: {str(e)}")
+            print(f"[backend] ❌ Error type: {type(e)}")
+            import traceback
+            print(f"[backend] ❌ Traceback: {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
 
 @router.get("/")

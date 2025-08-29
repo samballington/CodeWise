@@ -80,22 +80,16 @@ async def progress_aware_build_index(project=None):
 
 async def build_index_with_progress(project=None):
     """Modified build_index that reports progress"""
-    # This is a placeholder - we'd need to modify the actual build_index function
-    # For now, just call the original and simulate progress
-    import time
-    update_progress(phase="file_discovery")
-    time.sleep(0.5)  # Simulate work
-    update_progress(phase="parsing_files", total_files=100)
-    time.sleep(0.5)
-    update_progress(phase="generating_embeddings", files_processed=50)
-    time.sleep(0.5)
-    update_progress(phase="building_kg", chunks_generated=500)
-    time.sleep(0.5)
-    update_progress(phase="finalizing", kg_nodes=200, kg_edges=150)
-    
-    # Call original function
+    import asyncio
     from indexer.main import build_index
-    build_index(project)
+    
+    update_progress(phase="starting_indexing")
+    
+    # Run the synchronous build_index in an executor to avoid blocking
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, build_index, project)
+    
+    update_progress(phase="indexing_complete")
 
 @app.post("/rebuild", status_code=http_status.HTTP_202_ACCEPTED)
 async def rebuild(payload: dict | None = None, bt: BackgroundTasks = None):
