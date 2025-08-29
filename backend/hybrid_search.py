@@ -14,12 +14,12 @@ from collections import defaultdict
 import numpy as np
 from pathlib import Path
 
-from backend.bm25_index import BM25Index, BM25Result
-from backend.vector_store import get_vector_store
+from bm25_index import BM25Index, BM25Result
+from vector_store import get_vector_store
 
 # Phase 3.1: Import Query Intent Classifier for dynamic search weighting
 try:
-    from backend.search.query_classifier import QueryClassifier, QueryAnalysis
+    from search.query_classifier import QueryClassifier, QueryAnalysis
     QUERY_CLASSIFIER_AVAILABLE = True
 except ImportError:
     # Fallback when classifier not available

@@ -40,9 +40,8 @@ jobs:
       env:
         CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
       run: |
-        cd backend
         export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-        python -m pytest tests/ -v --tb=short
+        python -m pytest backend/tests/ -v --tb=short
         
     - name: Run backend linting
       run: |
