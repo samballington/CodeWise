@@ -174,7 +174,6 @@ open http://localhost:3000
 - Single-tenant architecture (no user isolation)
 - 65K token context window limit
 - SQLite write concurrency bottleneck  
-- Manual project onboarding (no git integration)
 - Read-only analysis (no code modification)
 
 ## Setup
