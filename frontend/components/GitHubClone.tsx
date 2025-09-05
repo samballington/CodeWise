@@ -70,11 +70,11 @@ export default function GitHubClone({ onCloneSuccess }: GitHubCloneProps) {
               onChange={(e) => setRepoUrl(e.target.value)}
               onKeyPress={handleKeyPress}
               placeholder="user/repo or https://github.com/user/repo"
-              className={`w-full pl-10 pr-4 py-3 rounded-lg border text-sm ${
+              className={`w-full pl-10 pr-4 py-3 rounded-lg border text-sm font-medium ${
                 isDarkMode 
-                  ? 'bg-background border-border text-text-primary placeholder-text-secondary' 
+                  ? 'bg-slate-800 border-slate-600 text-slate-100 placeholder-slate-400' 
                   : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
-              } focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent`}
+              } focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent transition-colors duration-200`}
               disabled={isCloning}
             />
           </div>

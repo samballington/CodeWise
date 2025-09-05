@@ -15,6 +15,7 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
   const { fetchProjects } = useProjectStore()
   const [isImporting, setIsImporting] = useState(false)
   const [importStatus, setImportStatus] = useState<string>('')
+  const [importProgress, setImportProgress] = useState<number>(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const handleFolderSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -31,11 +32,14 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
     
     try {
       setIsImporting(true)
+      setImportProgress(0)
       setImportStatus('Preparing project files...')
 
       // Create FormData with all selected files
       const formData = new FormData()
       formData.append('project_name', projectName)
+      
+      setImportProgress(20)
       
       for (let i = 0; i < files.length; i++) {
         const file = files[i]
@@ -43,6 +47,7 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
         formData.append('files', file, relativePath)
       }
 
+      setImportProgress(40)
       setImportStatus('Uploading and indexing project...')
 
       // Post to backend import endpoint
@@ -51,11 +56,15 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
         body: formData,
       })
 
+      setImportProgress(70)
+
       if (!response.ok) {
         throw new Error(`Import failed: ${response.statusText}`)
       }
 
+      setImportProgress(90)
       const result = await response.json()
+      setImportProgress(100)
       setImportStatus(`Successfully imported ${projectName}!`)
       
       // Refresh projects list
@@ -65,11 +74,13 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
       setTimeout(() => {
         onClose()
         setImportStatus('')
+        setImportProgress(0)
         setIsImporting(false)
       }, 2000)
 
     } catch (error: any) {
       console.error('Import error:', error)
+      setImportProgress(0)
       setImportStatus(`Import failed: ${error.message}`)
       setTimeout(() => {
         setImportStatus('')
@@ -170,11 +181,29 @@ export default function ImportDialog({ isOpen, onClose }: ImportDialogProps) {
                 )}
               </div>
               
-              <p className={`text-sm ${
+              <p className={`text-sm mb-4 ${
                 isDarkMode ? 'text-text-primary' : 'text-gray-900'
               }`}>
                 {importStatus}
               </p>
+              
+              {isImporting && (
+                <div className="w-full max-w-xs mx-auto">
+                  <div className={`w-full bg-gray-200 rounded-full h-2 ${
+                    isDarkMode ? 'bg-gray-700' : 'bg-gray-200'
+                  }`}>
+                    <div 
+                      className="bg-primary h-2 rounded-full transition-all duration-500 ease-out"
+                      style={{ width: `${importProgress}%` }}
+                    ></div>
+                  </div>
+                  <p className={`text-xs mt-2 text-center ${
+                    isDarkMode ? 'text-text-secondary' : 'text-gray-500'
+                  }`}>
+                    {importProgress}%
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>
