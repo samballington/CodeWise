@@ -348,6 +348,54 @@ class KGStartupService:
                 error_message=error_msg
             )
     
+    async def index_new_project(self, project_name: str) -> ProjectIndexingResult:
+        """
+        Index a newly cloned/imported project.
+        
+        Public method for routers to trigger indexing of a specific project.
+        """
+        self.logger.info(f"🆕 Indexing new project: {project_name}")
+        
+        project_path = self.workspace_dir / project_name
+        if not project_path.exists():
+            error_msg = f"Project directory not found: {project_path}"
+            self.logger.error(f"❌ {error_msg}")
+            return ProjectIndexingResult(
+                project_name=project_name,
+                success=False,
+                files_processed=0,
+                symbols_discovered=0,
+                relationships_found=0,
+                chunks_created=0,
+                processing_time=0.0,
+                error_message=error_msg
+            )
+        
+        if not project_path.is_dir():
+            error_msg = f"Path is not a directory: {project_path}"
+            self.logger.error(f"❌ {error_msg}")
+            return ProjectIndexingResult(
+                project_name=project_name,
+                success=False,
+                files_processed=0,
+                symbols_discovered=0,
+                relationships_found=0,
+                chunks_created=0,
+                processing_time=0.0,
+                error_message=error_msg
+            )
+        
+        # Use existing private method to do the work
+        result = await self._index_single_project(project_path)
+        
+        if result.success:
+            self.logger.info(f"✅ New project indexed successfully: {project_name} "
+                           f"({result.symbols_discovered} symbols, {result.relationships_found} relationships)")
+        else:
+            self.logger.error(f"❌ Failed to index new project: {project_name} - {result.error_message}")
+        
+        return result
+    
     def get_kg_status(self) -> Dict[str, Any]:
         """
         Get current Knowledge Graph status for all projects.
