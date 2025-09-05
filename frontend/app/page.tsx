@@ -92,19 +92,6 @@ export default function Home() {
               Clone Repo
             </button>
             
-            {/* Chat toggle */}
-            <button
-              onClick={() => setShowChatOverlay(!showChatOverlay)}
-              className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${
-                showChatOverlay
-                  ? 'bg-primary text-white'
-                  : isDarkMode
-                  ? 'bg-slate-700 text-text-primary hover:bg-slate-600'
-                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-              }`}
-            >
-              Chat
-            </button>
 
 
 
