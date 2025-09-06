@@ -184,9 +184,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     import re
                     mentions = re.findall(r'@([a-zA-Z0-9_-]+)', user_query)
                     mentioned_projects = mentions
-                    
-                    # Clean @mentions from query after extraction
-                    if mentions:
+                
+                # Clean @mentions from query after extraction (regardless of how they were found)
+                if user_query and ('@' in user_query):
+                    import re
+                    # Check if query contains @mentions that need cleaning
+                    if re.search(r'@[a-zA-Z0-9_-]+', user_query):
                         # Remove @mentions from the query
                         cleaned_query = re.sub(r'@[a-zA-Z0-9_-]+', '', user_query).strip()
                         # Clean up extra spaces and improve query formatting
