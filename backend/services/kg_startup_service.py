@@ -70,7 +70,8 @@ class KGStartupService:
         self.supported_patterns = [
             "*.py", "*.js", "*.ts", "*.jsx", "*.tsx", 
             "*.java", "*.cpp", "*.c", "*.h", "*.hpp",
-            "*.cs", "*.php", "*.rb", "*.go", "*.rs"
+            "*.cs", "*.php", "*.rb", "*.go", "*.rs",
+            "*.swift", "*.m", "*.kt"
         ]
         
         # Directories to skip
