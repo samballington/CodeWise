@@ -185,6 +185,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     mentions = re.findall(r'@([a-zA-Z0-9_-]+)', user_query)
                     mentioned_projects = mentions
                 
+                # Clean @mentions from query after extraction (regardless of how they were found)
+                if user_query and ('@' in user_query):
+                    import re
+                    # Check if query contains @mentions that need cleaning
+                    if re.search(r'@[a-zA-Z0-9_-]+', user_query):
+                        # Remove @mentions from the query
+                        cleaned_query = re.sub(r'@[a-zA-Z0-9_-]+', '', user_query).strip()
+                        # Clean up extra spaces and improve query formatting
+                        cleaned_query = re.sub(r'\s+', ' ', cleaned_query)  # Multiple spaces -> single space
+                        if cleaned_query.startswith('and '):
+                            cleaned_query = cleaned_query[4:]  # Remove leading "and "
+                        if not cleaned_query or cleaned_query.lower() in ['what it does', 'and what it does']:
+                            cleaned_query = "explain what this project does"
+                        user_query = cleaned_query
+                        logger.info(f"🔧 CLEANED QUERY: {user_query}")
+                
                 # Persistent project context: maintain project context across conversation
                 if not hasattr(websocket, 'active_project_context'):
                     websocket.active_project_context = None

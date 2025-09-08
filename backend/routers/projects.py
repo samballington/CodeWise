@@ -334,7 +334,7 @@ class ProjectService:
             raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
     
     @staticmethod
-    def clone_any_github_repo(repo_url: str, target_name: str = None) -> Dict[str, Any]:
+    async def clone_any_github_repo(repo_url: str, target_name: str = None) -> Dict[str, Any]:
         """Clone any public GitHub repository"""
         import subprocess
         import os
@@ -384,20 +384,24 @@ class ProjectService:
             # Get project info
             project_size = ProjectService._get_directory_size(target_path)
             
-            # Notify indexer to rebuild for this project with progress tracking
+            # Use unified indexing service (no separate indexer needed)
+            indexing_result = None
             indexer_triggered = False
             try:
-                import httpx, os
-                indexer_url = os.getenv("INDEXER_URL", "http://indexer:8002")
-                with httpx.Client() as client:
-                    response = client.post(f"{indexer_url}/rebuild", json={"project": target_name}, timeout=10)
-                    if response.status_code in [200, 202]:
-                        indexer_triggered = True
-                        print(f"[backend] ✅ Indexing triggered for project: {target_name}")
-                    else:
-                        print(f"[backend] ⚠️ Indexer responded with status {response.status_code}")
+                from services.kg_startup_service import get_kg_startup_service
+                
+                kg_service = get_kg_startup_service()
+                indexing_result = await kg_service.index_new_project(target_name)
+                
+                indexer_triggered = indexing_result.success
+                if indexer_triggered:
+                    print(f"[backend] ✅ Project indexed successfully: {target_name} "
+                          f"({indexing_result.symbols_discovered} symbols, {indexing_result.relationships_found} relationships)")
+                else:
+                    print(f"[backend] ❌ Project indexing failed: {target_name} - {indexing_result.error_message}")
+                    
             except Exception as e:
-                print(f"[backend] ❌ Failed to trigger indexer for {target_name}: {e}")
+                print(f"[backend] ❌ Failed to index project {target_name}: {e}")
 
             return {
                 "success": True,
@@ -494,7 +498,7 @@ async def delete_project(project_name: str):
 async def clone_github_repo(request: CloneRequest):
     """Clone any public GitHub repository"""
     try:
-        result = ProjectService.clone_any_github_repo(request.repo_url, request.target_name)
+        result = await ProjectService.clone_any_github_repo(request.repo_url, request.target_name)
         return JSONResponse(content=result)
     except HTTPException as e:
         raise e
@@ -533,15 +537,24 @@ async def import_project(
                 
                 files_imported += 1
         
-        # Trigger indexing for the specific imported project only
+        # Use unified indexing service (no separate indexer needed)
+        indexing_result = None  
+        indexer_success = False
         try:
-            import requests
-            indexer_url = "http://indexer:8002/rebuild"
-            payload = {"project": project_name}
-            indexer_response = requests.post(indexer_url, json=payload, timeout=30)
-            indexer_success = indexer_response.status_code in [200, 202]
+            from services.kg_startup_service import get_kg_startup_service
+            
+            kg_service = get_kg_startup_service()
+            indexing_result = await kg_service.index_new_project(project_name)
+            
+            indexer_success = indexing_result.success
+            if indexer_success:
+                print(f"[backend] ✅ Imported project indexed successfully: {project_name} "
+                      f"({indexing_result.symbols_discovered} symbols, {indexing_result.relationships_found} relationships)")
+            else:
+                print(f"[backend] ❌ Imported project indexing failed: {project_name} - {indexing_result.error_message}")
+                
         except Exception as e:
-            print(f"Failed to trigger indexer: {e}")
+            print(f"[backend] ❌ Failed to index imported project {project_name}: {e}")
             indexer_success = False
         
         return JSONResponse(content={
