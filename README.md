@@ -4,6 +4,8 @@
 [![PR Checks](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml/badge.svg)](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml)
 
 Code intelligence platform for understanding large codebases. Combines semantic search, knowledge graphs, and LLM reasoning to answer questions about complex software systems.
+## Demo
+Check out the [live demo](http://3.16.130.20:3000)!
 
 ## 🚀 [Quick Setup](#setup)
 
