@@ -5,7 +5,7 @@
 
 Code intelligence platform for understanding large codebases. Combines semantic search, knowledge graphs, and LLM reasoning to answer questions about complex software systems.
 ## Demo
-Check out the [live demo](http://3.16.130.20:3000)! (note: queries will take up to 2 minutes due to AWS EC2 bottlenecks, but run faster locally!)
+Check out the [live demo](http://3.16.130.20:3000)! (note: queries will take up to 2 minutes due to AWS EC2 pricing bottlenecks, but run faster locally!)
 
 ## 🚀 [Quick Setup](#setup)
 
