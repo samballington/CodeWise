@@ -7,6 +7,8 @@ Code intelligence platform for understanding large codebases. Combines semantic 
 ## Demo
 Check out the [live demo](http://3.16.130.20:3000)! (note: queries will take up to 2 minutes due to AWS EC2 pricing bottlenecks, but run faster locally!)
 
+Check out the [video demo](https://www.youtube.com/watch?v=JRGNQxGkio8)
+
 ## 🚀 [Quick Setup](#setup)
 
 Get CodeWise running in 5 minutes with Docker. [Jump to setup instructions](#setup) ↓
