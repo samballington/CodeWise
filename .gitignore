@@ -60,6 +60,7 @@ backend/.claude/
 *.md
 **/*.md
 !README.md
+!docs/*.md
 
 # Screenshots and assets - NEVER commit these
 screenshots/

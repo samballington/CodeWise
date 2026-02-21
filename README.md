@@ -393,3 +393,22 @@ CodeWise processes queries through a sophisticated multi-stage pipeline:
 6. **Error Recovery**: Progressive retry with fallback chains ensures 95% success rate
 
 All operations are logged with structured severity codes and tracked through comprehensive observability.
+
+---
+
+## Architecture Decisions
+
+Key architectural choices are documented as Architecture Decision Records (ADRs):
+
+- [ADR-001: SQLite + VSS over Neo4j](docs/architecture-decision-records.md#adr-001-sqlite-over-neo4j-for-knowledge-graph) — zero-dependency embedded storage
+- [ADR-002: FAISS over managed vector DBs](docs/architecture-decision-records.md#adr-002-faiss-over-managed-vector-databases) — local-first, no external service dependencies
+- [ADR-003: WebSocket over REST polling](docs/architecture-decision-records.md#adr-003-websocket-over-rest-polling) — real-time LLM response streaming
+- [ADR-004: Tool consolidation (8 → 2 tools)](docs/architecture-decision-records.md#adr-004-tool-consolidation-8--2-tools) — eliminated LLM tool-selection paralysis
+- [ADR-005: 4-layer caching strategy](docs/architecture-decision-records.md#adr-005-4-layer-caching-strategy) — 85% cache hit rate
+- [ADR-007: BGE-large-en-v1.5 over MiniLM](docs/architecture-decision-records.md#adr-007-bge-large-en-v15-embedding-model) — 1024D embeddings for code retrieval quality
+- [ADR-008: Cerebras over OpenAI](docs/architecture-decision-records.md#adr-008-cerebras-over-openai-for-llm-provider) — single-provider strategy, native tool-use SDK
+- [ADR-009: Docker 4-service architecture](docs/architecture-decision-records.md#adr-009-docker-multi-service-architecture) — frontend / backend / indexer / mcp_server
+- [ADR-010: Tree-sitter for AST parsing](docs/architecture-decision-records.md#adr-010-tree-sitter-for-ast-extraction) — unified API across 10+ languages
+- [ADR-012: FastAPI over Flask/Django](docs/architecture-decision-records.md#adr-012-fastapi-over-flaskdjango) — native async WebSocket support
+
+See [`docs/architecture-decision-records.md`](docs/architecture-decision-records.md) for the full records.
