@@ -3,7 +3,8 @@
 [![CI/CD](https://github.com/samballington/CodeWise/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/samballington/CodeWise/actions/workflows/ci-cd.yml)
 [![PR Checks](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml/badge.svg)](https://github.com/samballington/CodeWise/actions/workflows/pr-checks.yml)
 
-AI-powered code intelligence platform for understanding large codebases. Combines semantic search, knowledge graphs, and LLM reasoning with production-grade error handling, caching, and observability.
+AI-powered code intelligence platform for understanding large codebases. Combines semantic search, knowledge graphs, and LLM reasoning with production-grade error handling, caching, and observability. 
+Check out the [Design decisions](https://github.com/samballington/CodeWise/blob/main/docs/architecture-decision-records.md)
 
 ## Demo
 
